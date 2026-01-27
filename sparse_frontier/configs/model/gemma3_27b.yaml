@@ -1,0 +1,11 @@
+# @package _global_
+
+model:
+  name: gemma3_27b
+  path: ${paths.checkpoints}/gemma-3-27b-it
+  hf_repo: google/gemma-3-27b-it
+  num_q_heads: 32
+  num_kv_heads: 16
+  num_layers: 62
+
+tp: 2

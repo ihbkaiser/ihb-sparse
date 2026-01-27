@@ -1,0 +1,13 @@
+# @package _global_
+
+model:
+  name: qwen3_8b
+  path: ${paths.checkpoints}/Qwen3-8B
+  hf_repo: Qwen/Qwen3-8B
+  num_q_heads: 32
+  num_kv_heads: 8
+  num_layers: 36
+
+tp: 1
+max_output_tokens: 38912
+thinking: true

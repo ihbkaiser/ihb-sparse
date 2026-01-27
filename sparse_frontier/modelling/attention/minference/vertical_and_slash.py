@@ -114,7 +114,6 @@ def _triton_mixed_sparse_attn_fwd_kernel(
 
     # write back O
     acc /= l_i[:, None]
-    # acc = tl.where(m_mask, acc / l_i[:, None], 0.0)
     tl.store(o_ptrs, acc.to(dtype), mask=m_mask)
 
 
@@ -134,7 +133,7 @@ def _triton_mixed_sparse_attention(
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
-    assert Lk in {16, 32, 64, 128}
+    assert Lk in {16, 32, 64, 128, 256}
     o = torch.zeros_like(q)
     grid = (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16

@@ -10,14 +10,15 @@ debug: false
 
 gpus: 1
 tp: 1
+samples: 30
 
-samples: 100
 max_input_tokens: 8192
 max_output_tokens: 1024
 kv_cache_block_size: 256
 random_seed: 43
+thinking: false
 
-print_eval_results: true
+use_attention_patch: true
 
 paths:
   results: ./experiments/results

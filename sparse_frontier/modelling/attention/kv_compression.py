@@ -2,7 +2,6 @@ import math
 import torch
 import torch.nn.functional as F
 from .abstract_attention import AbstractAttention
-from sparse_frontier.utils.globals import is_vllm_profiling_done
 
 
 class SnapKVCompression(AbstractAttention):
@@ -101,10 +100,6 @@ class SnapKVCompression(AbstractAttention):
             dim=1,
             index=expanded_indices
         )
-        
-        # Track sparsity - based on fixed capacity ratio
-        sparsity = 1.0 - (capacity / keys.size(0))
-        self.layer_sparsity_statistics.append(torch.tensor(sparsity, device=queries.device))
 
         # Create sequence length tensor (same for all heads)
         seq_lens = torch.full((num_kv_heads,), capacity, device=queries.device, dtype=torch.long)
@@ -234,10 +229,5 @@ class AdaSnapKVCompression(AbstractAttention):
         for head_idx in range(num_kv_heads):
             compressed_keys[head_idx, :seq_lens[head_idx]] = keys_t[head_idx, selected_mask[head_idx]]
             compressed_values[head_idx, :seq_lens[head_idx]] = values_t[head_idx, selected_mask[head_idx]]
-        
-        # Track sparsity - based on actual tokens kept
-        total_tokens_kept = seq_lens.sum().item()
-        sparsity = 1.0 - (total_tokens_kept / (keys.size(0) * num_kv_heads))
-        self.layer_sparsity_statistics.append(torch.tensor(sparsity, device=queries.device))
         
         return compressed_keys, compressed_values, seq_lens

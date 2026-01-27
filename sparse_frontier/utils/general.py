@@ -1,27 +1,37 @@
 import os
 import json
-import socket
-
-from sparse_frontier.utils.globals import GlobalSettings
+from dataclasses import asdict
 
 
-def get_free_ports(n: int) -> list[int]:
-    """Find N free ports on the local machine."""
-    free_ports = []
-    sockets = []
+def ensure_model_downloaded(model_path: str, hf_repo: str) -> None:
+    """Download model from HuggingFace Hub if not already present.
     
-    try:
-        for _ in range(n):
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(('localhost', 0))  # Bind to an available port
-            free_ports.append(s.getsockname()[1])  # Get the assigned port number
-            sockets.append(s)  # Keep the socket open to reserve the port
-    finally:
-        # Close all sockets to release the ports
-        for s in sockets:
-            s.close()
+    Args:
+        model_path: Local path where model should be stored
+        hf_repo: HuggingFace Hub repository ID (e.g., "Qwen/Qwen2.5-7B-Instruct")
+    """
+    import glob
     
-    return free_ports
+    # Check for actual model weight files, not just config
+    safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
+    bin_files = glob.glob(os.path.join(model_path, "*.bin"))
+    
+    if safetensors_files or bin_files:
+        return
+    
+    print(f"Model weights not found at {model_path}. Downloading from {hf_repo}...")
+    
+    from huggingface_hub import snapshot_download
+    
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    
+    snapshot_download(
+        repo_id=hf_repo,
+        local_dir=model_path,
+        local_dir_use_symlinks=False,
+    )
+    
+    print(f"Model downloaded to {model_path}")
 
 
 def get_latest_commit_id():
@@ -33,18 +43,14 @@ def get_latest_commit_id():
         return None
 
 
-def save_config(dir_path: str):
-    from omegaconf import OmegaConf
+def save_config(dir_path: str, cfg):
     from datetime import datetime
-    
-    cfg = GlobalSettings.get('cfg')
 
-    config_dict = OmegaConf.to_container(cfg, resolve=True)
+    config_dict = asdict(cfg)
+
     config_dict['commit_id'] = get_latest_commit_id()
-    
-    # Add timestamp
     config_dict['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     config_path = os.path.join(dir_path, "config.json")
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=2)

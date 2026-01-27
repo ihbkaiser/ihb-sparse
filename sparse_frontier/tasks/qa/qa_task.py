@@ -144,7 +144,7 @@ class QASample(AbstractSample):
 
 class QATask(AbstractTask):
     """Task for question answering evaluation."""
-    MAX_SAMPLE_TOKENS = 8172 # 8192 - 20 (safe tokens)
+    MAX_SAMPLE_TOKENS = 8172  # Maximum tokens for a single-document sample (8192 - 20 safe tokens)
     
     def __init__(self, dataset_name, **kwargs) -> None:
         """Initialize QA task.
@@ -162,11 +162,10 @@ class QATask(AbstractTask):
         
         Args:
             dataset_name: Name of the dataset to load
-            max_sample_tokens: 
-                Maximum tokens allowed for the input.
-                This is the same as minimum tokens we're testing in the benchamrk.
-                We filter out samples that exceed this limit.
-                This is to ensure that all context lengths we're testing have the same data.
+            
+        Note:
+            Samples are filtered based on min(MAX_SAMPLE_TOKENS, max_input_tokens)
+            to ensure consistency across runs while respecting the token budget.
         """
         # Load dataset using qa_data module
         qa_dataset = get_dataset(dataset_name)
@@ -176,8 +175,6 @@ class QATask(AbstractTask):
             idx: (len(self.tokenizer.text_to_tokens(f"\n\nDocument XX:\n{context}")) + 3) # We add 3 tokens as a placeholder for the document number
             for idx, context in enumerate(qa_dataset.unique_contexts)
         }
-
-        # sum(list(context_token_lengths.values()))
 
         # Create initial samples list with token lengths
         processed_samples = []
@@ -205,7 +202,9 @@ class QATask(AbstractTask):
             total_tokens = len(self.tokenizer.text_to_tokens(input_text))
             
             # Only keep samples that fit within token budget
-            if total_tokens <= self.MAX_SAMPLE_TOKENS - self.template_tokens:
+            # Use min of MAX_SAMPLE_TOKENS and max_input_tokens to ensure compatibility
+            max_allowed = min(self.MAX_SAMPLE_TOKENS, self.max_input_tokens) - self.template_tokens
+            if total_tokens <= max_allowed:
                 processed_samples.append({
                     "context": context,
                     "question": question,
@@ -237,8 +236,12 @@ class QATask(AbstractTask):
         if not self.task_params.get("processed_dataset"):
             raise ValueError("Dataset not loaded")
 
-        if len(self.task_params["processed_dataset"]) < self.num_samples:
-            raise ValueError(f"Not enough samples in dataset. Found {len(self.task_params['processed_dataset'])} samples, but {self.num_samples} were requested")
+        available = len(self.task_params["processed_dataset"])
+        if available < self.num_samples:
+            raise ValueError(
+                f"Not enough samples in dataset. Found {available} samples after filtering "
+                f"by max_input_tokens={self.max_input_tokens}, but {self.num_samples} were requested"
+            )
 
     @property
     def sample_class(self):

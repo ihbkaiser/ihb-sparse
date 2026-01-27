@@ -1,5 +1,21 @@
+import os
+from typing import Optional
+
 import torch
 from .abstract_attention import AttentionUtils
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+
+from sparse_frontier.utils.sparsity_server import (
+    ENV_ENABLED,
+    set_prefill_sparsity,
+    add_decode_access,
+)
+
+DECODE_REPORT_EVERY_N_STEPS = 100
 
 
 def update_kv_cache(
@@ -103,6 +119,105 @@ class AttentionHandler:
             device="cpu"
         )
         self.head_indices = None
+        self._prefill_sparsity_sum = 0.0
+        self._prefill_sparsity_count = 0
+        self._prompt_len: Optional[int] = None
+        self._dense_seq_len: Optional[int] = None
+        self._decode_step: int = 0
+        self._decode_access_sum_pending: float = 0.0
+        self._decode_dense_sum_pending: float = 0.0
+
+    @staticmethod
+    def _should_report() -> bool:
+        return os.environ.get(ENV_ENABLED) == "1" and get_tensor_model_parallel_rank() == 0
+
+    def report_prefill_sparsity(self, sparsity: float) -> None:
+        """Record one per-layer prefill sparsity value."""
+        self._prefill_sparsity_sum += float(sparsity)
+        self._prefill_sparsity_count += 1
+
+    def _begin_prefill(self, prompt_len: int) -> None:
+        self._prompt_len = int(prompt_len)
+        self._dense_seq_len = int(prompt_len)
+        self._decode_step = 0
+        self._prefill_sparsity_sum = 0.0
+        self._prefill_sparsity_count = 0
+        self._decode_access_sum_pending = 0.0
+        self._decode_dense_sum_pending = 0.0
+        self.tokens_per_layer_head.zero_()
+
+    def _begin_decode_step(self) -> None:
+        self._decode_step += 1
+        if self._prompt_len is not None:
+            self._dense_seq_len = int(self._prompt_len + self._decode_step)
+
+    def _maybe_report_prefill_sparsity(self, device: torch.device) -> None:
+        if self.current_layer != self.model_layers - 1:
+            return
+
+        if self._prefill_sparsity_count > 0:
+            local = torch.tensor(
+                [self._prefill_sparsity_sum / self._prefill_sparsity_count],
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            local = torch.tensor([0.0], device=device, dtype=torch.float32)
+
+        if get_tensor_model_parallel_world_size() > 1:
+            local = tensor_model_parallel_all_gather(local)
+
+        if self._should_report():
+            set_prefill_sparsity(float(local.mean().item()))
+
+    def _maybe_report_decode_cost(self, device: torch.device) -> None:
+        if self.current_layer != self.model_layers - 1:
+            return
+
+        if self._dense_seq_len is None:
+            return
+
+        dense_len = int(self._dense_seq_len)
+        local_heads = int(self.q_heads_per_gpu)
+
+        from sparse_frontier.modelling.attention.registry import get_attention
+
+        attention = get_attention()
+        accessed_cap = (
+            min(dense_len, (attention.page_budget + 1) * attention.page_size)
+            if attention.__class__.__name__ == "QuestAttention"
+            else None
+        )
+
+        if accessed_cap is None:
+            accessed_sum = float(self.tokens_per_layer_head[self.current_layer].sum().item())
+        else:
+            accessed_sum = float(accessed_cap * local_heads)
+
+        dense_sum = float(dense_len * local_heads)
+        self._decode_access_sum_pending += accessed_sum
+        self._decode_dense_sum_pending += dense_sum
+
+        if self._decode_step != 1 and self._decode_step % DECODE_REPORT_EVERY_N_STEPS != 0:
+            return
+
+        local = torch.tensor(
+            [self._decode_access_sum_pending, self._decode_dense_sum_pending],
+            device=device,
+            dtype=torch.float32,
+        )
+        if get_tensor_model_parallel_world_size() > 1:
+            local = tensor_model_parallel_all_gather(local)
+
+        if self._should_report():
+            totals = local if local.ndim == 1 else local.sum(dim=0)
+            add_decode_access(accessed_sum=float(totals[0].item()), dense_sum=float(totals[1].item()))
+
+        self._decode_access_sum_pending = 0.0
+        self._decode_dense_sum_pending = 0.0
+
+    def advance_layer(self) -> None:
+        self.current_layer = (self.current_layer + 1) % self.model_layers
 
     def _compute_attention_head_by_head(
         self,
@@ -174,9 +289,6 @@ class AttentionHandler:
         """
         num_tokens = queries.shape[0]
         is_prefilling = num_tokens > 1
-        
-        if is_prefilling:
-            self.tokens_per_layer_head[self.current_layer, :] = 0
 
         # Initialize head_indices if not already done
         if self.head_indices is None and keys.numel() > 0:
@@ -184,16 +296,6 @@ class AttentionHandler:
             self.head_indices = torch.arange(num_kv_heads, device=keys.device)
             self.tokens_per_layer_head = self.tokens_per_layer_head.to(keys.device)
 
-        if kv_cache.numel() == 0:
-            self._compute_attention_head_by_head(
-                queries=queries,
-                keys=keys,
-                values=values,
-                output=output,
-            )
-            self.current_layer = (self.current_layer + 1) % self.model_layers
-            return
-        
         if is_prefilling:
             self._compute_attention_head_by_head(
                 queries=queries,
@@ -201,6 +303,7 @@ class AttentionHandler:
                 values=values,
                 output=output,
             )
+            self._maybe_report_prefill_sparsity(device=keys.device)
 
         k_cache, v_cache = AttentionUtils.reshape_kv_cache(kv_cache, self.block_size, self.max_blocks)
 
@@ -217,11 +320,6 @@ class AttentionHandler:
             queries=queries if is_prefilling else None,
         )
 
-        if is_prefilling:
-            # By this point we should have put all the layer sparsity statistics for all methods
-            from sparse_frontier.modelling.attention.registry import get_attention
-            get_attention().sync_and_calc_layer_stats()
-
         if not is_prefilling:
             from sparse_frontier.modelling.attention.registry import get_attention
 
@@ -231,9 +329,11 @@ class AttentionHandler:
                 values=values,
                 k_cache=k_cache,
                 v_cache=v_cache,
-                cache_seqlens=self.tokens_per_layer_head[self.current_layer],
+                tokens_per_head=self.tokens_per_layer_head[self.current_layer],
                 output=output,
                 layer_idx=self.current_layer,
             )
 
-        self.current_layer = (self.current_layer + 1) % self.model_layers
+            self._maybe_report_decode_cost(device=keys.device)
+
+        self.advance_layer()

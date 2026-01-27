@@ -1,12 +1,6 @@
 import math
 import torch
 from .abstract_attention import AbstractAttention
-from .minference import (
-    block_sparse_attention,
-    vertical_and_slash_kernel,
-    vertical_slash_sparse_attention,
-    sum_over_diagonals,
-)
 from .abstract_attention import AttentionUtils
 
 
@@ -19,7 +13,6 @@ class DenseAttention(AbstractAttention):
     def __call__(
         self, queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor, layer_idx: int
     ) -> torch.Tensor:
-        self.layer_sparsity_statistics.append(torch.tensor(0.0, device=queries.device))
         return AttentionUtils.flash_attention(queries, keys, values)
 
 
@@ -101,8 +94,11 @@ class BlockSparseAttentionMInference(AbstractAttention):
     def __call__(
         self, queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor, layer_idx: int
     ) -> torch.Tensor:
-        sparsity = torch.tensor(self._calculate_sparsity(queries.shape[2], self.chunk_size, self.top_chunks), device=queries.device)
-        self.layer_sparsity_statistics.append(sparsity)
+        from .minference import block_sparse_attention
+        from sparse_frontier.modelling.attention.registry import get_attention_handler
+
+        sparsity = float(self._calculate_sparsity(queries.shape[2], self.chunk_size, self.top_chunks))
+        get_attention_handler().report_prefill_sparsity(sparsity)
         return block_sparse_attention(queries, keys, values, self.top_chunks, self.chunk_size, self.chunk_size)
 
 
@@ -134,6 +130,9 @@ class VerticalAndSlashAttentionMInference(AbstractAttention):
     def __call__(
         self, queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor, layer_idx: int
     ) -> torch.Tensor:
+        from .minference import vertical_and_slash_kernel
+        from sparse_frontier.modelling.attention.registry import get_attention_handler
+
         attn_output, sparsity = vertical_and_slash_kernel(
             queries,
             keys,
@@ -142,7 +141,7 @@ class VerticalAndSlashAttentionMInference(AbstractAttention):
             slash_size=min(self.slash_size, queries.shape[2]),
             last_q=min(self.approximation_size, queries.shape[2]),
         )
-        self.layer_sparsity_statistics.append(sparsity)
+        get_attention_handler().report_prefill_sparsity(float(sparsity))
         return attn_output
 
 
@@ -168,6 +167,7 @@ class FlexPrefill(AbstractAttention):
     def get_active_blocks(
         self, q, k, v
     ):
+        from .minference import sum_over_diagonals
         _, _, seq_len, head_dim = q.shape
 
         # Compute attention scores for last queries
@@ -206,6 +206,9 @@ class FlexPrefill(AbstractAttention):
     def __call__(
         self, queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor, layer_idx: int
     ) -> torch.Tensor:
+        from .minference import vertical_slash_sparse_attention
+        from sparse_frontier.modelling.attention.registry import get_attention_handler
+
         assert queries.shape[-1] == keys.shape[-1]
 
         # Get active blocks for sparse portion
@@ -219,7 +222,6 @@ class FlexPrefill(AbstractAttention):
             vertical_idx,
             slash_idx,
         )
-
-        self.layer_sparsity_statistics.append(sparsity)
+        get_attention_handler().report_prefill_sparsity(float(sparsity))
         
         return sparse_out

@@ -70,9 +70,6 @@ def _triton_block_sparse_attn_fwd_kernel(
         v = tl.load(v_ptrs + cols[:, None] * stride_vn)
         # -- compute qk --
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        # if start_n + BLOCK_N < seqlen:
-        #     qk = tl.where(m_mask, qk, float("-inf"))
-        # else:
         causal_mask = cols[None, :] <= offs_m[:, None]
         qk = tl.where(m_mask & causal_mask, qk, float("-inf"))
         qk += tl.dot(q, k)
@@ -106,7 +103,7 @@ def _triton_block_sparse_attention(
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
-    assert Lk in {16, 32, 64, 128}
+    assert Lk in {16, 32, 64, 128, 256}
     o = torch.zeros_like(q)
     grid = (triton.cdiv(q.shape[2], block_size_M), q.shape[0] * q.shape[1], 1)
     dtype = tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16

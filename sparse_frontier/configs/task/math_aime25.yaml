@@ -1,0 +1,6 @@
+# @package _global_
+
+task:
+  name: math_aime25
+  args:
+    dataset_name: aime25

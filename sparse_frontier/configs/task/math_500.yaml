@@ -1,0 +1,6 @@
+# @package _global_
+
+task:
+  name: math_500
+  args:
+    dataset_name: math_500

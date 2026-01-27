@@ -1,17 +1,16 @@
-from typing import Dict, Optional
-
+import os
+from typing import Callable, Dict, Optional, Any
 import torch
-from vllm import LLM, SamplingParams
-from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.backends.flash_attn import (
-    FlashAttentionMetadata,
-    get_num_prefill_decode_query_kv_tokens,
-)
 
-from sparse_frontier.modelling.attention.registry import get_attention, get_attention_handler
-from sparse_frontier.utils.globals import set_vllm_profiling_done, is_vllm_profiling_done
+from sparse_frontier.modelling.attention.registry import (
+    get_attention_handler,
+    ensure_attention_initialized_from_env,
+)
 from .abstract_model import AbstractModel
 from sparse_frontier.modelling.tokenizer import Tokenizer
+
+
+_ORIGINAL_FLASH_ATTENTION_FORWARD: Optional[Callable[..., torch.Tensor]] = None
 
 
 class VLLMModel(AbstractModel):
@@ -23,6 +22,7 @@ class VLLMModel(AbstractModel):
         dtype: torch.dtype = None,
         tensor_parallel_size: int = 1,
         seed: Optional[int] = 43,
+        enable_thinking: bool = False,
     ):
         """
             vLLM uses forking to run the TP. Therefore we can't initialise CUDA,
@@ -35,14 +35,13 @@ class VLLMModel(AbstractModel):
         self.dtype = dtype or torch.bfloat16
         self.tensor_parallel_size = tensor_parallel_size
         self.seed = seed
-
-        set_vllm_profiling_done(False)
+        self.enable_thinking = enable_thinking
 
         assert not torch.cuda.is_initialized(), "CUDA is not initialized"
         self.model = self._load_model(self.model_path)
-        self.tokenizer = Tokenizer(self.model_path)
+        self.tokenizer = Tokenizer(self.model_path, thinking=self.enable_thinking)
 
-    def _load_model(self, model_path: str) -> LLM:
+    def _load_model(self, model_path: str):
         if 'Qwen' in model_path and self.max_input_tokens + self.max_output_tokens > 32768:
             factor = (self.max_input_tokens + self.max_output_tokens) / 32768
             hf_overrides = {
@@ -55,32 +54,50 @@ class VLLMModel(AbstractModel):
         else:
             hf_overrides = {}
 
+        from vllm import LLM
         model = LLM(
             model=model_path,
-            skip_tokenizer_init=True,
-            trust_remote_code=True,
+            # skip_tokenizer_init=True,  # Disabled: Gemma requires tokenizer for model configuration
             enforce_eager=True,
             seed=self.seed,
-            gpu_memory_utilization=0.9,
+            gpu_memory_utilization=0.85,
             max_num_batched_tokens=self.max_input_tokens + self.max_output_tokens,
             max_model_len=self.max_input_tokens + self.max_output_tokens,
-            enable_chunked_prefill=False,
+            enable_chunked_prefill=False, # it's no-op in v1
+            enable_prefix_caching=False,
             tensor_parallel_size=self.tensor_parallel_size,
             hf_overrides=hf_overrides,
+            limit_mm_per_prompt={"image": 0},
+            disable_hybrid_kv_cache_manager=True, # this fixes gemma3 which has sliding window cache and it impacts the way we handle kv cache
         )
-
-        # Statistics has been accumulated during vLLM profiling
-        get_attention().reset_sparsity_statistics()
-        set_vllm_profiling_done(True)
 
         return model
 
-    def _greedy_config(self, max_output_tokens: int) -> Dict:
+    def _sampling_config(self) -> Dict:
+        from vllm import SamplingParams
+
+        common_kwargs = {
+            'max_tokens': self.max_output_tokens,
+            'seed': self.seed,
+        }
+
+        if self.enable_thinking:
+            # Qwen 3 config for thinking mode
+            sampling_params = SamplingParams(
+                temperature=0.6,
+                top_p=0.95,
+                top_k=20,
+                min_p=0.0,
+                **common_kwargs,
+            )
+        else:
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                **common_kwargs,
+            )
+
         return {
-            'sampling_params': SamplingParams(
-                max_tokens=max_output_tokens,
-                temperature=0,
-            ),
+            'sampling_params': sampling_params,
             'use_tqdm': False,
         }
 
@@ -88,73 +105,93 @@ class VLLMModel(AbstractModel):
     def generate(
         self,
         input_text: str,
-        max_output_tokens: int = None,
     ) -> str:
-        max_output_tokens = max_output_tokens or self.max_output_tokens
+        from vllm.inputs import TokensPrompt
         model_input = self.tokenizer.encode_for_generation(input_text, return_tensors=False)
+        prompt = TokensPrompt(prompt_token_ids=model_input["input_ids"])
 
-        output = self.model.generate(
-            prompt_token_ids=model_input['input_ids'],
-            **self._greedy_config(max_output_tokens),
-        )
+        sampling_config = self._sampling_config()
+        output_ids = self.model.generate(
+            prompts=[prompt],
+            **sampling_config,
+        )[0].outputs[0].token_ids
 
-        output_ids = output[0].__dict__['outputs'][0].token_ids
         decoded = self.tokenizer.decode(output_ids)
 
-        return {
+        output: dict[str, Any] = {
             'text': decoded[0] if isinstance(decoded, list) else decoded,
             'output_tokens_len': len(output_ids),
         }
 
-
+        return output
 
 def vllm_patched_forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
-        attn_type: AttentionType = AttentionType.DECODER,
-        output: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Forward pass with FlashAttention.
+    self,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
+    output: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+):
+    global _ORIGINAL_FLASH_ATTENTION_FORWARD
 
-        Args:
-            query: shape = [num_tokens, num_heads, head_size]
-            key: shape = [num_tokens, num_kv_heads, head_size]
-            value: shape = [num_tokens, num_kv_heads, head_size]
-            output: shape = [num_tokens, num_heads, head_size]
-            kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
-            attn_metadata: Metadata for attention.
-        Returns:
-            shape = [num_tokens, num_heads * head_size]
-        """
-        (num_prefill_query_tokens, num_prefill_kv_tokens, _) = \
-            get_num_prefill_decode_query_kv_tokens(attn_metadata, attn_type)
-        
-        if attn_metadata.prefill_metadata:
-            get_attention_handler().__call__(
-                queries=query[:num_prefill_query_tokens],
-                keys=key[:num_prefill_kv_tokens],
-                values=value[:num_prefill_kv_tokens],
-                kv_cache=kv_cache,
-                output=output[:num_prefill_query_tokens],
-            )
+    if attn_metadata is None:
+        # This is vLLM's profiling run - initialize attention and pre-allocate memory
+        ensure_attention_initialized_from_env(key)
+        return output
+    
+    handler = get_attention_handler()
+    num_tokens = query.shape[0]
+    is_prefilling = num_tokens > 1
+
+    # Initialize tracking state at layer 0 (needed for all layer types including sliding window)
+    if handler.current_layer == 0:
+        if is_prefilling:
+            handler._begin_prefill(prompt_len=num_tokens)
         else:
-            get_attention_handler().__call__(
-                queries=query[num_prefill_query_tokens:],
-                keys=key[num_prefill_query_tokens:],
-                values=value[num_prefill_query_tokens:],
-                kv_cache=kv_cache,
-                output=output[num_prefill_query_tokens:],
-            )
+            handler._begin_decode_step()
 
+    sliding_window = getattr(self, "sliding_window", (-1, -1))
+
+    if sliding_window != (-1, -1):
+        handler.advance_layer()
+
+        return _ORIGINAL_FLASH_ATTENTION_FORWARD(
+            self,
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
+    else:
+        handler(
+            queries=query.contiguous(),
+            keys=key.contiguous(),
+            values=value.contiguous(),
+            kv_cache=kv_cache.contiguous(),
+            output=output,
+        )
         return output
 
 
 def swap_vllm_attention():
-    from vllm.attention.backends.flash_attn import FlashAttentionImpl
+    is_attention_patch_enabled = os.getenv("SF_USE_ATTENTION_PATCH", "1") != "0"
+    if not is_attention_patch_enabled:
+        return
+
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+    global _ORIGINAL_FLASH_ATTENTION_FORWARD
+
+    if _ORIGINAL_FLASH_ATTENTION_FORWARD is None:
+        _ORIGINAL_FLASH_ATTENTION_FORWARD = FlashAttentionImpl.forward
+
     FlashAttentionImpl.forward = vllm_patched_forward

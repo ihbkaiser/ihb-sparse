@@ -1,0 +1,11 @@
+# @package _global_
+
+model:
+  name: llama_31_70b
+  path: ${paths.checkpoints}/Llama-3.1-70B-Instruct
+  hf_repo: meta-llama/Llama-3.1-70B-Instruct
+  num_q_heads: 64
+  num_kv_heads: 8
+  num_layers: 80
+
+tp: 4

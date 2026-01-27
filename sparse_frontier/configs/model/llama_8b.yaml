@@ -1,0 +1,11 @@
+# @package _global_
+
+model:
+  name: llama_8b
+  path: ${paths.checkpoints}/Llama-3.1-8B-Instruct
+  hf_repo: meta-llama/Llama-3.1-8B-Instruct
+  num_q_heads: 32
+  num_kv_heads: 8
+  num_layers: 32
+
+tp: 1 

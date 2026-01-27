@@ -37,8 +37,8 @@ class AbstractModel(ABC):
         pass
 
     @abstractmethod
-    def _greedy_config(self, max_output_tokens: int) -> Dict:
-        """Get configuration for greedy generation.
+    def _sampling_config(self, max_output_tokens: int) -> Dict:
+        """Get configuration for a generation call.
 
         Args:
             max_output_tokens: Maximum number of new tokens to generate

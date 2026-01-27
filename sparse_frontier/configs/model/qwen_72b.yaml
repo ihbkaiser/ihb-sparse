@@ -3,11 +3,9 @@
 model:
   name: qwen_72b
   path: ${paths.checkpoints}/Qwen2.5-72B-Instruct
+  hf_repo: Qwen/Qwen2.5-72B-Instruct
   num_q_heads: 64
   num_kv_heads: 8
   num_layers: 80
-  hidden_dim: 8192
-  intermediate_dim: 29568
-  vocab_size: 152064
 
 tp: 4

@@ -8,8 +8,10 @@ class Tokenizer:
         self,
         model_path: str,
         device: torch.device = None,
+        thinking: bool = False,
     ) -> None:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.thinking = thinking
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -35,7 +37,8 @@ class Tokenizer:
         input_text_with_prompt = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": input_text}],
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=self.thinking,
         )
 
         if return_tensors:

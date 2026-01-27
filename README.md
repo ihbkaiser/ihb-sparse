@@ -1,8 +1,17 @@
+
 <p align="center">
   <img src="./assets/photo.png" width="100%" alt="logo">
 </p>
 
-## TL;DR
+## Latest News🔥
+
+- [2025/12] 💻 Added **MATH** tasks to the evaluation suite: `AIME24/25`, `MATH500`
+- [2025/12] 🧠 Added support for **reasoning models** like **Qwen3** and **hybrid models** like **Gemma 3**
+- [2025/12] ⚡ Added support for **vLLM v1** (re-architected vLLM engine)
+- [2025/12] 🧠️ Added support for **TOVA (Token Omission Via Attention)**, training-free KV-cache compression via attention-based token omission
+
+
+## About
 
 **The evaluation framework for training-free sparse attention in LLMs**
 
@@ -10,15 +19,16 @@ This repository serves two main purposes:
 1. **Reproducing results** from our paper "[The Sparse Frontier: Sparse Attention Trade-offs in Transformer LLMs](https://arxiv.org/abs/2504.17768)".
 2. **Providing a starting point** for your own training-free sparse attention research and development.
 
+
 ### Why This Framework?
 
-**The Problem**: vLLM is a highly optimized framework supporting hundreds of models, but its extensive codebase makes integrating custom sparse attention patterns extremely challenging. Researchers face a difficult choice: build from scratch with limited model support, use Hugging Face where each model requires navigating different implementation files to add support, or navigate vLLM's complex internals.
+**The Problem**: vLLM is a highly optimized framework supporting hundreds of models, but its extensive codebase makes integrating custom sparse attention patterns extremely challenging. Researchers face a difficult choice: build from scratch with limited model support, use Hugging Face which often lacks efficient inference support (TP), or navigate vLLM's complex internals.
 
 **Our Solution**: We provide a clean abstraction that lets you focus on your sparse attention logic while automatically inheriting all of vLLM's optimizations and model compatibility. Here's what makes our framework unique:
 
-- **🎯 Elegant vLLM Integration**: Seamless sparse attention integration through our `AttentionHandler` that intercepts vLLM's execution flow. Write your sparse attention in 50 lines, not 5000—evaluate on 100 models, not 1. By implementing sparse attention in our framework, you automatically gain compatibility with all models supported by vLLM, from small 7B models to large 405B+ models across different architectures (Llama, Qwen, Mistral, etc.).
-- **⚡ State-of-the-art Baselines**: 6 representative SOTA patterns spanning key design dimensions for both inference phases—sparse prefilling (Vertical-Slash, Block-Sparse, FlexPrefill), sparse decoding (Quest), and KV cache compression (SnapKV, Ada-SnapKV)—with optimized Triton implementations.
-- **🔬 Comprehensive Evaluation**: 9 diverse tasks covering retrieval, multi-hop reasoning, and information aggregation with rigorous sequence length control and standardized preprocessing.
+- **🎯 Elegant vLLM Integration**: Seamless sparse attention integration through our `AttentionHandler` that intercepts vLLM's execution flow. Write your sparse attention in 50 lines, not 5000—evaluate on 100 models, not 1. By implementing sparse attention in our framework, you automatically gain compatibility with all models supported by vLLM, from small 7B models to large 405B+ models across different architectures (Qwen, Gemma, etc.).
+- **⚡ State-of-the-art Baselines**: 7 representative SOTA patterns spanning key design dimensions for both inference phases—sparse prefilling (Vertical-Slash, Block-Sparse, FlexPrefill), sparse decoding (Quest), and KV cache compression (SnapKV, Ada-SnapKV, TOVA)—with optimized Triton implementations.
+- **🔬 Comprehensive Evaluation**: A diverse suite of tasks covering retrieval, multi-hop reasoning, and information aggregation, math and code, with rigorous sequence length control and standardized preprocessing.
 - **🧪 Research-Grade Extensibility**: Clean modular architecture with abstract base classes designed for rapid prototyping of novel sparse attention patterns and tasks.
 
 ### Getting Started with Sparse Attention
@@ -27,42 +37,26 @@ If you're new to sparse attention and want to understand how these patterns work
 
 ## Setup
 
-Follow these steps to set up the environment and prepare for running experiments:
+````bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --no-cache-dir --upgrade pip setuptools wheel psutil ninja
+pip install --no-cache-dir torch==2.8.0
+pip install --no-cache-dir -e .
+MAX_JOBS=8 python compile.py build_ext --inplace --build-lib ./sparse_frontier/modelling/attention/minference
+````
 
-1.  **Create Virtual Environment and Install Dependencies:**
-    Set up a dedicated Python environment and install the required packages, including compiling custom CUDA kernels
+For reference, the complete list of dependencies used in our experiments is available in `./assets/pipfreeze.txt`. We tested the codebase on both A100 and H100 GPUs.
 
-    ```bash
-    # Create a virtual environment using Python 3.11
-    python3.11 -m venv .venv
+1. **Configure Paths:**
+   Modify the default configuration file to specify where data, results, and checkpoints should be stored on your system.
 
-    # Activate the virtual environment
-    source .venv/bin/activate
+   * Edit the `paths` section in `configs/default.yaml`.
 
-    # Upgrade pip and install essential build/utility tools
-    pip install --no-cache-dir --upgrade pip setuptools wheel psutil ninja
+2. **Model Checkpoints:**
+   Model checkpoints are automatically downloaded from HuggingFace Hub on first run. The models are saved to the `paths.checkpoints` directory specified in `configs/default.yaml`.
 
-    # Install PyTorch
-    pip install --no-cache-dir torch==2.5.1
-
-    # Install the sparse_frontier project in editable mode
-    pip install --no-cache-dir -e .
-
-    # Compile custom CUDA kernels (for MInference attention)
-    # Adjust MAX_JOBS based on your system core count for faster compilation
-    MAX_JOBS=8 python compile.py build_ext --inplace --build-lib ./sparse_frontier/modelling/attention/minference
-    ```
-    For reference, the complete list of dependencies used in our experiments is available in `./assets/pipfreeze.txt`. We tested the codebase on both A100 and H100 GPUs.
-
-2.  **Configure Paths:**
-    Modify the default configuration file to specify where data, results, and checkpoints should be stored on your system.
-
-    *   Edit the `paths` section in `configs/default.yaml`.
-
-3.  **Download Model Checkpoints:**
-    Obtain the pre-trained model weights you intend to evaluate from Hugging Face Hub. We prefer doing this manually as this way we have better control of what and where we download things.
-    
-    *   Ensure the final directory structure for the downloaded checkpoints matches the format expected by the corresponding model configuration file (e.g., as defined in `configs/model/qwen_7b.yaml`). The `model.path` variable in these configs should point to the directory containing the model files.
+   * For gated models (e.g., Llama, Gemma), ensure you have accepted the model license on HuggingFace and are logged in via `huggingface-cli login`.
 
 ## Where should I look at if I want to:
 
@@ -70,27 +64,29 @@ Follow these steps to set up the environment and prepare for running experiments
 
 Experiments are launched using the main script `sparse_frontier.main`. The framework uses [Hydra](https://hydra.cc/) for configuration management. All configurations are stored in YAML files within the `sparse_frontier/configs/` directory, organized into three main categories:
 
-- **`attention/`**: Configurations for different sparse attention mechanisms (dense, quest, snapkv, etc.)
-- **`task/`**: Configurations for evaluation tasks (RULER, QA, Story tasks)
-- **`model/`**: Configurations for different model architectures (Qwen2.5-7B to 72B)
+* **`attention/`**: Configurations for different sparse attention mechanisms (dense, quest, snapkv, etc.)
+* **`task/`**: Configurations for evaluation tasks (RULER, QA, Story, MATH)
+* **`model/`**: Configurations for different model architectures
 
 The execution pipeline typically involves three stages, controlled by the `mode` parameter (defaulting to `all`):
-1.  **Preparation (`preparation.py`):** Generates and saves task-specific data based on the selected `task` configuration. Tasks are defined in `sparse_frontier/tasks/` (inheriting from [AbstractTask](./sparse_frontier/tasks/abstract_task.py) and [AbstractSample](./sparse_frontier/tasks/abstract_sample.py)) and registered in [TASK_REGISTRY](sparse_frontier/tasks/registry.py).
-2.  **Prediction (`prediction.py`):** Runs the specified `model` with the chosen `attention` mechanism on the prepared data, saving the model outputs. Attention mechanisms are implemented in `sparse_frontier/modelling/attention/` and registered in [ATTENTION_REGISTRY](sparse_frontier/modelling/attention/registry.py).
-3.  **Evaluation (`evaluation.py`):** Compares the predictions against the gold answers using the task's specific evaluation logic and saves the final metrics.
+
+1. **Preparation (`preparation.py`):** Generates and saves task-specific data based on the selected `task` configuration. Tasks are defined in `sparse_frontier/tasks/` (inheriting from [AbstractTask](./sparse_frontier/tasks/abstract_task.py) and [AbstractSample](./sparse_frontier/tasks/abstract_sample.py)) and registered in [TASK_REGISTRY](sparse_frontier/tasks/registry.py).
+2. **Prediction (`prediction.py`):** Runs the specified `model` with the chosen `attention` mechanism on the prepared data, saving the model outputs. Attention mechanisms are implemented in `sparse_frontier/modelling/attention/` and registered in [ATTENTION_REGISTRY](sparse_frontier/modelling/attention/registry.py).
+3. **Evaluation (`evaluation.py`):** Compares the predictions against the gold answers using the task's specific evaluation logic and saves the final metrics.
 
 **Quick Start Examples:**
+
 ```bash
 # Basic experiment with command line overrides
-python -m sparse_frontier.main task=ruler_niah model=qwen_7b attention=quest samples=50
+python -m sparse_frontier.main task=ruler_niah model=qwen_7b attention=dense samples=1
 
 # Override attention parameters
 python -m sparse_frontier.main attention=quest attention.args.token_budget=2048
 ```
 
-For detailed configuration documentation see **[CONFIGURATION.md](CONFIGURATION.md)**.
+For detailed configuration documentation see [`sparse_frontier/config_schema.py`](sparse_frontier/config_schema.py).
 
-**Note**: The current framework implementation supports only batch size = 1. This limitation stems from our initial experiments with methods that had kernels supporting only BS=1. Since then, we have followed a simple heuristic: for a given (Model Size, Method, Sequence Length) combination, we find the minimum tensor parallelism (TP) that provides sufficient total GPU memory to handle the evaluation, then use our [intra-node scheduler](./sparse_frontier/prediction.py) to distribute BS=1 evaluations across the node's GPUs. For the majority of our evaluations, we achieved >95% GPU utilization. Nevertheless, higher throughput and GPU utilization could likely be achieved with larger TP and BS>1. We plan to support batch size > 1 in the next release.
+**Note**: The current framework implementation supports only batch size = 1. This limitation stems from our initial experiments with methods that had kernels supporting only BS=1. Since then, we have followed a simple heuristic: for a given (Model Size, Method, Sequence Length) combination, we find the minimum tensor parallelism (TP) that provides sufficient total GPU memory to handle the evaluation, then use our [intra-node scheduler](./sparse_frontier/prediction.py) to distribute BS=1 evaluations across the node's GPUs. For the majority of our evaluations, we achieved >95% GPU utilization. Nevertheless, higher throughput and GPU utilization could likely be achieved with BS>1.
 
 ### Develop Your Own Training-Free Sparse Attention
 
@@ -122,7 +118,7 @@ class MySparseAttention(AbstractAttention):
         # Your prefill attention logic (uses dense prefill if not implemented)
         return attention_output
     
-    def decode(self, query, keys, values, k_cache, v_cache, cache_seqlens, output, layer_idx):
+    def decode(self, query, keys, values, k_cache, v_cache, tokens_per_head, output, layer_idx):
         # Your decoding logic (uses dense decoding if not implemented)
         pass
     
@@ -133,7 +129,7 @@ class MySparseAttention(AbstractAttention):
 
 That's it! No need to browse the huge vLLM codebase or worry about inference state handling, etc.
 
-Examples can be found in: [kv_compression.py](./sparse_frontier/modelling/attention/kv_compression.py) for SnapKV and AdaSnapKV; [efficient_prefilling.py](./sparse_frontier/modelling/attention/efficient_prefilling.py) for Vertical-Slash, Block-Sparse, and FlexPrefill, [efficient_decoding.py](./sparse_frontier/modelling/attention/efficient_decoding.py) for Quest.
+Examples can be found in: [kv_compression.py](./sparse_frontier/modelling/attention/kv_compression.py) for SnapKV and AdaSnapKV; [efficient_prefilling.py](./sparse_frontier/modelling/attention/efficient_prefilling.py) for Vertical-Slash, Block-Sparse, and FlexPrefill, [efficient_decoding.py](./sparse_frontier/modelling/attention/efficient_decoding.py) for Quest and TOVA.
 
 #### Registration
 
@@ -191,13 +187,14 @@ Experimental data generation is handled by task-specific modules located in `spa
 
 In this repository, we evaluate 6 sparse attention patterns:
 
-| Pattern | Source |
-|---------|--------|
-| **Vertical-Slash / Block-Sparse** | [Microsoft](https://github.com/microsoft/MInference) |
-| **FlexPrefill** | [ByteDance-Seed](https://github.com/ByteDance-Seed/FlexPrefill) |
-| **SnapKV** | [FasterDecoding](https://github.com/FasterDecoding/SnapKV) |
-| **Ada-SnapKV** | [FFY0](https://github.com/FFY0/AdaKV) |
-| **Quest** | [MIT-HAN-Lab](https://github.com/mit-han-lab/Quest) |
+| Pattern                                                                     | Source                                                                    |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| **Vertical-Slash / Block-Sparse**                                           | [Microsoft](https://github.com/microsoft/MInference)                      |
+| **FlexPrefill**                                                             | [ByteDance-Seed](https://github.com/ByteDance-Seed/FlexPrefill)           |
+| **SnapKV**                                                                  | [FasterDecoding](https://github.com/FasterDecoding/SnapKV)                |
+| **Ada-SnapKV**                                                              | [FFY0](https://github.com/FFY0/AdaKV)                                     |
+| **Quest**                                                                   | [MIT-HAN-Lab](https://github.com/mit-han-lab/Quest)                       |
+| **TOVA** (Token Omission Via Attention; training-free KV-cache compression) | [Oren et al., EMNLP 2024](https://aclanthology.org/2024.emnlp-main.1043/) |
 
 We either re-implement these patterns based on the original code or borrow implementations including kernels (for Vertical-Slash and Block-Sparse) from MInference.
 
@@ -206,12 +203,14 @@ We either re-implement these patterns based on the original code or borrow imple
 Our evaluation framework includes the following tasks:
 
 1. **RULER Tasks**: Re-implementation of NIAH, VT, and CWE tasks from [NVIDIA/RULER](https://github.com/NVIDIA/RULER)
-
 2. **QA Tasks**:
-   - Toefl and Quality datasets from [LC-VS-RAG](https://github.com/lixinze777/LC_VS_RAG)
-   - SQuAD dataset from [NVIDIA/RULER](https://github.com/NVIDIA/RULER)
-
+   * Toefl and Quality datasets from [LC-VS-RAG](https://github.com/lixinze777/LC_VS_RAG)
+   * SQuAD dataset from [NVIDIA/RULER](https://github.com/NVIDIA/RULER)
 3. **Novel Story Tasks**: Narrative tasks developed specifically for this project.
+4. **MATH Tasks**:
+   * AIME24: https://huggingface.co/datasets/HuggingFaceH4/aime_2024
+   * AIME25: https://huggingface.co/datasets/opencompass/AIME2025
+   * MATH 500: https://huggingface.co/datasets/HuggingFaceH4/MATH-500
 
 ## Cite
 
@@ -229,4 +228,4 @@ If you found the repository useful consider citing the paper about this work.
 
 ## Issues:
 
-If you have any questions, feel free to raise a Github issue or contact me directly at: piotr.nawrot@ed.ac.uk
+If you have any questions, feel free to raise a Github issue or contact me directly at: [piotr.nawrot@ed.ac.uk](mailto:piotr.nawrot@ed.ac.uk)
