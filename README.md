@@ -1,231 +1,213 @@
+# Sparse Frontier
 
-<p align="center">
-  <img src="./assets/photo.png" width="100%" alt="logo">
-</p>
+Evaluation framework for training-free sparse attention in transformer LLMs. The repository provides vLLM-based implementations and reproducible RULER evaluation for Dense, Quest, and ShadowKV.
 
-## Latest News🔥
+## Requirements
 
-- [2025/12] 💻 Added **MATH** tasks to the evaluation suite: `AIME24/25`, `MATH500`
-- [2025/12] 🧠 Added support for **reasoning models** like **Qwen3** and **hybrid models** like **Gemma 3**
-- [2025/12] ⚡ Added support for **vLLM v1** (re-architected vLLM engine)
-- [2025/12] 🧠️ Added support for **TOVA (Token Omission Via Attention)**, training-free KV-cache compression via attention-based token omission
+- Linux, Python 3.10–3.12, NVIDIA GPU, and a CUDA 12.8-compatible driver.
+- Enough GPU memory for the selected model, context length, and tensor parallelism (`tp`).
+- Hugging Face access for gated checkpoints such as Llama and Gemma.
 
+Install the pinned runtime:
 
-## About
-
-**The evaluation framework for training-free sparse attention in LLMs**
-
-This repository serves two main purposes:
-1. **Reproducing results** from our paper "[The Sparse Frontier: Sparse Attention Trade-offs in Transformer LLMs](https://arxiv.org/abs/2504.17768)".
-2. **Providing a starting point** for your own training-free sparse attention research and development.
-
-
-### Why This Framework?
-
-**The Problem**: vLLM is a highly optimized framework supporting hundreds of models, but its extensive codebase makes integrating custom sparse attention patterns extremely challenging. Researchers face a difficult choice: build from scratch with limited model support, use Hugging Face which often lacks efficient inference support (TP), or navigate vLLM's complex internals.
-
-**Our Solution**: We provide a clean abstraction that lets you focus on your sparse attention logic while automatically inheriting all of vLLM's optimizations and model compatibility. Here's what makes our framework unique:
-
-- **🎯 Elegant vLLM Integration**: Seamless sparse attention integration through our `AttentionHandler` that intercepts vLLM's execution flow. Write your sparse attention in 50 lines, not 5000—evaluate on 100 models, not 1. By implementing sparse attention in our framework, you automatically gain compatibility with all models supported by vLLM, from small 7B models to large 405B+ models across different architectures (Qwen, Gemma, etc.).
-- **⚡ State-of-the-art Baselines**: 7 representative SOTA patterns spanning key design dimensions for both inference phases—sparse prefilling (Vertical-Slash, Block-Sparse, FlexPrefill), sparse decoding (Quest), and KV cache compression (SnapKV, Ada-SnapKV, TOVA)—with optimized Triton implementations.
-- **🔬 Comprehensive Evaluation**: A diverse suite of tasks covering retrieval, multi-hop reasoning, and information aggregation, math and code, with rigorous sequence length control and standardized preprocessing.
-- **🧪 Research-Grade Extensibility**: Clean modular architecture with abstract base classes designed for rapid prototyping of novel sparse attention patterns and tasks.
-
-### Getting Started with Sparse Attention
-
-If you're new to sparse attention and want to understand how these patterns work, we recommend starting with our companion repository: [nano-sparse-attention](https://github.com/PiotrNawrot/nano-sparse-attention). It provides clean, educational PyTorch implementations with interactive Jupyter notebooks for experimenting and learning before diving into the optimized implementations here. Originally created for the [NeurIPS 2024 Dynamic Sparsity Workshop](https://dynamic-sparsity.github.io/), it serves as an excellent starting point for understanding sparse attention fundamentals.
-
-## Setup
-
-````bash
-python -m venv .venv
+```bash
+python3 -m venv .venv
 source .venv/bin/activate
-pip install --no-cache-dir --upgrade pip setuptools wheel psutil ninja
-pip install --no-cache-dir torch==2.8.0
-pip install --no-cache-dir -e .
-MAX_JOBS=8 python compile.py build_ext --inplace --build-lib ./sparse_frontier/modelling/attention/minference
-````
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
 
-For reference, the complete list of dependencies used in our experiments is available in `./assets/pipfreeze.txt`. We tested the codebase on both A100 and H100 GPUs.
-
-1. **Configure Paths:**
-   Modify the default configuration file to specify where data, results, and checkpoints should be stored on your system.
-
-   * Edit the `paths` section in `configs/default.yaml`.
-
-2. **Model Checkpoints:**
-   Model checkpoints are automatically downloaded from HuggingFace Hub on first run. The models are saved to the `paths.checkpoints` directory specified in `configs/default.yaml`.
-
-   * For gated models (e.g., Llama, Gemma), ensure you have accepted the model license on HuggingFace and are logged in via `huggingface-cli login`.
-
-## Where should I look at if I want to:
-
-### Reproduce your experiments
-
-Experiments are launched using the main script `sparse_frontier.main`. The framework uses [Hydra](https://hydra.cc/) for configuration management. All configurations are stored in YAML files within the `sparse_frontier/configs/` directory, organized into three main categories:
-
-* **`attention/`**: Configurations for different sparse attention mechanisms (dense, quest, snapkv, etc.)
-* **`task/`**: Configurations for evaluation tasks (RULER, QA, Story, MATH)
-* **`model/`**: Configurations for different model architectures
-
-The execution pipeline typically involves three stages, controlled by the `mode` parameter (defaulting to `all`):
-
-1. **Preparation (`preparation.py`):** Generates and saves task-specific data based on the selected `task` configuration. Tasks are defined in `sparse_frontier/tasks/` (inheriting from [AbstractTask](./sparse_frontier/tasks/abstract_task.py) and [AbstractSample](./sparse_frontier/tasks/abstract_sample.py)) and registered in [TASK_REGISTRY](sparse_frontier/tasks/registry.py).
-2. **Prediction (`prediction.py`):** Runs the specified `model` with the chosen `attention` mechanism on the prepared data, saving the model outputs. Attention mechanisms are implemented in `sparse_frontier/modelling/attention/` and registered in [ATTENTION_REGISTRY](sparse_frontier/modelling/attention/registry.py).
-3. **Evaluation (`evaluation.py`):** Compares the predictions against the gold answers using the task's specific evaluation logic and saves the final metrics.
-
-**Quick Start Examples:**
+Optional ShadowKV CUDA kernels can be compiled in the same environment:
 
 ```bash
-# Basic experiment with command line overrides
-python -m sparse_frontier.main task=ruler_niah model=qwen_7b attention=dense samples=1
-
-# Override attention parameters
-python -m sparse_frontier.main attention=quest attention.args.token_budget=2048
+SF_BUILD_SHADOWKV_CUDA=1 python setup.py build_ext --inplace
 ```
 
-For detailed configuration documentation see [`sparse_frontier/config_schema.py`](sparse_frontier/config_schema.py).
+The kernels are optional. The PyTorch implementation remains the fallback.
 
-**Note**: The current framework implementation supports only batch size = 1. This limitation stems from our initial experiments with methods that had kernels supporting only BS=1. Since then, we have followed a simple heuristic: for a given (Model Size, Method, Sequence Length) combination, we find the minimum tensor parallelism (TP) that provides sufficient total GPU memory to handle the evaluation, then use our [intra-node scheduler](./sparse_frontier/prediction.py) to distribute BS=1 evaluations across the node's GPUs. For the majority of our evaluations, we achieved >95% GPU utilization. Nevertheless, higher throughput and GPU utilization could likely be achieved with BS>1.
+## Models
 
-### Develop Your Own Training-Free Sparse Attention
+The RULER runner accepts a local Hugging Face checkpoint through `--model_path`; it does not accept a Hydra model name. Download the checkpoint first, or provide an existing cache directory:
 
-Instead of wrestling with vLLM's complex internals, we provide a clean abstraction layer that lets you focus on your sparse attention logic.
+| Model | Hugging Face repository | Default `tp` |
+|---|---|---:|
+| Qwen 2.5 7B | `Qwen/Qwen2.5-7B-Instruct` | 1 |
+| Qwen 2.5 14B | `Qwen/Qwen2.5-14B-Instruct` | 1 |
+| Qwen 2.5 32B | `Qwen/Qwen2.5-32B-Instruct` | 2 |
+| Qwen 2.5 72B | `Qwen/Qwen2.5-72B-Instruct` | 4 |
+| Qwen 3 4B/8B | `Qwen/Qwen3-4B`, `Qwen/Qwen3-8B` | 1 |
+| Llama 3.1 8B/70B | `meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.1-70B-Instruct` | 1/4 |
+| Gemma 3 4B/12B/27B | `google/gemma-3-4b-it`, `google/gemma-3-12b-it`, `google/gemma-3-27b-it` | 1/1/2 |
 
-#### How It Works
-
-Our integration works by intercepting vLLM's attention execution at the FlashAttention level. When you register your sparse attention pattern, our framework:
-
-1. **Patches vLLM's FlashAttention forward method** - The `vllm_patched_forward` function in [vllm_model.py](./sparse_frontier/modelling/models/vllm_model.py) replaces vLLM's default attention computation.
-2. **Routes attention calls through our handler** - The `AttentionHandler` from [handler.py](./sparse_frontier/modelling/attention/handler.py) manages layer state, prefill vs decode phases, and KV cache updates.
-3. **Executes your sparse attention** - Your implementation receives the same tensors vLLM would use, but with your custom attention logic.
-
-The `swap_vllm_attention` function is registered as a vLLM plugin in [setup.py](./setup.py), ensuring all tensor parallel workers automatically load our custom implementation. This provides seamless Tensor Parallelism support without any additional configuration.
-
-The integration is automatic - when you register your attention pattern, it becomes available to all vLLM-compatible models without any additional setup.
-
-#### Implementing a New Sparse Attention Pattern
-
-```python
-from sparse_frontier.modelling.attention.abstract_attention import AbstractAttention
-
-class MySparseAttention(AbstractAttention):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Your initialization logic
-    
-    def __call__(self, queries, keys, values, layer_idx):
-        # Your prefill attention logic (uses dense prefill if not implemented)
-        return attention_output
-    
-    def decode(self, query, keys, values, k_cache, v_cache, tokens_per_head, output, layer_idx):
-        # Your decoding logic (uses dense decoding if not implemented)
-        pass
-    
-    def kv_compress(self, queries, keys, values):
-        # Your KV compression logic (leaves the KV Cache intact if not implemented)
-        return compressed_keys, compressed_values, seq_lens
-```
-
-That's it! No need to browse the huge vLLM codebase or worry about inference state handling, etc.
-
-Examples can be found in: [kv_compression.py](./sparse_frontier/modelling/attention/kv_compression.py) for SnapKV and AdaSnapKV; [efficient_prefilling.py](./sparse_frontier/modelling/attention/efficient_prefilling.py) for Vertical-Slash, Block-Sparse, and FlexPrefill, [efficient_decoding.py](./sparse_frontier/modelling/attention/efficient_decoding.py) for Quest and TOVA.
-
-#### Registration
-
-Once you've implemented your sparse attention pattern, registration is a simple two-step process:
-
-**1. Register in the Attention Registry**
-
-Add your attention class to the `ATTENTION_REGISTRY` dictionary in [`sparse_frontier/modelling/attention/registry.py`](./sparse_frontier/modelling/attention/registry.py):
-
-```python
-from .your_module import MySparseAttention  # Import your implementation
-
-ATTENTION_REGISTRY = {
-    ...
-    'my_sparse_attention': MySparseAttention,  # Add your pattern here
-}
-```
-
-**2. Create Configuration File**
-
-Create a YAML configuration file at `configs/attention/my_sparse_attention.yaml` that defines your attention mechanism and its parameters:
-
-```yaml
-# @package _global_
-
-attention:
-  name: my_sparse_attention
-  args:
-    sparsity_ratio: 0.1
-```
-
-The configuration structure follows the pattern used by existing attention mechanisms. The `name` field must match your registry key, and `args` contains all the parameters that will be passed to your attention class constructor.
-
-**3. Run Evaluation**
-
-Your sparse attention pattern is now ready to use! Test it with any model and task:
+For a gated model, accept its license on Hugging Face and authenticate:
 
 ```bash
-# Basic evaluation with your new attention pattern
-python -m sparse_frontier.main task=ruler_niah model=qwen_7b attention=my_sparse_attention
-
-# Override specific attention parameters
-python -m sparse_frontier.main attention=my_sparse_attention attention.args.sparsity_ratio=0.05
+hf auth login
+hf download meta-llama/Llama-3.1-8B-Instruct \
+  --local-dir experiments/checkpoints/Llama-3.1-8B-Instruct
 ```
 
-**Result**: Your sparse attention works with any vLLM-compatible model and benefits from all vLLM optimizations.
+Use the resulting local directory as `MODEL_PATH`. For ShadowKV, the model must use scalar RoPE positions and its KV-head count must be divisible by `--tp`.
 
-### Extend the Test Data
+## RULER workflow
 
-Experimental data generation is handled by task-specific modules located in `sparse_frontier/tasks/`. Each task implements `AbstractTask` and `AbstractSample` subclasses (defined in `sparse_frontier/tasks/abstract_*.py`) to define input / output creation, and task-specific evaluation. Tasks are registered in `sparse_frontier/tasks/registry.py` and selected via configuration (e.g., `task=your_task_name`). The `preparation.py` script orchestrates the generation process based on the configuration, saving the formatted samples. See existing tasks like `QATask` (`qa_task.py`) or the Ruler tasks (`niah.py`, `cwe.py`, `vt.py`) for implementation examples.
+The mixed-task pilot covers `niah_single`, `niah_multikey`, `niah_multiquery`, `vt`, and `fwe`. It generates 50 samples per task by default (250 total), with stable indexes, task metadata, gold answers, and prompt-length accounting.
+
+### Prepare data
+
+Obtain the official RULER `PaulGrahamEssays.json` and set its path. The JSON object must contain a string field named `text`.
+
+```bash
+export MODEL_PATH="$PWD/experiments/checkpoints/Llama-3.1-8B-Instruct"
+export ESSAY_PATH="$PWD/data/PaulGrahamEssays.json"
+mkdir -p experiments/data/ruler
+```
+
+Generate one immutable dataset per context length. `--max_seq_length` includes the task-specific generation allowance.
+
+```bash
+for length in 8192 16384 32768; do
+  python -m sparse_frontier.ruler_pilot \
+    --model_path "$MODEL_PATH" \
+    --essay_path "$ESSAY_PATH" \
+    --output "experiments/data/ruler/ruler_${length}.jsonl" \
+    --samples_per_task 50 \
+    --max_seq_length "$length" \
+    --seed 20260831
+done
+```
+
+The generator refuses to overwrite an existing file. Do not reuse an 8K dataset for a 16K or 32K run.
+
+### Smoke test
+
+The smoke matrix runs Dense, Quest-512, and ShadowKV-512 on one sample each:
+
+```bash
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_8192.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_8k_smoke \
+  --max_input_tokens 8192 \
+  --max_output_tokens 1024 \
+  --tp 1 \
+  --seed 43 \
+  --smoke
+```
+
+### Full matrix
+
+Without `--method`, the runner executes seven isolated configurations:
+
+| Method | Budgets |
+|---|---|
+| Dense | none |
+| Quest | 512, 1024, 2048 |
+| ShadowKV | 512, 1024, 2048 |
+
+Run the matrix at any generated context length by keeping `--data_path` and `--max_input_tokens` equal:
+
+```bash
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_16384.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_16k_full \
+  --max_input_tokens 16384 \
+  --max_output_tokens 1024 \
+  --tp 1 \
+  --seed 43
+
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_32768.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_32k_full \
+  --max_input_tokens 32768 \
+  --max_output_tokens 1024 \
+  --tp 1 \
+  --seed 43
+```
+
+For a single configuration, add `--method dense`, or add `--method quest|shadowkv` and `--budget 512|1024|2048`:
+
+```bash
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_16384.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_16k_quest_b1024 \
+  --method quest \
+  --budget 1024 \
+  --max_input_tokens 16384 \
+  --max_output_tokens 1024 \
+  --tp 1
+```
+
+### 32K memory settings
+
+On a 24 GB GPU, increase vLLM capacity or offload model weights when required:
+
+```bash
+SF_GPU_MEMORY_UTILIZATION=0.96 \
+SF_CPU_OFFLOAD_GB=3 \
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_32768.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_32k_full \
+  --max_input_tokens 32768 \
+  --max_output_tokens 1024 \
+  --tp 1 \
+  --seed 43
+```
+
+`SF_CPU_OFFLOAD_GB` offloads model weights, not the KV cache; vLLM's KV cache remains dense. `SF_MAX_NUM_BATCHED_TOKENS=4096` can reduce dense-prefill activation memory, but ShadowKV requires a non-chunked prefill. `SF_KV_CACHE_MEMORY_BYTES` can cap dense KV-cache allocation when a measured value is available. For Qwen, YaRN RoPE scaling is applied automatically when input plus output length exceeds 32,768 tokens.
+
+### ShadowKV options
+
+ShadowKV uses randomized SVD by default. Use exact full SVD, and optionally disable fused retrieval:
+
+```bash
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_8192.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_8k_shadowkv_exact \
+  --method shadowkv \
+  --budget 2048 \
+  --max_input_tokens 8192 \
+  --shadowkv_svd_backend exact \
+  --no-shadowkv_fused_retrieval
+```
+
+Each run writes `dataset.jsonl`, `predictions.jsonl`, `aggregate.json`, `aggregate.csv`, and `run.json`. A nonzero exit code indicates at least one failed example or run.
+
+## Hydra workflow
+
+For the registered attention implementations outside the mixed pilot runner, use Hydra. Attention configs: `dense`, `quest`, `snapkv`, `ada_snapkv`, `flexprefill`, `block_sparse`, `vertical_and_slash`, `tova`, `shadowkv`. RULER task configs: `ruler_niah`, `ruler_vt`, `ruler_cwe`.
+
+```bash
+python -m sparse_frontier.main \
+  model=llama_8b attention=dense task=ruler_niah \
+  max_input_tokens=8192 max_output_tokens=1024 samples=30 tp=1
+
+python -m sparse_frontier.main \
+  model=llama_8b attention=quest attention.args.token_budget=1024 \
+  task=ruler_vt max_input_tokens=16384 max_output_tokens=1024 \
+  samples=30 tp=1
+```
+
+Model names and default checkpoint paths are defined in [`sparse_frontier/configs/model`](sparse_frontier/configs/model). Override a path with `model.path=/absolute/path/to/checkpoint`. Global defaults are in [`default.yaml`](sparse_frontier/configs/default.yaml).
+
+## Limitations and development
+
+Evaluation is single-request (`batch_size=1`). Dense attention is exact; Quest sparsifies decoding; ShadowKV keeps dense prefill and a dense vLLM KV cache, so it makes no KV-cache memory-savings claim.
+
+```bash
+python -m pytest -q
+```
+
+Primary extension points are [`sparse_frontier/modelling/attention`](sparse_frontier/modelling/attention), [`sparse_frontier/tasks`](sparse_frontier/tasks), and their registries.
 
 ## References
 
-### Sparse Attention Patterns
-
-In this repository, we evaluate 6 sparse attention patterns:
-
-| Pattern                                                                     | Source                                                                    |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| **Vertical-Slash / Block-Sparse**                                           | [Microsoft](https://github.com/microsoft/MInference)                      |
-| **FlexPrefill**                                                             | [ByteDance-Seed](https://github.com/ByteDance-Seed/FlexPrefill)           |
-| **SnapKV**                                                                  | [FasterDecoding](https://github.com/FasterDecoding/SnapKV)                |
-| **Ada-SnapKV**                                                              | [FFY0](https://github.com/FFY0/AdaKV)                                     |
-| **Quest**                                                                   | [MIT-HAN-Lab](https://github.com/mit-han-lab/Quest)                       |
-| **TOVA** (Token Omission Via Attention; training-free KV-cache compression) | [Oren et al., EMNLP 2024](https://aclanthology.org/2024.emnlp-main.1043/) |
-
-We either re-implement these patterns based on the original code or borrow implementations including kernels (for Vertical-Slash and Block-Sparse) from MInference.
-
-### Evaluation Tasks
-
-Our evaluation framework includes the following tasks:
-
-1. **RULER Tasks**: Re-implementation of NIAH, VT, and CWE tasks from [NVIDIA/RULER](https://github.com/NVIDIA/RULER)
-2. **QA Tasks**:
-   * Toefl and Quality datasets from [LC-VS-RAG](https://github.com/lixinze777/LC_VS_RAG)
-   * SQuAD dataset from [NVIDIA/RULER](https://github.com/NVIDIA/RULER)
-3. **Novel Story Tasks**: Narrative tasks developed specifically for this project.
-4. **MATH Tasks**:
-   * AIME24: https://huggingface.co/datasets/HuggingFaceH4/aime_2024
-   * AIME25: https://huggingface.co/datasets/opencompass/AIME2025
-   * MATH 500: https://huggingface.co/datasets/HuggingFaceH4/MATH-500
-
-## Cite
-
-If you found the repository useful consider citing the paper about this work.
-
-```
-@article{nawrot2025sparsefrontier,
-      title={The Sparse Frontier: Sparse Attention Trade-offs in Transformer LLMs}, 
-      author={Piotr Nawrot and Robert Li and Renjie Huang and Sebastian Ruder and Kelly Marchisio and Edoardo M. Ponti},
-      year={2025},
-      journal={arXiv:2504.17768}
-      url={https://arxiv.org/abs/2504.17768}, 
-}
-```
-
-## Issues:
-
-If you have any questions, feel free to raise a Github issue or contact me directly at: [piotr.nawrot@ed.ac.uk](mailto:piotr.nawrot@ed.ac.uk)
+- [The Sparse Frontier](https://arxiv.org/abs/2504.17768)
+- [RULER](https://github.com/NVIDIA/RULER)
+- [vLLM](https://github.com/vllm-project/vllm)
