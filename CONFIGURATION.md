@@ -16,6 +16,7 @@ sparse_frontier/configs/
 │   ├── ada_snapkv.yaml      # Ada-SnapKV attention
 │   ├── flexprefill.yaml     # FlexPrefill attention
 │   ├── block_sparse.yaml    # Block-sparse attention
+│   ├── shadowkv.yaml         # ShadowKV accuracy baseline
 │   └── vertical_and_slash.yaml # Vertical-Slash attention
 ├── task/                    # Task-specific configurations
 │   ├── ruler_niah.yaml      # RULER NIAH task

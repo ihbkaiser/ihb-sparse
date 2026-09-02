@@ -145,7 +145,12 @@ class QuestAttention(AbstractAttention):
         
         # Page representations per layer
         self.page_reps_per_layer: List[Optional[torch.Tensor]] = [None] * num_layers
+        self._page_reps_ready = [False] * num_layers
         self.offsets = None
+
+    def reset(self) -> None:
+        """Reset request-local page summaries."""
+        self._page_reps_ready = [False] * self.num_layers
 
     def preallocate_memory(self, keys: torch.Tensor) -> None:
         """Pre-allocate page representations for all layers."""
@@ -193,6 +198,32 @@ class QuestAttention(AbstractAttention):
                 keys.amin(dim=1),
                 keys.amax(dim=1),
             ], dim=1)
+        self._page_reps_ready[layer_idx] = True
+
+    def ensure_page_reps_from_cache(
+        self,
+        k_cache: torch.Tensor,
+        cache_len: int,
+        layer_idx: int,
+    ) -> None:
+        """Initialize summaries after vLLM handled a chunked dense prefill."""
+        if self._page_reps_ready[layer_idx]:
+            return
+        if k_cache.ndim != 4:
+            raise ValueError(
+                "Quest cache summaries expect [kv_heads, blocks, block_size, head_dim], "
+                f"got {tuple(k_cache.shape)}"
+            )
+        flat_cache = k_cache.view(k_cache.shape[0], -1, k_cache.shape[-1])
+        if cache_len < 1 or cache_len > flat_cache.shape[1]:
+            raise ValueError(
+                f"Quest cache length {cache_len} is outside the available "
+                f"cache range [1, {flat_cache.shape[1]}]"
+            )
+        self._init_page_reps(
+            flat_cache[:, :cache_len].unsqueeze(0),
+            layer_idx=layer_idx,
+        )
         
     def __call__(
         self,

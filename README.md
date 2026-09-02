@@ -98,13 +98,17 @@ python -m sparse_frontier.ruler_runner \
 
 ### Full matrix
 
-Without `--method`, the runner executes seven isolated configurations:
+Without `--method`, the runner executes the Dense/Quest/ShadowKV baseline matrix:
 
 | Method | Budgets |
 |---|---|
 | Dense | none |
 | Quest | 512, 1024, 2048 |
 | ShadowKV | 512, 1024, 2048 |
+
+Query-Robust is not part of this default matrix because it requires a
+model- and representation-matched empirical query pool. Run it explicitly
+after completing the calibration workflow below.
 
 Run the matrix at any generated context length by keeping `--data_path` and `--max_input_tokens` equal:
 
@@ -178,6 +182,106 @@ python -m sparse_frontier.ruler_runner \
 ```
 
 Each run writes `dataset.jsonl`, `predictions.jsonl`, `aggregate.json`, `aggregate.csv`, and `run.json`. A nonzero exit code indicates at least one failed example or run.
+
+### Query-Robust calibration and evaluation
+
+Query-Robust uses dense vLLM calibration captures. The capture must use the
+same checkpoint, tokenizer, context-length dataset, and model geometry as the
+evaluation. The following example uses the first five examples of each RULER
+task family as calibration data, captures generated query states, and omits
+large prompt-key shards:
+
+```bash
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_16384.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_16k_capture \
+  --method dense \
+  --max_input_tokens 16384 \
+  --max_output_tokens 128 \
+  --capture_query_dir experiments/query_pools/raw_16k \
+  --capture_max_tokens 128 \
+  --capture_queries_only \
+  --tp 1 \
+  --seed 43
+```
+
+Freeze the raw capture into a transportable schema-2 pool, then inspect and
+validate its identity against the same checkpoint:
+
+```bash
+python -m sparse_frontier.query_pool_cli capture-schema2-finalize \
+  --input experiments/query_pools/raw_16k \
+  --output experiments/query_pools/pool_16k \
+  --samples_per_head 32 \
+  --seed 43 \
+  --tasks niah_single niah_multikey niah_multiquery vt fwe
+
+python -m sparse_frontier.query_pool_cli inspect \
+  --pool experiments/query_pools/pool_16k
+
+python -m sparse_frontier.query_pool_cli validate \
+  --pool experiments/query_pools/pool_16k \
+  --model_path "$MODEL_PATH"
+```
+
+Run Query-Robust as a single method. The pool must be context-matched: create
+and validate an independent pool for 8K, 16K, and 32K evaluation regimes.
+
+```bash
+python -m sparse_frontier.ruler_runner \
+  --data_path experiments/data/ruler/ruler_16384.jsonl \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/results/ruler_16k_query_robust_b512 \
+  --method query_robust \
+  --budget 512 \
+  --query_pool_path experiments/query_pools/pool_16k \
+  --query_robust_generation_horizon 128 \
+  --query_robust_objective minimax \
+  --query_robust_initial_support 64 \
+  --query_robust_max_support 1024 \
+  --query_robust_solver_max_iterations 64 \
+  --max_input_tokens 16384 \
+  --max_output_tokens 1024 \
+  --tp 1 \
+  --seed 43
+```
+
+Supported Query-Robust budgets are `96`, `128`, `256`, `512`, `1024`, and
+`2048`; `chunk_size` is currently 16. The default `minimax` objective is
+fail-closed and falls back to dense attention when its certificate is not
+available. `cvar` is a tail-risk alternative. Options such as
+`--no-query_robust_solver_fail_closed`, reduced support, one solver iteration,
+or `--no-query_robust_solver_armijo` are exploratory latency settings and
+must not be reported as certified results.
+
+For a bounded exploratory pilot, use the offline Pile path:
+
+```bash
+python -m sparse_frontier.pile_query_capture \
+  --model_path "$MODEL_PATH" \
+  --output_dir experiments/query_pools/pile_raw \
+  --num_sequences 20 \
+  --sequence_tokens 2048 \
+  --samples_per_head 3000 \
+  --seed 43
+
+python -m sparse_frontier.query_pool_cli inspect \
+  --pool experiments/query_pools/pile_raw
+
+python -m sparse_frontier.pile_robust_pilot \
+  --model_path "$MODEL_PATH" \
+  --pool_path experiments/query_pools/pile_raw \
+  --output experiments/results/query_robust_offline_pilot.json \
+  --layers 31 \
+  --num_chunks 8 \
+  --chunk_size 16 \
+  --objective minimax
+```
+
+The first command above produces a Pile empirical artifact directly; use
+`query_pool_cli inspect` to inspect it. The offline pilot is diagnostic and
+does not replace an online vLLM evaluation.
 
 ## Hydra workflow
 

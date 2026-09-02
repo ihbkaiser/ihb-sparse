@@ -6,6 +6,9 @@ from .efficient_prefilling import (
 )
 from .efficient_decoding import QuestAttention, TOVAAttention
 from .kv_compression import SnapKVCompression, AdaSnapKVCompression
+from .shadowkv import ShadowKVAttention
+from .query_robust import QueryRobustAttention
+from .query_pool import QueryPoolExpectations, REPRESENTATION
 from .handler import AttentionHandler
 import os
 import json
@@ -21,6 +24,8 @@ ATTENTION_REGISTRY = {
     'quest': QuestAttention,
     'tova': TOVAAttention,
     'flexprefill': FlexPrefill,
+    'shadowkv': ShadowKVAttention,
+    'query_robust': QueryRobustAttention,
 }
 
 # Module-level singletons initialized from environment
@@ -65,11 +70,22 @@ def ensure_attention_initialized_from_env(keys: torch.Tensor = None) -> None:
     except Exception as e:
         raise RuntimeError(f"Failed to parse SF_ATTENTION_ARGS_JSON: {e}")
 
-    # Derive block size (option a): quest uses page_size, else global kv block size
+    # Quest and Query-Robust expose their own logical block sizes. The latter
+    # still validates divisibility against vLLM's physical cache blocks.
     if name == 'quest':
         if 'page_size' not in attention_args:
             raise RuntimeError("Quest attention requires 'page_size' in SF_ATTENTION_ARGS_JSON")
         block_size = int(attention_args['page_size'])
+    elif name == 'query_robust':
+        if 'chunk_size' not in attention_args:
+            raise RuntimeError(
+                "Query-Robust attention requires 'chunk_size' in SF_ATTENTION_ARGS_JSON"
+            )
+        block_size = int(attention_args['chunk_size'])
+        if int(kv_cache_block_size) % block_size:
+            raise RuntimeError(
+                "Query-Robust requires physical KV-cache blocks divisible by chunk_size"
+            )
     else:
         block_size = int(kv_cache_block_size)
 
@@ -93,6 +109,63 @@ def ensure_attention_initialized_from_env(keys: torch.Tensor = None) -> None:
         'max_input_tokens': int(max_input_tokens),
         'max_output_tokens': int(max_output_tokens),
     } if name == 'quest' else {}
+    if name == 'shadowkv':
+        if int(num_kv_heads) % int(tp_size) != 0:
+            raise RuntimeError(
+                "ShadowKV requires model KV heads divisible by tensor parallel size; "
+                f"got kv={num_kv_heads}, tp={tp_size}"
+            )
+        extra_args = {
+            'num_layers': int(num_layers),
+            'num_q_heads': int(num_q_heads),
+            'num_kv_heads': int(num_kv_heads),
+            'tp_size': int(tp_size),
+            'block_size': block_size,
+        }
+    elif name == 'query_robust':
+        identity_env = {
+            'model_id': os.getenv('SF_MODEL_ID'),
+            'model_revision': os.getenv('SF_MODEL_REVISION'),
+            'rope_type': os.getenv('SF_MODEL_ROPE_TYPE'),
+            'rope_parameters': os.getenv('SF_MODEL_ROPE_PARAMETERS_JSON'),
+            'attention_scale': os.getenv('SF_ATTENTION_SCALE'),
+            'head_dim': os.getenv('SF_MODEL_HEAD_DIM'),
+        }
+        missing_identity = [key for key, value in identity_env.items() if value is None]
+        if missing_identity:
+            raise RuntimeError(
+                "Query-Robust fail-closed model identity is missing: "
+                + ", ".join(missing_identity)
+            )
+        try:
+            rope_parameters = json.loads(identity_env['rope_parameters'])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                "SF_MODEL_ROPE_PARAMETERS_JSON is invalid"
+            ) from exc
+        expectations = QueryPoolExpectations(
+            model_id=identity_env['model_id'],
+            model_revision=identity_env['model_revision'],
+            num_layers=int(num_layers),
+            num_q_heads=int(num_q_heads),
+            num_kv_heads=int(num_kv_heads),
+            head_dim=int(identity_env['head_dim']),
+            tp_size=int(tp_size),
+            rope_type=identity_env['rope_type'],
+            rope_parameters=rope_parameters,
+            representation=REPRESENTATION,
+            attention_scale=float(identity_env['attention_scale']),
+        )
+        extra_args = {
+            'num_layers': int(num_layers),
+            'num_q_heads': int(num_q_heads),
+            'num_kv_heads': int(num_kv_heads),
+            'tp_size': int(tp_size),
+            'block_size': block_size,
+            'max_input_tokens': int(max_input_tokens),
+            'max_output_tokens': int(max_output_tokens),
+            'pool_expectations': expectations,
+        }
 
     attention = ATTENTION_REGISTRY[name](**attention_args, **extra_args)
 

@@ -1,0 +1,1 @@
+recursive-include sparse_frontier/modelling/attention/csrc *.cpp *.cu

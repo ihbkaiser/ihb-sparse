@@ -239,6 +239,42 @@ def test_finalize_capture_builds_cumulative_centroids_and_offline_pool(tmp_path)
     assert (output / "full" / "layer_000_rank_000.pt").is_file()
 
 
+def test_finalize_accepts_real_capture_payload_and_ignores_prompt_shards(tmp_path):
+    raw = tmp_path / "raw"
+    request = raw / "request_0001"
+    request.mkdir(parents=True)
+    manifest = _manifest(coreset_sizes=[])
+    (raw / "manifest.json").write_text(json.dumps(manifest.to_dict()))
+    torch.save(
+        {"keys": torch.zeros(8, 2, 8), "metadata": {"split": "calibration"}},
+        request / "prompt_layer_000_rank_000.pt",
+    )
+    for offset in range(2):
+        torch.save(
+            {
+                "layer_ids": torch.tensor([0, 1]),
+                "prompt_origin_queries": torch.randn(2, 4, 8),
+                "post_rope_queries": torch.randn(2, 4, 8),
+                "generated_keys": torch.randn(2, 1, 2, 8),
+                "metadata": {
+                    "decode_offset": offset,
+                    "prompt_length": 8,
+                    "sequence_id_hash": 1,
+                    "task": "niah_single",
+                    "task_index": 0,
+                    "split": "calibration",
+                    "stratum_id": 0,
+                    "tp_rank": 0,
+                },
+            },
+            request / f"step_{offset:03d}_rank_000.pt",
+        )
+    output = tmp_path / "pool"
+    finalize_capture(raw, output, pool_size=4, coreset_sizes=(), seed=43)
+    pool = load_query_pool(output, _expectations(), 0, include_full_queries=True)
+    assert len(pool.layers) == 2
+
+
 def test_query_pool_cli_inspect_emits_machine_readable_json(tmp_path, capsys):
     from sparse_frontier.query_pool_cli import run_cli
 

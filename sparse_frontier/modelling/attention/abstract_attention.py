@@ -45,6 +45,7 @@ class AttentionUtils:
         kv_cache: torch.Tensor,
         target_block_size: int,
         max_blocks: int,
+        block_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Retrieve keys and values from cache for attention computation.
         
@@ -57,11 +58,50 @@ class AttentionUtils:
             v_cache: [num_kv_heads, num_blocks, target_block_size, head_size]
         """
         num_blocks, block_size, num_kv_heads, head_size = kv_cache[0].shape
-        final_num_blocks = min(max_blocks, (num_blocks * block_size) // target_block_size)
-        left_original_num_blocks = (final_num_blocks * target_block_size) // block_size
 
-        k_cache = kv_cache[0, :left_original_num_blocks, :, :].view(num_kv_heads, final_num_blocks, target_block_size, head_size)
-        v_cache = kv_cache[1, :left_original_num_blocks, :, :].view(num_kv_heads, final_num_blocks, target_block_size, head_size)
+        # vLLM's FlashAttention cache is physically laid out as
+        # [blocks, block_tokens, kv_heads, head_dim].  Attention handlers use
+        # a logical [kv_heads, blocks, block_tokens, head_dim] view.  A plain
+        # reshape would alias the storage with the wrong head/token order and
+        # is especially damaging for ShadowKV, which gathers values by token
+        # position.  Materialize the small accuracy-path view after permuting
+        # the semantic dimensions; the canonical vLLM cache is updated by the
+        # vLLM cache op in vllm_model.py before handlers read it.
+        if block_table is None:
+            available_physical_indices = torch.arange(
+                num_blocks, device=kv_cache.device, dtype=torch.long
+            )
+        else:
+            if block_table.ndim != 2 or block_table.shape[0] != 1:
+                raise ValueError(
+                    "Sparse attention currently supports one vLLM sequence; "
+                    f"received block_table shape {tuple(block_table.shape)}"
+                )
+            table = block_table[0].to(device=kv_cache.device, dtype=torch.long)
+            available_physical_indices = table[table >= 0]
+            if available_physical_indices.numel() == 0:
+                raise ValueError("vLLM block_table contains no allocated physical blocks")
+
+        final_num_blocks = min(
+            max_blocks,
+            (available_physical_indices.numel() * block_size) // target_block_size,
+        )
+        requested_tokens = final_num_blocks * target_block_size
+        left_original_num_blocks = (requested_tokens + block_size - 1) // block_size
+        physical_block_indices = available_physical_indices[:left_original_num_blocks]
+
+        k_tokens = kv_cache[0, physical_block_indices, :, :].permute(
+            2, 0, 1, 3
+        ).contiguous().view(num_kv_heads, -1, head_size)
+        v_tokens = kv_cache[1, physical_block_indices, :, :].permute(
+            2, 0, 1, 3
+        ).contiguous().view(num_kv_heads, -1, head_size)
+        k_cache = k_tokens[:, :requested_tokens].view(
+            num_kv_heads, final_num_blocks, target_block_size, head_size
+        )
+        v_cache = v_tokens[:, :requested_tokens].view(
+            num_kv_heads, final_num_blocks, target_block_size, head_size
+        )
 
         return k_cache, v_cache
 

@@ -1,0 +1,19 @@
+# @package _global_
+
+attention:
+  name: shadowkv
+  args:
+    # Accuracy/correctness baseline settings from ByteDance-Seed/ShadowKV.
+    sparse_budget: 2048
+    chunk_size: 8
+    rank: 160
+    local_chunk: 4
+    outlier_chunk: 48
+    # Use the faster randomized decomposition by default.  Pass exact for the
+    # faithful official full-SVD baseline; gesvdj is an optional full CUDA SVD.
+    svd_backend: randomized
+    svd_oversample: 32
+    svd_niter: 2
+    # Uses the fused landmark GEMM+softmax kernel when the optional CUDA
+    # extension is built; falls back to the verified PyTorch implementation.
+    fused_retrieval: true

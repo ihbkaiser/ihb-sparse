@@ -529,30 +529,58 @@ def finalize_capture(
     if any(size < 1 or size > pool_size for size in normalized_coresets):
         raise ValueError("coreset sizes must be positive and no larger than the pool")
 
-    steps = sorted(root.rglob("*.pt"))
+    if manifest.tp_size != 1:
+        raise ValueError(
+            "raw capture finalization v1 supports TP=1 only; rank-local TP merging is not implemented"
+        )
+    steps = sorted(root.rglob("step*.pt"))
     if not steps:
         raise ValueError("raw capture contains no tensor step shards")
-    raw_queries: list[Tensor] = []
-    offsets: list[int] = []
-    strata: list[int] = []
+    raw_queries: dict[int, list[Tensor]] = {
+        layer: [] for layer in range(manifest.num_layers)
+    }
+    offsets: dict[int, list[int]] = {
+        layer: [] for layer in range(manifest.num_layers)
+    }
+    strata: dict[int, list[int]] = {
+        layer: [] for layer in range(manifest.num_layers)
+    }
     records: list[CaptureRecord] = []
     for step in steps:
         payload = _safe_load_shard(step)
-        if set(payload) != {"prompt_origin_queries", "metadata"}:
+        required = {"prompt_origin_queries", "metadata"}
+        if not required.issubset(payload):
             raise ValueError(f"raw capture shard {step} has invalid fields")
         queries = payload["prompt_origin_queries"]
         metadata = payload["metadata"]
-        expected_shape = (manifest.num_layers, manifest.num_q_heads, manifest.head_dim)
-        if not isinstance(queries, Tensor) or queries.shape != expected_shape:
-            raise ValueError(f"raw capture shard {step} has an invalid query shape")
         if not isinstance(metadata, dict):
             raise ValueError(f"raw capture shard {step} has invalid metadata")
+        if str(metadata.get("split")) != "calibration":
+            continue
+        if "layer_ids" in payload:
+            layer_ids_tensor = payload["layer_ids"]
+            if not isinstance(layer_ids_tensor, Tensor) or layer_ids_tensor.ndim != 1:
+                raise ValueError(f"raw capture shard {step} has invalid layer IDs")
+            layer_ids = [int(layer) for layer in layer_ids_tensor.tolist()]
+        else:
+            layer_ids = list(range(manifest.num_layers))
+        expected_shape = (len(layer_ids), manifest.num_q_heads, manifest.head_dim)
+        if not isinstance(queries, Tensor) or queries.shape != expected_shape:
+            raise ValueError(
+                f"raw capture shard {step} query shape {getattr(queries, 'shape', None)} "
+                f"does not match {expected_shape}"
+            )
+        if len(set(layer_ids)) != len(layer_ids) or any(
+            layer < 0 or layer >= manifest.num_layers for layer in layer_ids
+        ):
+            raise ValueError(f"raw capture shard {step} has invalid layer IDs")
         offset = int(metadata["decode_offset"])
         if not 0 <= offset <= manifest.max_decode_offset:
             raise ValueError(f"raw capture offset {offset} is outside the manifest horizon")
-        raw_queries.append(queries.to(torch.float32))
-        offsets.append(offset)
-        strata.append(int(metadata["stratum_id"]))
+        for local_layer, layer_idx in enumerate(layer_ids):
+            raw_queries[layer_idx].append(queries[local_layer].to(torch.float32))
+            offsets[layer_idx].append(offset)
+            strata[layer_idx].append(int(metadata["stratum_id"]))
         records.append(
             CaptureRecord(
                 sequence_id_hash=int(metadata["sequence_id_hash"]),
@@ -568,19 +596,21 @@ def finalize_capture(
             "finalize the full/centroid pool first"
         )
 
-    stacked = torch.stack(raw_queries, dim=0)
-    offset_tensor = torch.tensor(offsets, dtype=torch.long)
-    stratum_per_step = torch.tensor(strata, dtype=torch.long)
     group_size = manifest.num_q_heads // manifest.num_kv_heads
     layers: list[QueryPoolLayer] = []
     for layer_idx in range(manifest.num_layers):
+        if not raw_queries[layer_idx]:
+            raise ValueError(f"raw capture is missing calibration layer {layer_idx}")
+        stacked = torch.stack(raw_queries[layer_idx], dim=0)
+        offset_tensor = torch.tensor(offsets[layer_idx], dtype=torch.long)
+        stratum_per_step = torch.tensor(strata[layer_idx], dtype=torch.long)
         centroid_heads: list[Tensor] = []
         full_heads: list[Tensor] = []
         weight_heads: list[Tensor] = []
         for kv_head in range(manifest.num_kv_heads):
             q_start = kv_head * group_size
             q_stop = q_start + group_size
-            candidates = stacked[:, layer_idx, q_start:q_stop].reshape(-1, manifest.head_dim)
+            candidates = stacked[:, q_start:q_stop].reshape(-1, manifest.head_dim)
             candidate_heads = torch.arange(q_start, q_stop).repeat(stacked.shape[0])
             candidate_offsets = offset_tensor.repeat_interleave(group_size)
             candidate_strata = stratum_per_step.repeat_interleave(group_size)
@@ -590,21 +620,20 @@ def finalize_capture(
             selected_queries = candidates[selection]
             selected_heads = candidate_heads[selection]
             selected_strata = candidate_strata[selection]
-            selected_offsets = candidate_offsets[selection]
             selected_weights = balanced_empirical_weights(selected_heads, selected_strata)
             full_heads.append(selected_queries.to(torch.bfloat16))
             weight_heads.append(selected_weights.to(torch.float32))
 
             horizon_centroids: list[Tensor] = []
             for horizon in range(1, manifest.max_decode_offset + 2):
-                mask = selected_offsets < horizon
+                mask = candidate_offsets < horizon
                 if not bool(mask.any()):
                     raise ValueError(f"no captured queries cover decode horizon {horizon}")
                 horizon_weights = balanced_empirical_weights(
-                    selected_heads[mask], selected_strata[mask]
+                    candidate_heads[mask], candidate_strata[mask]
                 )
                 horizon_centroids.append(
-                    horizon_weights.to(torch.float32) @ selected_queries[mask].to(torch.float32)
+                    horizon_weights.to(torch.float32) @ candidates[mask].to(torch.float32)
                 )
             centroid_heads.append(torch.stack(horizon_centroids, dim=0))
         layers.append(

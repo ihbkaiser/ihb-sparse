@@ -1,0 +1,19 @@
+{
+  "compile_witness": 2.0,
+  "cuda": "12.8",
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "matmul_sum": 3680.0,
+  "nnls_available": true,
+  "numpy": "2.2.6",
+  "pandas": "2.3.1",
+  "pip_check": "No broken requirements found.",
+  "python": "3.12.14",
+  "requirements_sha256": "c048cc133377b0098ae24875c450c88e8cf260d0d84ad269cf5385d90cdfa419",
+  "scipy": "1.16.1",
+  "softmax_finite": true,
+  "statsmodels": "0.14.5",
+  "test_baseline_after_rebuild": "38 passed, 1 skipped, 1 expected warning",
+  "torch": "2.8.0+cu128",
+  "transformers": "4.57.1",
+  "vllm": "0.11.0"
+}

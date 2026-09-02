@@ -1,5 +1,16 @@
 # Llama 3.1 Query-Pool Study for Online Affine Chunk Routing
 
+> **Superseded implementation decision (2026-09-01).** The centroid/coreset
+> ladder below was the pre-implementation proposal. The delivered path uses
+> the explicit schema-2 Pile pool and solves empirical **minimax** (primary) or
+> weighted **CVaR** per chunk. Centroid/expectation routing is retained only
+> in legacy analysis/test helpers and is not the Query-Robust runtime method.
+> See `ImplementationNote.md` and `Method.md` for the implemented contract and
+> measured pilot.
+
+The remainder of this file is retained as the historical pre-implementation
+centroid/coreset proposal for provenance; it is not the current runtime design.
+
 ## Status and scope
 
 This design records the approved experiment before checkpoint download or code changes. Its purpose is to obtain a real-model signal and use that evidence to revise `ImplementationNote.md`. It is not yet an implementation plan for the complete `query_robust` attention path and it does not claim that the method works on Llama 3.1.

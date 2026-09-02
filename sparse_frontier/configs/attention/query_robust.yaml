@@ -1,0 +1,42 @@
+# @package _global_
+attention:
+  name: query_robust
+  args:
+    # Robust empirical objective. Minimax is the default; CVaR retains the
+    # full-pool probability weights and is selected explicitly for a tail fit.
+    objective: minimax
+    cvar_alpha: 0.95
+    initial_support: 64
+    max_support: 1024
+    solver_gap_tolerance: 0.001
+    solver_max_iterations: 500
+    solver_chunk_batch_size: 16
+    # Admit several worst inactive empirical queries after each full-pool scan.
+    # This preserves the minimax/CVaR objective and certificate while avoiding
+    # one GPU active-set solve per individual violator.
+    solver_violators_per_round: 4
+    solver_fail_closed: true
+    # Required for certified fits. The unguarded one-step route is an
+    # exploratory latency ablation only and is rejected with fail-closed mode.
+    solver_armijo: true
+    # Keep exact residual/error extrema for calibration or diagnostic runs.
+    # The raw-entropy online route does not consume them, so leave this off
+    # for latency measurements and serving.
+    collect_solver_audit: false
+    # Opt in only after validating the target GPU/runtime; the event fence
+    # preserves the same summaries and routing decisions as synchronous build.
+    async_prefill_build: false
+    token_budget: 1024
+    chunk_size: 16
+    query_pool_path: null
+    generation_horizon: 128
+    sink_chunks: 1
+    recent_chunks: 1
+    # One common set lets FlashAttention read vLLM's canonical paged cache
+    # directly. Set false only for the slower per-KV-head routing ablation.
+    share_chunks_across_kv_heads: true
+    # Sum preserves aggregate predicted mass. ``max`` and ``raw_score_sum``
+    # are recall/ranking ablations for a shared cache table.
+    shared_chunk_aggregation: sum
+    summary_dtype: bfloat16
+    score_dtype: float32
