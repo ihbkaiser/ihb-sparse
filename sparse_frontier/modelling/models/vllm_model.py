@@ -87,6 +87,9 @@ def _get_query_capture_collector():
         capture_layers=capture_layers,
         capture_values=os.getenv("SF_QUERY_CAPTURE_VALUES", "0") == "1",
         capture_prompt_keys=os.getenv("SF_QUERY_CAPTURE_PROMPT_KEYS", "1") == "1",
+        capture_prompt_queries=os.getenv("SF_QUERY_CAPTURE_PROMPT_QUERIES", "0") == "1",
+        prompt_query_samples=int(os.getenv("SF_QUERY_CAPTURE_PROMPT_QUERY_SAMPLES", "16")),
+        prompt_query_seed=int(os.getenv("SF_QUERY_CAPTURE_PROMPT_QUERY_SEED", "1043")),
         composition_tolerance=float(
             os.getenv("SF_QUERY_CAPTURE_COMPOSITION_TOLERANCE", "0.05")
         ),

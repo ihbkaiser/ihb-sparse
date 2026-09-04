@@ -631,8 +631,11 @@ def batched_independent_active_fit(
         else int(initial_support)
     )
     initial = min(n, max(1, int(initial_support), required))
-    limit = n if max_support is None else int(max_support)
-    if limit < initial or limit > n:
+    # A finite empirical source cannot expose more than ``n`` scenarios.  Treat
+    # a larger configured cap as the natural finite-population cap so the
+    # runtime remains fail-closed on the finite support it was given.
+    limit = n if max_support is None else min(n, int(max_support))
+    if limit < initial:
         raise ValueError("invalid batched robust support limit")
     if not compute_certificate and limit != initial:
         raise ValueError(

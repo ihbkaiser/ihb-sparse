@@ -48,6 +48,102 @@ class CaptureContext:
         return cls(**payload)
 
 
+class PromptQueryReservoir:
+    """Deterministic per-layer/Q-head reservoir for prompt pre-RoPE queries.
+
+    The reservoir is deliberately independent of keys, generated states, and
+    task labels.  It therefore represents only a compact empirical measure of
+    the current prompt query stream.  Stored rows retain the pre-RoPE query
+    representation and their absolute prompt positions for later transport.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_q_heads: int,
+        head_dim: int,
+        size: int,
+        seed: int,
+    ) -> None:
+        positive = {
+            "num_layers": num_layers,
+            "num_q_heads": num_q_heads,
+            "head_dim": head_dim,
+            "size": size,
+        }
+        for name, value in positive.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"prompt reservoir {name} must be a positive integer")
+        self.num_layers = num_layers
+        self.num_q_heads = num_q_heads
+        self.head_dim = head_dim
+        self.size = size
+        self.generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        self.queries = torch.zeros(
+            num_layers, num_q_heads, size, head_dim, dtype=torch.bfloat16
+        )
+        self.priority = torch.full(
+            (num_layers, num_q_heads, size), float("-inf"), dtype=torch.float32
+        )
+        self.positions = torch.full(
+            (num_layers, num_q_heads, size), -1, dtype=torch.int32
+        )
+
+    @torch.no_grad()
+    def update(self, layer: int, queries: Tensor, positions: Tensor) -> None:
+        """Merge one ``[q_heads,tokens,head_dim]`` prompt batch."""
+
+        if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < self.num_layers:
+            raise ValueError(f"prompt reservoir layer {layer!r} is out of range")
+        if (
+            queries.ndim != 3
+            or queries.shape[0] != self.num_q_heads
+            or queries.shape[2] != self.head_dim
+            or queries.shape[1] < 1
+        ):
+            raise ValueError(
+                "prompt reservoir query batch must have shape "
+                "[q_heads,tokens,head_dim]"
+            )
+        if positions.ndim != 1 or positions.numel() != queries.shape[1]:
+            raise ValueError("prompt reservoir positions do not match query tokens")
+        batch = queries.detach().to(device="cpu", dtype=torch.bfloat16)
+        batch_positions = positions.detach().to(device="cpu", dtype=torch.int32)
+        batch_priority = torch.rand(
+            self.num_q_heads,
+            queries.shape[1],
+            generator=self.generator,
+            dtype=torch.float32,
+        )
+        for head in range(self.num_q_heads):
+            candidate_priority = torch.cat(
+                [self.priority[layer, head], batch_priority[head]]
+            )
+            candidate_queries = torch.cat(
+                [self.queries[layer, head], batch[head]], dim=0
+            )
+            candidate_positions = torch.cat(
+                [self.positions[layer, head], batch_positions], dim=0
+            )
+            selected_priority, selected = torch.topk(
+                candidate_priority, k=self.size, largest=True, sorted=True
+            )
+            self.priority[layer, head] = selected_priority
+            self.queries[layer, head] = candidate_queries[selected]
+            self.positions[layer, head] = candidate_positions[selected]
+
+    def complete_layer(self, layer: int) -> None:
+        if torch.any(self.positions[layer] < 0):
+            raise RuntimeError(
+                "prompt query reservoir did not receive enough tokens for "
+                f"layer {layer}"
+            )
+
+    def complete(self) -> None:
+        for layer in range(self.num_layers):
+            self.complete_layer(layer)
+
+
 class QueryCaptureCollector:
     """Collect one request at a time in a vLLM worker process.
 
@@ -68,6 +164,9 @@ class QueryCaptureCollector:
         capture_layers: Sequence[int] | None = None,
         capture_values: bool = False,
         capture_prompt_keys: bool = True,
+        capture_prompt_queries: bool = False,
+        prompt_query_samples: int = 16,
+        prompt_query_seed: int = 1043,
         composition_tolerance: float = 0.05,
     ) -> None:
         positive = {
@@ -103,6 +202,11 @@ class QueryCaptureCollector:
         self._capture_layer_set = set(selected)
         self.capture_values = bool(capture_values)
         self.capture_prompt_keys = bool(capture_prompt_keys)
+        if not isinstance(prompt_query_samples, int) or isinstance(prompt_query_samples, bool) or prompt_query_samples < 1:
+            raise ValueError("prompt query samples must be a positive integer")
+        self.capture_prompt_queries = bool(capture_prompt_queries)
+        self.prompt_query_samples = int(prompt_query_samples)
+        self.prompt_query_seed = int(prompt_query_seed)
         self.composition_tolerance = float(composition_tolerance)
 
         self.context: CaptureContext | None = None
@@ -113,6 +217,7 @@ class QueryCaptureCollector:
         self._step_layers: dict[int, dict[str, Tensor | float]] = {}
         self._decode_offset = 0
         self._implicit_layer = 0
+        self._prompt_query_reservoir: PromptQueryReservoir | None = None
 
     def _read_context(self) -> CaptureContext:
         if not self.context_path.is_file():
@@ -135,6 +240,48 @@ class QueryCaptureCollector:
         self._step_layers.clear()
         self._decode_offset = 0
         self._implicit_layer = 0
+        self._prompt_query_reservoir = (
+            PromptQueryReservoir(
+                self.num_layers,
+                self.num_q_heads,
+                self.head_dim,
+                self.prompt_query_samples,
+                self.prompt_query_seed,
+            )
+            if self.capture_prompt_queries
+            else None
+        )
+
+    def _ensure_request_context(self) -> None:
+        context = self._read_context()
+        if self.context is None or self.context.sequence_id_hash != context.sequence_id_hash:
+            self.reset_request(context)
+
+    def _write_prompt_query_shard(self, layer_idx: int) -> None:
+        if not self.capture_prompt_queries:
+            return
+        if self.context is None or self._request_dir is None:
+            raise RuntimeError("prompt query capture has no active request context")
+        reservoir = self._prompt_query_reservoir
+        if reservoir is None:
+            raise RuntimeError("prompt query reservoir was not initialized")
+        reservoir.complete_layer(layer_idx)
+        self._atomic_torch_save(
+            {
+                "prompt_pre_rope_queries": reservoir.queries[layer_idx].clone(),
+                "prompt_positions": reservoir.positions[layer_idx].clone(),
+                "layer_idx": layer_idx,
+                "representation": "q_norm_pre_rope_pre_scale",
+                "sampling": {
+                    "method": "uniform_priority_reservoir",
+                    "samples_per_q_head": self.prompt_query_samples,
+                    "seed": self.prompt_query_seed,
+                },
+                "metadata": asdict(self.context),
+            },
+            self._request_dir
+            / f"prompt_queries_layer_{layer_idx:03d}_rank_{self.tp_rank:03d}.pt",
+        )
 
     def _query_view(self, query: Tensor) -> Tensor:
         if query.ndim == 2:
@@ -179,6 +326,30 @@ class QueryCaptureCollector:
         if query_view.shape[0] != positions.numel():
             raise RuntimeError("query capture position and token counts differ")
         if query_view.shape[0] != 1:
+            if self.capture_prompt_queries:
+                # vLLM performs a context-free dummy/profile forward before
+                # the first user request.  There is no valid request source
+                # to capture in that pass; the real prefill path still fails
+                # closed in capture_attention if its context is absent.
+                if not self.context_path.is_file():
+                    self._pending_pre_query = None
+                    self._pending_positions = None
+                    self._pending_rope = None
+                    return
+                self._ensure_request_context()
+                if self.context is None:
+                    raise RuntimeError("prompt query capture has no request context")
+                if query_view.shape[0] != self.context.prompt_length:
+                    raise RuntimeError(
+                        "prompt query capture did not receive the full prompt; "
+                        f"context={self.context.prompt_length}, tensor={query_view.shape[0]}"
+                    )
+                reservoir = self._prompt_query_reservoir
+                if reservoir is None:
+                    raise RuntimeError("prompt query reservoir was not initialized")
+                layer_idx = self._resolve_layer(None)
+                if layer_idx in self._capture_layer_set:
+                    reservoir.update(layer_idx, query_view.transpose(0, 1), positions)
             self._pending_pre_query = None
             self._pending_positions = None
             self._pending_rope = None
@@ -243,7 +414,9 @@ class QueryCaptureCollector:
 
         if is_prefill:
             if resolved_layer == 0:
-                self.reset_request(self._read_context())
+                context = self._read_context()
+                if self.context is None or self.context.sequence_id_hash != context.sequence_id_hash:
+                    self.reset_request(context)
             if self.context is None or self._request_dir is None:
                 raise RuntimeError("query capture prefill started without request context")
             if query_view.shape[0] != self.context.prompt_length:
@@ -268,6 +441,8 @@ class QueryCaptureCollector:
                     self._request_dir
                     / f"prompt_layer_{resolved_layer:03d}_rank_{self.tp_rank:03d}.pt",
                 )
+            if resolved_layer in self._capture_layer_set and self.capture_prompt_queries:
+                self._write_prompt_query_shard(resolved_layer)
             self._advance_implicit_layer(explicit_layer)
             return
 

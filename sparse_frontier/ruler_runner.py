@@ -283,7 +283,11 @@ def _configure_attention(
     capture_context_path: str | Path | None = None,
     capture_layers: tuple[int, ...] | None = None,
     capture_prompt_keys: bool = True,
+    capture_prompt_queries: bool = False,
+    prompt_query_samples: int = 16,
+    prompt_query_seed: int = 1043,
     query_pool_path: str | Path | None = None,
+    query_robust_prompt_query_root: str | Path | None = None,
     query_robust_generation_horizon: int | None = None,
     query_robust_recent_chunks: int = 1,
     query_robust_objective: str = "minimax",
@@ -303,6 +307,10 @@ def _configure_attention(
     query_robust_solver_armijo: bool = True,
 ) -> None:
     os.environ["VLLM_USE_V1"] = "1"
+    # This is request-local state. Clear it before configuring any method so a
+    # prior Query-Robust run cannot leak its prompt-support source into a later
+    # dense/capture run in the same interpreter.
+    os.environ.pop("SF_QUERY_ROBUST_PROMPT_QUERY_ROOT", None)
     # Query-Robust owns request-local tensors and its attention registry in the
     # Python process that configures vLLM.  On TP=1, a spawned worker receives
     # neither registry state nor the initialized tensor-parallel group.  Keep
@@ -310,7 +318,10 @@ def _configure_attention(
     # matching the validated smoke path.  Other methods retain vLLM's normal
     # multiprocessing default.
     if spec.method == "query_robust" and int(model_cfg["tp"]) == 1:
-        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        # Request-local support is handed to the in-process attention registry
+        # through the per-request environment.  An inherited worker-mode value
+        # must not silently switch this path back to multiprocessing.
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     else:
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
     os.environ["VLLM_FLASH_ATTN_VERSION"] = "2"
@@ -324,6 +335,9 @@ def _configure_attention(
             "SF_QUERY_CAPTURE_DIR",
             "SF_QUERY_CAPTURE_CONTEXT",
             "SF_QUERY_CAPTURE_LAYERS",
+            "SF_QUERY_CAPTURE_PROMPT_QUERIES",
+            "SF_QUERY_CAPTURE_PROMPT_QUERY_SAMPLES",
+            "SF_QUERY_CAPTURE_PROMPT_QUERY_SEED",
         ):
             os.environ.pop(name, None)
         return
@@ -343,6 +357,9 @@ def _configure_attention(
             Path(capture_context_path).resolve()
         )
         os.environ["SF_QUERY_CAPTURE_PROMPT_KEYS"] = "1" if capture_prompt_keys else "0"
+        os.environ["SF_QUERY_CAPTURE_PROMPT_QUERIES"] = "1" if capture_prompt_queries else "0"
+        os.environ["SF_QUERY_CAPTURE_PROMPT_QUERY_SAMPLES"] = str(prompt_query_samples)
+        os.environ["SF_QUERY_CAPTURE_PROMPT_QUERY_SEED"] = str(prompt_query_seed)
         if capture_layers is None:
             os.environ.pop("SF_QUERY_CAPTURE_LAYERS", None)
         else:
@@ -372,6 +389,10 @@ def _configure_attention(
             "fused_retrieval": shadowkv_fused_retrieval,
         }
     else:
+        if query_robust_prompt_query_root is not None and int(model_cfg["tp"]) != 1:
+            raise ValueError(
+                "request-local Query-Robust prompt support currently requires TP=1"
+            )
         if query_pool_path is None:
             raise ValueError("query_robust requires --query_pool_path")
         if query_robust_generation_horizon is None:
@@ -392,6 +413,11 @@ def _configure_attention(
             "solver_fail_closed": bool(query_robust_solver_fail_closed),
             "async_prefill_build": bool(query_robust_async_prefill_build),
             "solver_armijo": bool(query_robust_solver_armijo),
+            "prompt_query_root": (
+                str(Path(query_robust_prompt_query_root).resolve())
+                if query_robust_prompt_query_root is not None
+                else None
+            ),
             "token_budget": spec.budget,
             "chunk_size": 16,
             "query_pool_path": str(Path(query_pool_path).resolve()),
@@ -404,6 +430,12 @@ def _configure_attention(
     os.environ["SF_USE_ATTENTION_PATCH"] = "1"
     os.environ["SF_ATTENTION_NAME"] = spec.method
     os.environ["SF_ATTENTION_ARGS_JSON"] = json.dumps(attention_args, sort_keys=True)
+    if spec.method == "query_robust" and query_robust_prompt_query_root is not None:
+        os.environ["SF_QUERY_ROBUST_PROMPT_QUERY_ROOT"] = str(
+            Path(query_robust_prompt_query_root).resolve()
+        )
+    else:
+        os.environ.pop("SF_QUERY_ROBUST_PROMPT_QUERY_ROOT", None)
     os.environ["SF_TP_SIZE"] = str(model_cfg["tp"])
     os.environ["SF_MODEL_NUM_Q_HEADS"] = str(model_cfg["num_q_heads"])
     os.environ["SF_MODEL_NUM_KV_HEADS"] = str(model_cfg["num_kv_heads"])
@@ -452,14 +484,30 @@ def _generate_one(
     capture_max_tokens: int | None = None,
 ) -> dict[str, Any]:
     start = time.perf_counter()
+    context_payload: dict[str, Any] | None = None
+    request_source_enabled = bool(os.getenv("SF_QUERY_ROBUST_PROMPT_QUERY_ROOT"))
     try:
         if capture_context_path is not None:
             encoded = model.tokenizer.encode_for_generation(
                 sample["input_text"], return_tensors=False
             )
+            context_payload = _capture_context_payload(
+                sample, int(encoded["input_length"])
+            )
             _atomic_write_json(
                 capture_context_path,
-                _capture_context_payload(sample, int(encoded["input_length"])),
+                context_payload,
+            )
+        if request_source_enabled:
+            if context_payload is None:
+                encoded = model.tokenizer.encode_for_generation(
+                    sample["input_text"], return_tensors=False
+                )
+                context_payload = _capture_context_payload(
+                    sample, int(encoded["input_length"])
+                )
+            os.environ["SF_QUERY_ROBUST_REQUEST_ID"] = str(
+                int(context_payload["sequence_id_hash"])
             )
         generation_tokens = min(
             int(sample["tokens_to_generate"]), int(model.max_output_tokens)
@@ -498,6 +546,9 @@ def _generate_one(
             "failure": True,
             "error": f"{type(exc).__name__}: {exc}",
         }
+    finally:
+        if request_source_enabled:
+            os.environ.pop("SF_QUERY_ROBUST_REQUEST_ID", None)
 
 
 def run_spec(
@@ -520,7 +571,11 @@ def run_spec(
     capture_layers: tuple[int, ...] | None = None,
     capture_max_tokens: int | None = None,
     capture_prompt_keys: bool = True,
+    capture_prompt_queries: bool = False,
+    prompt_query_samples: int = 16,
+    prompt_query_seed: int = 1043,
     query_pool_path: str | Path | None = None,
+    query_robust_prompt_query_root: str | Path | None = None,
     query_robust_generation_horizon: int | None = None,
     query_robust_recent_chunks: int = 1,
     query_robust_objective: str = "minimax",
@@ -597,7 +652,11 @@ def run_spec(
         capture_context_path=resolved_capture_context,
         capture_layers=capture_layers,
         capture_prompt_keys=capture_prompt_keys,
+        capture_prompt_queries=capture_prompt_queries,
+        prompt_query_samples=prompt_query_samples,
+        prompt_query_seed=prompt_query_seed,
         query_pool_path=query_pool_path,
+        query_robust_prompt_query_root=query_robust_prompt_query_root,
         query_robust_generation_horizon=query_robust_generation_horizon,
         query_robust_recent_chunks=query_robust_recent_chunks,
         query_robust_objective=query_robust_objective,
@@ -778,7 +837,15 @@ def run_spec(
         "capture_layers": list(capture_layers) if capture_layers is not None else None,
         "capture_max_tokens": capture_max_tokens,
         "capture_prompt_keys": capture_prompt_keys if capture_query_dir else None,
+        "capture_prompt_queries": capture_prompt_queries if capture_query_dir else None,
+        "prompt_query_samples": prompt_query_samples if capture_query_dir else None,
+        "prompt_query_seed": prompt_query_seed if capture_query_dir else None,
         "query_pool_path": str(query_pool_path) if query_pool_path else None,
+        "query_robust_prompt_query_root": (
+            str(query_robust_prompt_query_root)
+            if query_robust_prompt_query_root
+            else None
+        ),
         "query_robust_generation_horizon": query_robust_generation_horizon,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -879,6 +946,31 @@ def run_cli(args: argparse.Namespace) -> int:
                 command.extend(["--budget", str(spec.budget)])
             if args.smoke:
                 command.append("--smoke")
+            if args.capture_query_dir is not None:
+                command.extend(["--capture_query_dir", str(args.capture_query_dir)])
+            if args.capture_context_path is not None:
+                command.extend(["--capture_context_path", str(args.capture_context_path)])
+            if args.capture_layers is not None:
+                command.extend(
+                    ["--capture_layers", *[str(layer) for layer in args.capture_layers]]
+                )
+            if args.capture_max_tokens is not None:
+                command.extend(["--capture_max_tokens", str(args.capture_max_tokens)])
+            if args.capture_queries_only:
+                command.append("--capture_queries_only")
+            if args.capture_prompt_queries:
+                command.append("--capture_prompt_queries")
+            command.extend(["--prompt_query_samples", str(args.prompt_query_samples)])
+            command.extend(["--prompt_query_seed", str(args.prompt_query_seed)])
+            if args.query_pool_path is not None:
+                command.extend(["--query_pool_path", str(args.query_pool_path)])
+            if args.query_robust_prompt_query_root is not None:
+                command.extend(
+                    [
+                        "--query_robust_prompt_query_root",
+                        str(args.query_robust_prompt_query_root),
+                    ]
+                )
             completed = subprocess.run(command, check=False)
             all_failures += int(completed.returncode != 0)
         _write_matrix_aggregate(args.output_dir, args.data_path, specs)
@@ -908,7 +1000,11 @@ def run_cli(args: argparse.Namespace) -> int:
             ),
             capture_max_tokens=args.capture_max_tokens,
             capture_prompt_keys=not args.capture_queries_only,
+            capture_prompt_queries=args.capture_prompt_queries,
+            prompt_query_samples=args.prompt_query_samples,
+            prompt_query_seed=args.prompt_query_seed,
             query_pool_path=args.query_pool_path,
+            query_robust_prompt_query_root=args.query_robust_prompt_query_root,
             query_robust_generation_horizon=args.query_robust_generation_horizon,
             query_robust_recent_chunks=args.query_robust_recent_chunks,
             query_robust_objective=args.query_robust_objective,
@@ -985,8 +1081,33 @@ def main() -> None:
         help="omit large prompt-key shards when building only an empirical query pool",
     )
     parser.add_argument(
+        "--capture_prompt_queries",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="capture a fixed per-layer/Q-head prompt pre-RoPE query reservoir",
+    )
+    parser.add_argument(
+        "--prompt_query_samples",
+        type=int,
+        default=16,
+        help="prompt pre-RoPE reservoir rows retained per Q head",
+    )
+    parser.add_argument(
+        "--prompt_query_seed",
+        type=int,
+        default=1043,
+        help="fixed seed for the prompt query reservoir",
+    )
+    parser.add_argument(
         "--query_pool_path",
         help="validated schema-2 Pile empirical query artifact for query_robust",
+    )
+    parser.add_argument(
+        "--query_robust_prompt_query_root",
+        help=(
+            "request capture root containing prompt_queries_layer shards; "
+            "uses only the current request's prompt support"
+        ),
     )
     parser.add_argument(
         "--query_robust_generation_horizon",

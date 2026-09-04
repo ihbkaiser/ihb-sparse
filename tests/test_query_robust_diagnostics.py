@@ -1,5 +1,9 @@
 import torch
 
+from sparse_frontier.modelling.attention.query_robust import (
+    _apply_llama3_rope_at_position,
+    _transport_llama3_rope,
+)
 from sparse_frontier.query_robust_diagnostics import (
     apply_llama3_rope,
     balanced_task_head_centroid,
@@ -7,6 +11,38 @@ from sparse_frontier.query_robust_diagnostics import (
     retained_attention_mass,
     select_gqa_chunks,
 )
+
+
+def test_pre_rope_prompt_queries_use_direct_target_rotation():
+    query = torch.randn(2, 3, 128, dtype=torch.float32)
+    kwargs = {
+        "rope_theta": 500000.0,
+        "factor": 8.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_max_position_embeddings": 8192,
+    }
+    source_positions = torch.full((2, 3), 137, dtype=torch.int32)
+    target_position = 16383
+
+    direct = _apply_llama3_rope_at_position(query, target_position, kwargs)
+    expected = apply_llama3_rope(
+        query,
+        target_position,
+        base=kwargs["rope_theta"],
+        factor=kwargs["factor"],
+        low_freq_factor=kwargs["low_freq_factor"],
+        high_freq_factor=kwargs["high_freq_factor"],
+        original_max_position_embeddings=kwargs["original_max_position_embeddings"],
+    )
+    torch.testing.assert_close(direct, expected)
+
+    # The post-RoPE source-to-target transport is intentionally different for
+    # a pre-RoPE tensor when the source position is nonzero.
+    wrong_representation = _transport_llama3_rope(
+        query, source_positions, target_position, kwargs
+    )
+    assert not torch.allclose(wrong_representation, expected)
 
 
 def test_llama3_prompt_origin_rotation_is_compositional():

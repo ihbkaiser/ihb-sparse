@@ -106,6 +106,138 @@ def test_dense_capture_enables_patch_and_model_geometry(monkeypatch, tmp_path):
     assert json.loads(os.environ["SF_QUERY_CAPTURE_LAYERS"]) == [0, 7, 31]
 
 
+def test_dense_capture_prompt_query_options_are_explicit_and_manifested(monkeypatch, tmp_path):
+    import json
+    import os
+
+    _configure_attention(
+        RunSpec("dense", None),
+        {
+            "tp": 1,
+            "num_q_heads": 32,
+            "num_kv_heads": 8,
+            "num_layers": 32,
+            "head_dim": 128,
+            "max_input_tokens": 16384,
+            "max_output_tokens": 128,
+            "kv_cache_block_size": 256,
+        },
+        capture_query_dir=tmp_path / "capture",
+        capture_context_path=tmp_path / "context.json",
+        capture_prompt_keys=False,
+        capture_prompt_queries=True,
+        prompt_query_samples=16,
+        prompt_query_seed=1043,
+    )
+    assert os.environ["SF_QUERY_CAPTURE_PROMPT_QUERIES"] == "1"
+    assert os.environ["SF_QUERY_CAPTURE_PROMPT_QUERY_SAMPLES"] == "16"
+    assert os.environ["SF_QUERY_CAPTURE_PROMPT_QUERY_SEED"] == "1043"
+
+
+def test_query_robust_can_be_configured_with_request_prompt_root(monkeypatch, tmp_path):
+    import json
+    import os
+
+    monkeypatch.delenv("SF_QUERY_ROBUST_PROMPT_QUERY_ROOT", raising=False)
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    model_cfg = {
+        "tp": 1,
+        "num_q_heads": 32,
+        "num_kv_heads": 8,
+        "num_layers": 32,
+        "head_dim": 128,
+        "max_input_tokens": 16384,
+        "max_output_tokens": 128,
+        "kv_cache_block_size": 256,
+        "model_id": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+        "model_revision": "d" * 40,
+        "rope_type": "llama3",
+        "rope_parameters": {"factor": 8.0, "rope_theta": 500000.0},
+        "attention_scale": 128**-0.5,
+    }
+    request_root = tmp_path / "prompt_sources"
+    _configure_attention(
+        RunSpec("query_robust", 1024),
+        model_cfg,
+        query_pool_path=pool,
+        query_robust_prompt_query_root=request_root,
+        query_robust_generation_horizon=128,
+    )
+    args = json.loads(os.environ["SF_ATTENTION_ARGS_JSON"])
+    assert args["prompt_query_root"] == str(request_root.resolve())
+    assert os.environ["SF_QUERY_ROBUST_PROMPT_QUERY_ROOT"] == str(request_root.resolve())
+
+
+def test_query_robust_prompt_source_requires_tp1_and_overrides_stale_worker_mode(
+    monkeypatch, tmp_path
+):
+    import os
+
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
+    with __import__("pytest").raises(ValueError, match="TP=1"):
+        _configure_attention(
+            RunSpec("query_robust", 1024),
+            {
+                "tp": 2,
+                "num_q_heads": 32,
+                "num_kv_heads": 8,
+                "num_layers": 32,
+                "head_dim": 128,
+                "max_input_tokens": 16384,
+                "max_output_tokens": 128,
+                "kv_cache_block_size": 256,
+                "model_id": "test/model",
+                "model_revision": "d" * 40,
+                "rope_type": "llama3",
+                "rope_parameters": {"factor": 8.0, "rope_theta": 500000.0},
+                "attention_scale": 128**-0.5,
+            },
+            query_pool_path=tmp_path / "pool",
+            query_robust_prompt_query_root=tmp_path / "prompt",
+        )
+    _configure_attention(
+        RunSpec("query_robust", 1024),
+        {
+            "tp": 1,
+            "num_q_heads": 32,
+            "num_kv_heads": 8,
+            "num_layers": 32,
+            "head_dim": 128,
+            "max_input_tokens": 16384,
+            "max_output_tokens": 128,
+            "kv_cache_block_size": 256,
+            "model_id": "test/model",
+            "model_revision": "d" * 40,
+            "rope_type": "llama3",
+            "rope_parameters": {"factor": 8.0, "rope_theta": 500000.0},
+            "attention_scale": 128**-0.5,
+        },
+        query_pool_path=tmp_path / "pool",
+    )
+    assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+
+
+def test_dense_configuration_clears_stale_prompt_query_root(monkeypatch, tmp_path):
+    import os
+
+    monkeypatch.setenv("SF_QUERY_ROBUST_PROMPT_QUERY_ROOT", str(tmp_path / "stale"))
+    _configure_attention(
+        RunSpec("dense", None),
+        {
+            "tp": 1,
+            "num_q_heads": 32,
+            "num_kv_heads": 8,
+            "num_layers": 32,
+            "head_dim": 128,
+            "max_input_tokens": 8192,
+            "max_output_tokens": 128,
+            "kv_cache_block_size": 256,
+        },
+    )
+    assert "SF_QUERY_ROBUST_PROMPT_QUERY_ROOT" not in os.environ
+
+
 def test_capture_context_has_no_prompt_text():
     payload = _capture_context_payload(
         {

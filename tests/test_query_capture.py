@@ -6,6 +6,7 @@ import torch
 
 from sparse_frontier.modelling.attention.query_capture import (
     CaptureContext,
+    PromptQueryReservoir,
     QueryCaptureCollector,
 )
 
@@ -263,3 +264,84 @@ def test_queries_only_capture_skips_large_prompt_key_shards(tmp_path):
         torch.zeros(4, 2, 4), torch.zeros(4, 1, 4), None, True, 0
     )
     assert not list((tmp_path / "capture").rglob("prompt*.pt"))
+
+
+def test_prompt_query_reservoir_is_deterministic_and_validates_completion():
+    first = PromptQueryReservoir(
+        num_layers=1, num_q_heads=2, head_dim=3, size=2, seed=17
+    )
+    second = PromptQueryReservoir(
+        num_layers=1, num_q_heads=2, head_dim=3, size=2, seed=17
+    )
+    queries = torch.arange(2 * 5 * 3, dtype=torch.float32).view(2, 5, 3)
+    positions = torch.arange(5, dtype=torch.int32)
+    first.update(0, queries, positions)
+    second.update(0, queries, positions)
+    first.complete()
+    second.complete()
+    torch.testing.assert_close(first.queries, second.queries)
+    torch.testing.assert_close(first.positions, second.positions)
+    assert first.queries.dtype == torch.bfloat16
+    assert first.positions.shape == (1, 2, 2)
+    assert torch.all((first.positions >= 0) & (first.positions < 5))
+
+
+def test_collector_writes_prompt_pre_rope_query_reservoir(tmp_path):
+    context_path = tmp_path / "context.json"
+    _context(context_path, prompt_length=4)
+    collector = QueryCaptureCollector(
+        capture_dir=tmp_path / "capture",
+        context_path=context_path,
+        num_layers=2,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        tp_rank=0,
+        capture_layers=(0, 1),
+        capture_prompt_keys=False,
+        capture_prompt_queries=True,
+        prompt_query_samples=2,
+        prompt_query_seed=19,
+    )
+    query = torch.arange(4 * 2 * 4, dtype=torch.float32).view(4, 2, 4)
+    positions = torch.arange(4, dtype=torch.int32)
+    collector.capture_pre_rope(query, positions, _additive_rope)
+    collector.capture_attention(
+        query.clone(), torch.zeros(4, 1, 4), None, is_prefill=True
+    )
+    collector.capture_pre_rope(query + 100, positions, _additive_rope)
+    collector.capture_attention(
+        query.clone(), torch.zeros(4, 1, 4), None, is_prefill=True
+    )
+    request_dir = tmp_path / "capture" / "request_00000000000004d2"
+    payload = torch.load(
+        request_dir / "prompt_queries_layer_000_rank_000.pt", weights_only=True
+    )
+    assert payload["prompt_pre_rope_queries"].shape == (2, 2, 4)
+    assert payload["prompt_positions"].shape == (2, 2)
+    assert payload["metadata"]["prompt_length"] == 4
+    assert payload["representation"] == "q_norm_pre_rope_pre_scale"
+
+
+def test_prompt_query_capture_requires_enough_prompt_tokens(tmp_path):
+    context_path = tmp_path / "context.json"
+    _context(context_path, prompt_length=2)
+    collector = QueryCaptureCollector(
+        capture_dir=tmp_path / "capture",
+        context_path=context_path,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        tp_rank=0,
+        capture_layers=(0,),
+        capture_prompt_queries=True,
+        prompt_query_samples=3,
+    )
+    collector.capture_pre_rope(
+        torch.zeros(2, 2, 4), torch.arange(2), _additive_rope
+    )
+    with pytest.raises(RuntimeError, match="enough"):
+        collector.capture_attention(
+            torch.zeros(2, 2, 4), torch.zeros(2, 1, 4), None, is_prefill=True
+        )

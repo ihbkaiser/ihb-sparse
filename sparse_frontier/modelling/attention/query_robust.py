@@ -27,6 +27,10 @@ from .query_robust_solver import (
     fit_p,
 )
 from sparse_frontier.pile_query_capture import PileQueryPool, load_pile_query_pool
+from .prompt_query_source import (
+    load_prompt_query_support,
+    validate_prompt_query_manifest,
+)
 
 
 BiasMode = Literal["raw_entropy", "mean_residual"]
@@ -96,6 +100,31 @@ def _transport_llama3_rope(
     rotated_first = unrot_first * target_cos - unrot_second * target_sin
     rotated_second = unrot_second * target_cos + unrot_first * target_sin
     return torch.cat((rotated_first, rotated_second), dim=-1)
+
+
+def _apply_llama3_rope_at_position(
+    queries: Tensor,
+    target_position: int,
+    parameters: dict[str, object],
+) -> Tensor:
+    """Apply target-position RoPE to queries stored before RoPE.
+
+    ``_transport_llama3_rope`` is for tensors that already contain source
+    position RoPE and therefore first inverse-rotates them.  Prompt-local
+    captures are explicitly pre-RoPE, so their source position must not be
+    inverse-rotated a second time.
+    """
+
+    if queries.ndim != 3:
+        raise ValueError(
+            "pre-RoPE target application expects [kv_heads,samples,dim]"
+        )
+    zero_positions = torch.zeros(
+        queries.shape[:2], device=queries.device, dtype=torch.int32
+    )
+    return _transport_llama3_rope(
+        queries, zero_positions, target_position, parameters
+    )
 
 
 def select_balanced_pile_queries(
@@ -437,6 +466,7 @@ class QueryRobustAttention(AbstractAttention):
         collect_solver_audit: bool = False,
         async_prefill_build: bool = False,
         solver_armijo: bool = True,
+        prompt_query_root: str | Path | None = None,
         **unsupported: object,
     ) -> None:
         super().__init__()
@@ -589,6 +619,28 @@ class QueryRobustAttention(AbstractAttention):
             pool is not None and all(layer.full_queries is not None for layer in pool.layers)
         )
         self.pool_manifest = manifest
+        self.prompt_query_root = (
+            None if prompt_query_root is None else Path(prompt_query_root)
+        )
+        if self.prompt_query_root is not None:
+            validate_prompt_query_manifest(
+                self.prompt_query_root,
+                {
+                    name: manifest_value(name)
+                    for name in (
+                        "model_id",
+                        "model_revision",
+                        "num_layers",
+                        "num_q_heads",
+                        "num_kv_heads",
+                        "head_dim",
+                        "tp_size",
+                        "rope_type",
+                        "rope_parameters",
+                        "attention_scale",
+                    )
+                },
+            )
         self.pool_head_dim = int(manifest_value("head_dim"))
         self.scale = float(manifest_value("attention_scale"))
         expected_scale = self.pool_head_dim ** -0.5
@@ -856,6 +908,48 @@ class QueryRobustAttention(AbstractAttention):
 
     def _prepare_query_state(self, layer_idx: int, prompt_length: int) -> None:
         """Prepare the frozen empirical queries at this request's target Q position."""
+        if self.prompt_query_root is not None:
+            import os
+
+            request_id_text = os.getenv("SF_QUERY_ROBUST_REQUEST_ID")
+            if request_id_text is None:
+                raise RuntimeError(
+                    "request-local Query-Robust support is enabled but "
+                    "SF_QUERY_ROBUST_REQUEST_ID is missing"
+                )
+            try:
+                request_id = int(request_id_text, 10)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "SF_QUERY_ROBUST_REQUEST_ID must be a decimal nonnegative integer"
+                ) from exc
+            support = load_prompt_query_support(
+                self.prompt_query_root,
+                request_id,
+                layer_idx,
+                tp_rank=self.tp_rank,
+                num_q_heads=self.local_q_heads,
+                num_kv_heads=self.local_kv_heads,
+                head_dim=self.pool_head_dim,
+                prompt_length=prompt_length,
+            )
+            transported = _apply_llama3_rope_at_position(
+                support.queries_by_kv_head.to(
+                    device=self.summary_key.device, dtype=torch.float32
+                ),
+                prompt_length + self.generation_horizon - 1,
+                dict(self.pool_manifest["rope_parameters"])
+                if self.pile_pool is not None
+                else dict(self.pool_manifest.rope_parameters),
+            )
+            self.request_queries[layer_idx] = transported.to(dtype=torch.bfloat16)
+            self.request_query_weights[layer_idx] = support.weights_by_kv_head.to(
+                device=self.summary_key.device, dtype=torch.float32
+            )
+            self.request_query_positions[layer_idx] = support.positions_by_kv_head
+            self.centroid_ready[layer_idx] = True
+            self._centroid_ready_host[layer_idx] = True
+            return
         if self.pile_pool is None and self.pool is not None and self.robust_pool_available:
             if self.request_queries[layer_idx] is not None:
                 return

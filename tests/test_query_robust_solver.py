@@ -103,6 +103,21 @@ def test_batched_cvar_grows_support_until_unequal_caps_are_feasible():
     assert torch.isfinite(result[0]).all()
 
 
+def test_batched_solver_clamps_max_support_to_finite_pool():
+    S, f = _problem(n=8, tokens=4)
+    result = batched_independent_active_fit(
+        S.float().unsqueeze(0),
+        f.float().unsqueeze(0),
+        objective="minimax",
+        initial_support=4,
+        max_support=1024,
+        tolerance=1.0,
+        max_iterations=2,
+    )
+    assert result[0].shape == (1, 4)
+    assert torch.isfinite(result[0]).all()
+
+
 def test_batched_independent_can_admit_several_full_pool_violators_per_round():
     S, f = _problem(n=24, tokens=6)
     batched_S = torch.stack([S.float(), (S + 0.15).float()])
