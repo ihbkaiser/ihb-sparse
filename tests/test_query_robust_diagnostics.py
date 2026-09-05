@@ -1,16 +1,45 @@
 import torch
 
+from sparse_frontier.modelling.attention.query_robust import _transport_llama3_rope
 from sparse_frontier.modelling.attention.query_robust import (
     _apply_llama3_rope_at_position,
     _transport_llama3_rope,
 )
 from sparse_frontier.query_robust_diagnostics import (
+    apply_rope,
     apply_llama3_rope,
     balanced_task_head_centroid,
     build_chunk_summaries,
     retained_attention_mass,
     select_gqa_chunks,
 )
+
+
+def test_default_rope_transport_is_compositional():
+    query = torch.randn(3, 128, dtype=torch.float64)
+    parameters = {"rope_theta": 3580165449.0}
+    direct = apply_rope(query, 8065, rope_type="default", parameters=parameters)
+    composed = apply_rope(
+        apply_rope(query, 2, rope_type="default", parameters=parameters),
+        8063,
+        rope_type="default",
+        parameters=parameters,
+    )
+    torch.testing.assert_close(composed, direct, rtol=1e-10, atol=1e-10)
+
+
+def test_default_rope_transport_undoes_source_position():
+    query = torch.randn(1, 2, 128, dtype=torch.float32)
+    parameters = {"rope_theta": 3580165449.0}
+    source = apply_rope(query, 2, rope_type="default", parameters=parameters)
+    transported = _transport_llama3_rope(
+        source,
+        torch.tensor([[2, 2]], dtype=torch.int32),
+        8065,
+        parameters,
+    )
+    expected = apply_rope(query, 8065, rope_type="default", parameters=parameters)
+    torch.testing.assert_close(transported, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_pre_rope_prompt_queries_use_direct_target_rotation():

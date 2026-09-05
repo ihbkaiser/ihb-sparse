@@ -51,6 +51,7 @@ class SparsityStats(TypedDict):
     query_robust_solver_gap_max: Optional[float]
     query_robust_solver_active_max: Optional[int]
     query_robust_solver_nonconverged: Optional[int]
+    query_robust_solver_retry_count: Optional[int]
     query_robust_quantized_error_max: Optional[float]
 
 
@@ -74,6 +75,7 @@ def _server_loop(address: Tuple[str, int], authkey: bytes, ready_event: mproc.Ev
     query_robust_solver_gap_max: Optional[float] = None
     query_robust_solver_active_max: Optional[int] = None
     query_robust_solver_nonconverged: Optional[int] = None
+    query_robust_solver_retry_count: Optional[int] = None
     query_robust_quantized_error_max: Optional[float] = None
 
     try:
@@ -125,6 +127,7 @@ def _server_loop(address: Tuple[str, int], authkey: bytes, ready_event: mproc.Ev
                 query_robust_solver_gap_max = float(message.get("solver_gap_max", 0.0))
                 query_robust_solver_active_max = int(message.get("solver_active_max", 0))
                 query_robust_solver_nonconverged = int(message.get("solver_nonconverged", 0))
+                query_robust_solver_retry_count = int(message.get("solver_retry_count", 0))
                 query_robust_quantized_error_max = float(message.get("quantized_error_max", 0.0))
                 conn.send({"status": "ok"})
             elif command == "query_robust_decode":
@@ -148,6 +151,7 @@ def _server_loop(address: Tuple[str, int], authkey: bytes, ready_event: mproc.Ev
                     "query_robust_solver_gap_max": query_robust_solver_gap_max,
                     "query_robust_solver_active_max": query_robust_solver_active_max,
                     "query_robust_solver_nonconverged": query_robust_solver_nonconverged,
+                    "query_robust_solver_retry_count": query_robust_solver_retry_count,
                     "query_robust_quantized_error_max": query_robust_quantized_error_max,
                 }
 
@@ -166,6 +170,7 @@ def _server_loop(address: Tuple[str, int], authkey: bytes, ready_event: mproc.Ev
                 query_robust_solver_gap_max = None
                 query_robust_solver_active_max = None
                 query_robust_solver_nonconverged = None
+                query_robust_solver_retry_count = None
                 query_robust_quantized_error_max = None
                 conn.send(response)
             else:
@@ -235,6 +240,7 @@ def set_query_robust_state(
     solver_gap_max: float = 0.0,
     solver_active_max: int = 0,
     solver_nonconverged: int = 0,
+    solver_retry_count: int = 0,
     quantized_error_max: float = 0.0,
 ) -> bool:
     """Record bounded Query-Robust request state after dense prefill."""
@@ -249,6 +255,7 @@ def set_query_robust_state(
             "solver_gap_max": float(solver_gap_max),
             "solver_active_max": int(solver_active_max),
             "solver_nonconverged": int(solver_nonconverged),
+            "solver_retry_count": int(solver_retry_count),
             "quantized_error_max": float(quantized_error_max),
         },
     )
@@ -288,6 +295,7 @@ def fetch_sparsity_and_reset() -> Optional[SparsityStats]:
         "query_robust_solver_gap_max": response.get("query_robust_solver_gap_max"),
         "query_robust_solver_active_max": response.get("query_robust_solver_active_max"),
         "query_robust_solver_nonconverged": response.get("query_robust_solver_nonconverged"),
+        "query_robust_solver_retry_count": response.get("query_robust_solver_retry_count"),
         "query_robust_quantized_error_max": response.get("query_robust_quantized_error_max"),
     }
 

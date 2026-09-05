@@ -776,7 +776,7 @@ def test_shadowkv_uses_fused_landmark_softmax_when_available(monkeypatch):
     torch.testing.assert_close(chosen, torch.tensor([[[3, 0], [8, 5]]]))
 
 
-def test_shadowkv_enables_fused_landmark_softmax_by_default():
+def test_shadowkv_uses_reference_landmark_softmax_by_default():
     attention = ShadowKVAttention(
         sparse_budget=4,
         chunk_size=2,
@@ -789,7 +789,7 @@ def test_shadowkv_enables_fused_landmark_softmax_by_default():
         tp_size=1,
         block_size=4,
     )
-    assert attention.fused_retrieval is True
+    assert attention.fused_retrieval is False
 
 
 def test_shadowkv_cuda_retrieval_kernel_matches_reference():

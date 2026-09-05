@@ -66,7 +66,7 @@ class ShadowKVAttention(AbstractAttention):
         svd_backend: str = "randomized",
         svd_oversample: int = 32,
         svd_niter: int = 2,
-        fused_retrieval: bool = True,
+        fused_retrieval: bool = False,
         local_chunk: int = 4,
         outlier_chunk: int = 48,
         num_layers: int = 1,

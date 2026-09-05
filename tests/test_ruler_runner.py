@@ -6,6 +6,9 @@ from sparse_frontier.ruler_runner import (
     _select_tasks,
     _select_task_indices,
     _generate_one,
+    _prepare_raw_capture_manifest,
+    _resolve_query_robust_cli_defaults,
+    build_table1_run_matrix,
     build_run_matrix,
     validate_budget,
 )
@@ -37,6 +40,131 @@ def test_smoke_matrix_has_one_run_per_method():
         ("quest", 512),
         ("shadowkv", 512),
     ]
+
+
+def test_table1_recipe_matrix_has_one_native_configuration_per_method():
+    matrix = build_table1_run_matrix()
+    assert [(spec.method, spec.budget) for spec in matrix] == [
+        ("dense", None),
+        ("quest", 2048),
+        ("shadowkv", 2048),
+        ("query_robust", 2048),
+    ]
+
+
+def test_general_cli_defaults_to_certified_newton_and_table1_keeps_locked_pilot():
+    assert _resolve_query_robust_cli_defaults(
+        table1_recipe=False, backend=None, fail_closed=None
+    ) == ("batched_newton", True)
+    assert _resolve_query_robust_cli_defaults(
+        table1_recipe=True, backend=None, fail_closed=None
+    ) == ("triton_fast_retry", False)
+    assert _resolve_query_robust_cli_defaults(
+        table1_recipe=False, backend="active_set", fail_closed=False
+    ) == ("active_set", False)
+
+
+def test_table1_recipe_locks_native_attention_arguments(monkeypatch, tmp_path):
+    import json
+
+    model_cfg = {
+        "tp": 1,
+        "num_q_heads": 32,
+        "num_kv_heads": 8,
+        "num_layers": 32,
+        "head_dim": 128,
+        "max_input_tokens": 131072,
+        "max_output_tokens": 128,
+        "kv_cache_block_size": 256,
+        "model_id": "org/model",
+        "model_revision": "a" * 40,
+        "rope_type": "llama3",
+        "rope_parameters": {"factor": 8.0},
+        "attention_scale": 128**-0.5,
+    }
+
+    _configure_attention(
+        RunSpec("quest", 2048), model_cfg, table1_recipe=True
+    )
+    quest = json.loads(__import__("os").environ["SF_ATTENTION_ARGS_JSON"])
+    assert quest == {
+        "token_budget": 2048,
+        "page_size": 16,
+        "share_pages": True,
+        "dense_layers": 2,
+    }
+
+    _configure_attention(
+        RunSpec("shadowkv", 2048), model_cfg, table1_recipe=True
+    )
+    shadowkv = json.loads(__import__("os").environ["SF_ATTENTION_ARGS_JSON"])
+    assert shadowkv["sparse_budget"] == 2048
+    assert shadowkv["chunk_size"] == 8
+    assert shadowkv["rank"] == 160
+    assert shadowkv["outlier_chunk"] == 48
+    assert shadowkv["svd_backend"] == "exact"
+    # The current 128K fused retrieval kernel exceeds its shared-memory
+    # launch limit, whereas the PyTorch path is the verified reference.
+    assert shadowkv["fused_retrieval"] is False
+
+    _configure_attention(
+        RunSpec("query_robust", 2048),
+        model_cfg,
+        table1_recipe=True,
+        query_pool_path=tmp_path / "pile_pool",
+        query_robust_solver_backend="triton_fast_retry",
+        query_robust_solver_fail_closed=False,
+    )
+    query_robust = json.loads(__import__("os").environ["SF_ATTENTION_ARGS_JSON"])
+    assert query_robust["token_budget"] == 2048
+    assert query_robust["chunk_size"] == 16
+    assert query_robust["generation_horizon"] == 128
+    assert query_robust["prompt_query_root"] is None
+    assert query_robust["solver_backend"] == "triton_fast_retry"
+    assert query_robust["triton_fast_iterations"] == 1024
+    assert query_robust["triton_retry_iterations"] == 8192
+    # This performance run deliberately has no dense/FP64 fallback.  Any
+    # remaining uncertified chunks are retained in the run diagnostics.
+    assert query_robust["solver_fail_closed"] is False
+
+
+def test_cli_accepts_locked_table1_protocol_options(monkeypatch, tmp_path):
+    import sys
+    import sparse_frontier.ruler_runner as runner
+
+    observed = {}
+
+    def fake_run_cli(args):
+        observed["protocol"] = args.protocol
+        observed["manifest"] = args.protocol_manifest
+        return 0
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ruler_runner",
+            "--protocol",
+            "ruler_128k_table1_recipe",
+            "--protocol_manifest",
+            str(tmp_path / "protocol.json"),
+            "--model_path",
+            "model",
+            "--output_dir",
+            "outputs",
+            "--query_pool_path",
+            "pool",
+        ],
+    )
+
+    with __import__("pytest").raises(SystemExit) as exit_info:
+        runner.main()
+    assert exit_info.value.code == 0
+    assert observed == {
+        "protocol": "ruler_128k_table1_recipe",
+        "manifest": str(tmp_path / "protocol.json"),
+    }
 
 
 def test_budget_validation():
@@ -76,7 +204,7 @@ def test_shadowkv_runner_defaults_to_randomized_svd(monkeypatch):
 
     args = json.loads(__import__("os").environ["SF_ATTENTION_ARGS_JSON"])
     assert args["svd_backend"] == "randomized"
-    assert args["fused_retrieval"] is True
+    assert args["fused_retrieval"] is False
 
 
 def test_dense_capture_enables_patch_and_model_geometry(monkeypatch, tmp_path):
@@ -278,6 +406,58 @@ def test_model_geometry_is_loaded_from_checkpoint(tmp_path):
     assert config["head_dim"] == 128
 
 
+def test_model_contract_uses_checkpoint_identity_not_the_local_directory(tmp_path):
+    import json
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "_name_or_path": "org/pinned-model",
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "hidden_size": 2048,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = _load_model_config(tmp_path, tp=1, max_input_tokens=4096, max_output_tokens=8)
+
+    assert config["model_id"] == "org/pinned-model"
+
+
+def test_capture_manifest_uses_checkpoint_identity_not_local_path(tmp_path):
+    import json
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "_name_or_path": "org/pinned-model",
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "hidden_size": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_cfg = _load_model_config(tmp_path, tp=1, max_input_tokens=16, max_output_tokens=4)
+    data_path = tmp_path / "data.jsonl"
+    data_path.write_text("{}\n", encoding="utf-8")
+
+    _prepare_raw_capture_manifest(
+        tmp_path / "capture",
+        tmp_path,
+        model_cfg,
+        data_path,
+        max_decode_offset=3,
+    )
+
+    manifest = json.loads((tmp_path / "capture" / "manifest.json").read_text())
+    assert manifest["model_id"] == "org/pinned-model"
+
+
 def test_select_task_indices_keeps_each_task_and_requested_split():
     rows = [
         {"task": task, "task_index": index}
@@ -344,6 +524,10 @@ def test_query_robust_runner_sets_fail_closed_identity(monkeypatch, tmp_path):
     assert args["bias_mode"] == "raw_entropy"
     assert args["share_chunks_across_kv_heads"] is True
     assert os.environ["SF_MODEL_REVISION"] == "d" * 40
+    assert args["solver_backend"] == "batched_newton"
+    assert args["solver_fail_closed"] is True
+    assert args["solver_gap_tolerance"] == 5e-4
+    assert args["solver_chunk_batch_size"] == 1024
 
 
 def test_generate_one_never_exceeds_model_declared_output_horizon():

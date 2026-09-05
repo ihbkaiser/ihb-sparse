@@ -14,6 +14,7 @@ attention:
     svd_backend: randomized
     svd_oversample: 32
     svd_niter: 2
-    # Uses the fused landmark GEMM+softmax kernel when the optional CUDA
-    # extension is built; falls back to the verified PyTorch implementation.
-    fused_retrieval: true
+    # PyTorch's GEMM+softmax reference is faster at long contexts and avoids
+    # the optional kernel's 128K shared-memory launch limit.  Enable only for
+    # a separately validated CUDA-kernel experiment.
+    fused_retrieval: false

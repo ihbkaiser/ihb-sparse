@@ -8,9 +8,14 @@ attention:
     cvar_alpha: 0.95
     initial_support: 64
     max_support: 1024
-    solver_gap_tolerance: 0.001
-    solver_max_iterations: 500
-    solver_chunk_batch_size: 16
+    # B200 low-query recipe: FP64 Newton state, bounded independent line
+    # searches, and a final full-pool certificate.  This assumes the selected
+    # empirical pool has <=32 queries (the RULER smoke uses four).
+    solver_backend: batched_newton
+    solver_gap_tolerance: 0.0005
+    solver_max_iterations: 8
+    solver_chunk_batch_size: 1024
+    empirical_query_budget: 4
     # Admit several worst inactive empirical queries after each full-pool scan.
     # This preserves the minimax/CVaR objective and certificate while avoiding
     # one GPU active-set solve per individual violator.

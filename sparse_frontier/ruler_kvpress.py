@@ -119,6 +119,13 @@ def build_prompt_token_ids(
     enable_thinking: bool = False,
 ) -> list[int]:
     """Mirror ``KVPressTextGenerationPipeline.preprocess`` for one RULER row."""
+    if bool(row.get("prompt_is_preformatted", False)):
+        if "prompt" not in row:
+            raise ValueError("preformatted RULER row is missing prompt")
+        # RULER's generator may already serialize model-specific role markers.
+        # Calling apply_chat_template here would make methods attend to a
+        # different prompt than the pinned JSONL bytes.
+        return list(tokenizer.encode(str(row["prompt"]), add_special_tokens=False))
     context = str(row["context"])
     question = str(row["question"])
     answer_prefix = str(row["answer_prefix"])

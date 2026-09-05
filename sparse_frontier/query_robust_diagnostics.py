@@ -111,6 +111,49 @@ def apply_llama3_rope(
     return rotated.to(query.dtype)
 
 
+def apply_rope(
+    query: Tensor,
+    position: int,
+    *,
+    rope_type: str,
+    parameters: dict[str, object],
+) -> Tensor:
+    """Apply a supported NeoX rotary map from versioned checkpoint metadata."""
+    if rope_type == "llama3":
+        return apply_llama3_rope(
+            query,
+            position,
+            base=float(parameters["rope_theta"]),
+            factor=float(parameters["factor"]),
+            low_freq_factor=float(parameters["low_freq_factor"]),
+            high_freq_factor=float(parameters["high_freq_factor"]),
+            original_max_position_embeddings=int(
+                parameters["original_max_position_embeddings"]
+            ),
+        )
+    if rope_type != "default":
+        raise ValueError(f"unsupported Query-Robust RoPE type {rope_type!r}")
+    if query.shape[-1] % 2:
+        raise ValueError("NeoX RoPE requires an even head dimension")
+    work_dtype = (
+        query.dtype if query.dtype in (torch.float32, torch.float64) else torch.float32
+    )
+    work = query.to(work_dtype)
+    inv = 1.0 / (
+        float(parameters["rope_theta"])
+        ** (
+            torch.arange(0, query.shape[-1], 2, device=query.device, dtype=work_dtype)
+            / query.shape[-1]
+        )
+    )
+    angle = inv * int(position)
+    cos, sin = angle.cos(), angle.sin()
+    first, second = work.chunk(2, dim=-1)
+    return torch.cat(
+        (first * cos - second * sin, second * cos + first * sin), dim=-1
+    ).to(query.dtype)
+
+
 def build_chunk_summaries(
     keys: Tensor,
     empirical_centroid: Tensor,
@@ -518,9 +561,10 @@ def evaluate_capture(
         root, split=calibration_split, horizon=horizon
     )
     rope = dict(manifest["rope_parameters"])
-    base = float(rope.pop("rope_theta"))
-    if manifest["rope_type"] != "llama3":
-        raise ValueError("the first offline evaluator supports only Llama-3 RoPE")
+    if manifest["rope_type"] not in {"llama3", "default"}:
+        raise ValueError(
+            "the offline evaluator supports only Llama-3 or default NeoX RoPE"
+        )
     target = torch.device(device)
     rows: list[dict[str, Any]] = []
     evaluated_requests = 0
@@ -543,16 +587,11 @@ def evaluate_capture(
         for local_layer, layer in enumerate(layer_ids):
             prompt_path = request / f"prompt_layer_{layer:03d}_rank_000.pt"
             prompt_keys = _safe_load(prompt_path)["keys"]
-            request_centroid = apply_llama3_rope(
+            request_centroid = apply_rope(
                 centroids[layer].to(target),
                 int(metadata["prompt_length"]),
-                base=base,
-                factor=float(rope["factor"]),
-                low_freq_factor=float(rope["low_freq_factor"]),
-                high_freq_factor=float(rope["high_freq_factor"]),
-                original_max_position_embeddings=int(
-                    rope["original_max_position_embeddings"]
-                ),
+                rope_type=str(manifest["rope_type"]),
+                parameters=rope,
             )
             for step_number, step in enumerate(steps):
                 keys = torch.cat(

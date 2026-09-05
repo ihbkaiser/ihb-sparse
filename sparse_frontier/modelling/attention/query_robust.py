@@ -24,7 +24,10 @@ from .query_pool import (
 )
 from .query_robust_solver import (
     batched_independent_active_fit,
+    batched_full_support_newton_fit,
     fit_p,
+    triton_global_armijo_full_support_fit,
+    triton_full_support_minimax_retry_fit,
 )
 from sparse_frontier.pile_query_capture import PileQueryPool, load_pile_query_pool
 from .prompt_query_source import (
@@ -73,22 +76,35 @@ def _transport_llama3_rope(
     if queries.ndim != 3 or source_positions.ndim != 2 or queries.shape[:2] != source_positions.shape:
         raise ValueError("RoPE transport expects [kv_heads,samples,dim] and aligned positions")
     base = float(parameters["rope_theta"])
-    factor = float(parameters["factor"])
-    low = float(parameters["low_freq_factor"])
-    high = float(parameters["high_freq_factor"])
-    original = int(parameters["original_max_position_embeddings"])
     work = queries.to(dtype=torch.float32)
     dim = work.shape[-1]
     inv = 1.0 / (base ** (torch.arange(0, dim, 2, device=work.device, dtype=torch.float32) / dim))
-    wavelength = 2.0 * torch.pi / inv
-    low_wavelength = original / low
-    high_wavelength = original / high
-    smooth = (original / wavelength - low) / (high - low)
-    inv = torch.where(
-        wavelength < high_wavelength,
-        inv,
-        torch.where(wavelength > low_wavelength, inv / factor, (1.0 - smooth) * inv / factor + smooth * inv),
-    )
+    # Gradient's long-context checkpoint declares plain/default RoPE with a
+    # large theta rather than Llama-3's piecewise frequency scaling. Both are
+    # position-composable; only the frequency map differs.
+    if {
+        "factor",
+        "low_freq_factor",
+        "high_freq_factor",
+        "original_max_position_embeddings",
+    } <= parameters.keys():
+        factor = float(parameters["factor"])
+        low = float(parameters["low_freq_factor"])
+        high = float(parameters["high_freq_factor"])
+        original = int(parameters["original_max_position_embeddings"])
+        wavelength = 2.0 * torch.pi / inv
+        low_wavelength = original / low
+        high_wavelength = original / high
+        smooth = (original / wavelength - low) / (high - low)
+        inv = torch.where(
+            wavelength < high_wavelength,
+            inv,
+            torch.where(
+                wavelength > low_wavelength,
+                inv / factor,
+                (1.0 - smooth) * inv / factor + smooth * inv,
+            ),
+        )
     source_angle = source_positions.to(device=work.device, dtype=torch.float32).unsqueeze(-1) * inv
     target_angle = float(target_position) * inv
     first, second = work.chunk(2, dim=-1)
@@ -466,6 +482,10 @@ class QueryRobustAttention(AbstractAttention):
         collect_solver_audit: bool = False,
         async_prefill_build: bool = False,
         solver_armijo: bool = True,
+        solver_backend: str = "active_set",
+        triton_fast_iterations: int = 1024,
+        triton_retry_iterations: int = 8192,
+        triton_armijo_backtracks: int = 12,
         prompt_query_root: str | Path | None = None,
         **unsupported: object,
     ) -> None:
@@ -584,8 +604,22 @@ class QueryRobustAttention(AbstractAttention):
         if not 1 <= generation_horizon <= max_horizon:
             raise ValueError("Query-Robust generation horizon is outside the empirical artifact")
         rope_type = manifest_value("rope_type")
-        if rope_type != "llama3":
-            raise ValueError("Query-Robust online v1 supports only Llama-3 RoPE")
+        if rope_type not in {"llama3", "default"}:
+            raise ValueError(
+                "Query-Robust online v1 supports only Llama-3 or default NeoX RoPE"
+            )
+        rope_parameters = manifest_value("rope_parameters")
+        if "rope_theta" not in rope_parameters:
+            raise ValueError("Query-Robust RoPE metadata must include rope_theta")
+        if rope_type == "llama3" and not {
+            "factor",
+            "low_freq_factor",
+            "high_freq_factor",
+            "original_max_position_embeddings",
+        } <= set(rope_parameters):
+            raise ValueError(
+                "Query-Robust Llama-3 RoPE metadata is missing frequency-scaling parameters"
+            )
         if score_dtype not in {"float32", torch.float32}:
             raise ValueError("Query-Robust online scoring must use float32")
         dtype_map = {
@@ -691,6 +725,29 @@ class QueryRobustAttention(AbstractAttention):
         # ``solver_fail_closed`` below.
         self.collect_solver_audit = bool(collect_solver_audit)
         self.solver_armijo = bool(solver_armijo)
+        self.solver_backend = str(solver_backend)
+        if self.solver_backend not in {
+            "active_set",
+            "batched_newton",
+            "triton_fast_retry",
+            "triton_global_armijo",
+        }:
+            raise ValueError(
+                "Query-Robust solver_backend must be active_set, batched_newton, triton_fast_retry, or triton_global_armijo"
+            )
+        if (
+            int(triton_fast_iterations) < 1
+            or int(triton_retry_iterations) < int(triton_fast_iterations)
+            or int(triton_armijo_backtracks) < 1
+        ):
+            raise ValueError("invalid Query-Robust Triton retry configuration")
+        if self.solver_backend in {"batched_newton", "triton_fast_retry", "triton_global_armijo"} and self.objective != "minimax":
+            raise ValueError(f"{self.solver_backend} supports only the minimax objective")
+        if self.solver_backend in {"batched_newton", "triton_fast_retry", "triton_global_armijo"} and not self.solver_armijo:
+            raise ValueError(f"{self.solver_backend} requires solver_armijo=True")
+        self.triton_fast_iterations = int(triton_fast_iterations)
+        self.triton_retry_iterations = int(triton_retry_iterations)
+        self.triton_armijo_backtracks = int(triton_armijo_backtracks)
         if not self.solver_armijo and (
             self.solver_fail_closed
             or self.collect_solver_audit
@@ -732,6 +789,7 @@ class QueryRobustAttention(AbstractAttention):
         self.solver_gap_max = 0.0
         self.solver_active_max = 0
         self.solver_nonconverged = 0
+        self.solver_retry_count = 0
         self.quantized_error_max = 0.0
         self._dense_fallback = False
         self._centroid_ready_host = [False] * self.num_layers
@@ -740,6 +798,7 @@ class QueryRobustAttention(AbstractAttention):
         # whether all KV heads share its weights only needs one device sync per
         # layer/request, not one per chunk build.
         self._common_query_weights: list[bool | None] = [None] * self.num_layers
+        self._triton_uniform_weights: list[bool | None] = [None] * self.num_layers
         self._prefill_stream: torch.cuda.Stream | None = None
         self._pending_prefill_events: list[
             tuple[torch.cuda.Event, torch.cuda.Event] | None
@@ -832,10 +891,13 @@ class QueryRobustAttention(AbstractAttention):
         self.solver_gap_max = 0.0
         self.solver_active_max = 0
         self.solver_nonconverged = 0
+        self.solver_retry_count = 0
         self.quantized_error_max = 0.0
         self._dense_fallback = False
         self._centroid_ready_host = [False] * self.num_layers
         self._summary_ready_host = [set() for _ in range(self.num_layers)]
+        self._common_query_weights = [None] * self.num_layers
+        self._triton_uniform_weights = [None] * self.num_layers
 
     def _wait_for_pending_prefill_summaries(self, layer_idx: int | None = None) -> None:
         """Fence asynchronous prefill summaries before their state is reused.
@@ -873,6 +935,7 @@ class QueryRobustAttention(AbstractAttention):
             solver_gap_max=self.solver_gap_max,
             solver_active_max=self.solver_active_max,
             solver_nonconverged=self.solver_nonconverged,
+            solver_retry_count=self.solver_retry_count,
             quantized_error_max=self.quantized_error_max,
         )
 
@@ -883,24 +946,18 @@ class QueryRobustAttention(AbstractAttention):
             raise RuntimeError("Query-Robust summary allocation failed")
 
     def _rotate_centroid(self, layer_idx: int, prompt_length: int) -> None:
-        from sparse_frontier.query_robust_diagnostics import apply_llama3_rope
+        from sparse_frontier.query_robust_diagnostics import apply_rope
 
         parameters = dict(self.pool.manifest.rope_parameters)
-        base = float(parameters.pop("rope_theta"))
         if self.prompt_origin_centroid is None:
             raise RuntimeError("Query-Robust origin-centroid allocation failed")
         origin = self.prompt_origin_centroid[layer_idx]
         self.request_centroid[layer_idx].copy_(
-            apply_llama3_rope(
+            apply_rope(
                 origin,
                 prompt_length,
-                base=base,
-                factor=float(parameters["factor"]),
-                low_freq_factor=float(parameters["low_freq_factor"]),
-                high_freq_factor=float(parameters["high_freq_factor"]),
-                original_max_position_embeddings=int(
-                    parameters["original_max_position_embeddings"]
-                ),
+                rope_type=str(self.pool.manifest.rope_type),
+                parameters=parameters,
             )
         )
         self.centroid_ready[layer_idx] = True
@@ -1036,6 +1093,25 @@ class QueryRobustAttention(AbstractAttention):
                 query_pool = query_pool.float()
                 key_heads = chunks.float().permute(2, 0, 1, 3)
                 shared_weights = query_weights[0]
+                if self.solver_backend in {"triton_fast_retry", "triton_global_armijo"}:
+                    uniform_weights = self._triton_uniform_weights[layer_idx]
+                    if uniform_weights is None:
+                        uniform_weights = bool(
+                            torch.allclose(
+                                shared_weights,
+                                torch.full_like(
+                                    shared_weights,
+                                    1.0 / shared_weights.numel(),
+                                ),
+                                atol=0.0,
+                                rtol=0.0,
+                            )
+                        )
+                        self._triton_uniform_weights[layer_idx] = uniform_weights
+                    if not uniform_weights:
+                        raise ValueError(
+                            "triton_fast_retry requires the uniform Pile empirical measure"
+                        )
                 for start in range(0, chunks.shape[0], self.solver_chunk_batch_size):
                     stop = min(chunks.shape[0], start + self.solver_chunk_batch_size)
                     key_batch = key_heads[:, start:stop]
@@ -1045,24 +1121,111 @@ class QueryRobustAttention(AbstractAttention):
                     batch_heads, batch_chunks = logits.shape[:2]
                     flat_logits = logits.reshape(batch_heads * batch_chunks, logits.shape[-2], logits.shape[-1])
                     flat_f = torch.logsumexp(flat_logits, dim=-1)
-                    p, lower, upper, gap, active_size, converged, _ = batched_independent_active_fit(
-                        flat_logits,
-                        flat_f,
-                        objective=self.objective,
-                        weights=shared_weights,
-                        alpha=self.cvar_alpha,
-                        initial_support=self.initial_support,
-                        max_support=self.max_support,
-                        tolerance=self.solver_gap_tolerance,
-                        max_iterations=self.solver_max_iterations,
-                        active_additions_per_round=self.solver_violators_per_round,
-                        compute_certificate=(
-                            self.solver_fail_closed
-                            or self.collect_solver_audit
-                            or self.max_support != self.initial_support
-                        ),
-                        armijo=self.solver_armijo,
-                    )
+                    # One-shot diagnostics for GPU solver investigations.
+                    # The scalar reductions are intentionally gated so normal
+                    # serving never pays for host synchronization.
+                    import os
+                    trace_solver = os.getenv("SF_QR_TRACE_SOLVER") == "1"
+                    dump_solver = os.getenv("SF_QR_DUMP_SOLVER")
+                    if (trace_solver or dump_solver) and not getattr(
+                        self, "_solver_trace_emitted", False
+                    ):
+                        trace = {
+                            "shape": list(flat_logits.shape),
+                            "score_min": float(flat_logits.amin().item()),
+                            "score_max": float(flat_logits.amax().item()),
+                            "score_absmax": float(flat_logits.abs().amax().item()),
+                            "score_mean": float(flat_logits.mean().item()),
+                            "score_std": float(flat_logits.float().std().item()),
+                            "partition_min": float(flat_f.amin().item()),
+                            "partition_max": float(flat_f.amax().item()),
+                            "query_mean": flat_logits.mean((0, 2)).tolist(),
+                            "query_std": flat_logits.float().std((0, 2)).tolist(),
+                            "query_absmax": flat_logits.abs().amax((0, 2)).tolist(),
+                        }
+                        if trace_solver:
+                            print(
+                                __import__("json").dumps(
+                                    {"query_robust_solver_trace": trace},
+                                    sort_keys=True,
+                                ),
+                                flush=True,
+                            )
+                        if dump_solver:
+                            torch.save(
+                                {
+                                    "scores": flat_logits[:1024].detach().cpu(),
+                                    "partitions": flat_f[:1024].detach().cpu(),
+                                    "trace": trace,
+                                },
+                                dump_solver,
+                            )
+                        self._solver_trace_emitted = True
+                    if self.solver_backend == "batched_newton":
+                        p, lower, upper, gap, converged, _ = (
+                            batched_full_support_newton_fit(
+                                flat_logits,
+                                flat_f,
+                                tolerance=self.solver_gap_tolerance,
+                                max_iterations=min(self.solver_max_iterations, 8),
+                                armijo_backtracks=min(self.triton_armijo_backtracks, 10),
+                            )
+                        )
+                        active_size = torch.full_like(
+                            gap, flat_logits.shape[1], dtype=torch.int64
+                        )
+                    elif self.solver_backend == "triton_fast_retry":
+                        if flat_logits.shape[1] > 256:
+                            raise ValueError(
+                                "triton_fast_retry supports at most 256 empirical queries; "
+                                "reduce empirical_query_budget or use active_set"
+                            )
+                        p, lower, upper, gap, converged, retry_count = (
+                            triton_full_support_minimax_retry_fit(
+                                flat_logits,
+                                flat_f,
+                                tolerance=self.solver_gap_tolerance,
+                                fast_iterations=self.triton_fast_iterations,
+                                retry_iterations=self.triton_retry_iterations,
+                                armijo_backtracks=self.triton_armijo_backtracks,
+                            )
+                        )
+                        active_size = torch.full_like(
+                            gap, flat_logits.shape[1], dtype=torch.int64
+                        )
+                        self.solver_retry_count += retry_count
+                    elif self.solver_backend == "triton_global_armijo":
+                        p, lower, upper, gap, converged = (
+                            triton_global_armijo_full_support_fit(
+                                flat_logits,
+                                flat_f,
+                                tolerance=self.solver_gap_tolerance,
+                                max_iterations=self.triton_retry_iterations,
+                                armijo_backtracks=self.triton_armijo_backtracks,
+                            )
+                        )
+                        active_size = torch.full_like(
+                            gap, flat_logits.shape[1], dtype=torch.int64
+                        )
+                    else:
+                        p, lower, upper, gap, active_size, converged, _ = batched_independent_active_fit(
+                            flat_logits,
+                            flat_f,
+                            objective=self.objective,
+                            weights=shared_weights,
+                            alpha=self.cvar_alpha,
+                            initial_support=self.initial_support,
+                            max_support=self.max_support,
+                            tolerance=self.solver_gap_tolerance,
+                            max_iterations=self.solver_max_iterations,
+                            active_additions_per_round=self.solver_violators_per_round,
+                            compute_certificate=(
+                                self.solver_fail_closed
+                                or self.collect_solver_audit
+                                or self.max_support != self.initial_support
+                            ),
+                            armijo=self.solver_armijo,
+                        )
                     p = p.view(batch_heads, batch_chunks, -1).to(dtype=torch.float32)
                     summary_batch = torch.einsum("hcn,hcnd->hcd", p, key_batch)
                     entropy_batch = -(
@@ -1093,13 +1256,21 @@ class QueryRobustAttention(AbstractAttention):
                         quantized_predicted = affine_score + bias_batch.unsqueeze(-1)
                         quantized_error = (flat_f.view(batch_heads, batch_chunks, -1) - quantized_predicted).abs().max()
                         self.quantized_error_max = max(self.quantized_error_max, float(quantized_error.item()))
-                        self.solver_gap_max = max(self.solver_gap_max, float(gap.max().item()))
-                        self.solver_active_max = max(self.solver_active_max, int(active_size.max().item()))
-                        self.solver_nonconverged += int((~converged).sum().item())
+                    # Certificate telemetry is mandatory for every backend.
+                    # Previously active-set reported no gap/nonconvergence
+                    # unless audit mode was enabled, which could make an
+                    # uncertified sparse run look healthy.
+                    self.solver_gap_max = max(self.solver_gap_max, float(gap.max().item()))
+                    self.solver_active_max = max(self.solver_active_max, int(active_size.max().item()))
+                    self.solver_nonconverged += int((~converged).sum().item())
                     if self.solver_fail_closed and bool((~converged).any() or (gap > self.solver_gap_tolerance).any()):
                         self._dense_fallback = True
                         self.fallback_count += int((~converged).sum().item()) + int((gap > self.solver_gap_tolerance).sum().item())
             else:
+                if self.solver_backend == "triton_fast_retry":
+                    raise ValueError(
+                        "triton_fast_retry requires common uniform query weights across KV heads"
+                    )
                 for kv_head in range(self.local_kv_heads):
                     q = query_pool[kv_head]
                     key = chunks[:, :, kv_head, :].float()
@@ -1137,9 +1308,9 @@ class QueryRobustAttention(AbstractAttention):
                             quantized_predicted = affine_score + bias[start:stop, kv_head].unsqueeze(-1)
                             quantized_error = (chunk_f - quantized_predicted).abs().max()
                             self.quantized_error_max = max(self.quantized_error_max, float(quantized_error.item()))
-                            self.solver_gap_max = max(self.solver_gap_max, float(gap.max().item()))
-                            self.solver_active_max = max(self.solver_active_max, int(active_size.max().item()))
-                            self.solver_nonconverged += int((~converged).sum().item())
+                        self.solver_gap_max = max(self.solver_gap_max, float(gap.max().item()))
+                        self.solver_active_max = max(self.solver_active_max, int(active_size.max().item()))
+                        self.solver_nonconverged += int((~converged).sum().item())
                         if self.solver_fail_closed and bool((~converged).any() or (gap > self.solver_gap_tolerance).any()):
                             self._dense_fallback = True
                             self.fallback_count += int((~converged).sum().item()) + int((gap > self.solver_gap_tolerance).sum().item())

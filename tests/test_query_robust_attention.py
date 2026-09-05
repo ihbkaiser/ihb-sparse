@@ -187,6 +187,174 @@ def test_unguarded_solver_step_requires_fixed_support_exploratory_routing():
     ).solver_armijo
 
 
+def test_triton_fast_retry_rejects_a_disabled_armijo_guard():
+    import pytest
+
+    with pytest.raises(ValueError, match="requires solver_armijo=True"):
+        _attention(
+            solver_backend="triton_fast_retry",
+            solver_fail_closed=False,
+            solver_armijo=False,
+            initial_support=64,
+            max_support=64,
+        )
+
+
+def test_triton_global_armijo_backend_is_explicitly_supported():
+    attention = _attention(
+        solver_backend="triton_global_armijo",
+        solver_fail_closed=False,
+    )
+    assert attention.solver_backend == "triton_global_armijo"
+
+
+def test_batched_newton_backend_is_explicitly_supported():
+    attention = _attention(
+        solver_backend="batched_newton",
+        solver_fail_closed=False,
+    )
+    assert attention.solver_backend == "batched_newton"
+
+
+def test_batched_newton_serving_path_uses_newton_solver(monkeypatch):
+    attention = _attention(
+        solver_backend="batched_newton",
+        solver_fail_closed=False,
+    )
+    attention.robust_pool_available = True
+    attention.request_queries[0] = torch.tensor(
+        [[[0.5, -0.25], [0.25, 0.5], [-0.5, 0.25], [0.0, 0.5]]]
+    )
+    attention.request_query_weights[0] = torch.full((1, 4), 0.25)
+    attention._common_query_weights[0] = True
+    calls = []
+
+    def fake_newton(scores, partitions, **kwargs):
+        calls.append((scores.shape, partitions.shape, kwargs))
+        chunks = scores.shape[0]
+        p = torch.full((chunks, scores.shape[-1]), 1.0 / scores.shape[-1])
+        zeros = torch.zeros(chunks)
+        return p, zeros, zeros, zeros, torch.ones(chunks, dtype=torch.bool), torch.ones(chunks, dtype=torch.int32)
+
+    monkeypatch.setattr(
+        "sparse_frontier.modelling.attention.query_robust.batched_full_support_newton_fit",
+        fake_newton,
+    )
+    monkeypatch.setattr(
+        "sparse_frontier.modelling.attention.query_robust.batched_independent_active_fit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("active-set used")),
+    )
+
+    summary, bias = attention._summarize(
+        torch.tensor([[[[1.0, 3.0]], [[5.0, 7.0]]]]), layer_idx=0
+    )
+
+    assert calls == [
+        ((1, 4, 2), (1, 4), {
+            "tolerance": 1e-3,
+            "max_iterations": 8,
+            "armijo_backtracks": 10,
+        })
+    ]
+    torch.testing.assert_close(summary.float(), torch.tensor([[[3.0, 5.0]]]))
+    assert torch.isfinite(bias).all()
+
+
+def test_triton_fast_retry_serving_path_never_uses_active_set_or_dense_fallback(
+    monkeypatch,
+):
+    """The main-run backend consumes only the fast+retry solver result."""
+
+    attention = _attention(
+        solver_backend="triton_fast_retry",
+        solver_fail_closed=False,
+    )
+    attention.robust_pool_available = True
+    attention.request_queries[0] = torch.tensor(
+        [[[0.5, -0.25], [0.25, 0.5], [-0.5, 0.25], [0.0, 0.5]]]
+    )
+    attention.request_query_weights[0] = torch.full((1, 4), 0.25)
+    attention._common_query_weights[0] = True
+    calls = []
+
+    def fake_fast_retry(scores, partitions, **kwargs):
+        calls.append((scores.shape, partitions.shape, kwargs))
+        chunks, _, tokens = scores.shape
+        p = torch.full((chunks, tokens), 1.0 / tokens)
+        zeros = torch.zeros(chunks)
+        return p, zeros, zeros, zeros, torch.ones(chunks, dtype=torch.bool), 3
+
+    monkeypatch.setattr(
+        "sparse_frontier.modelling.attention.query_robust.triton_full_support_minimax_retry_fit",
+        fake_fast_retry,
+    )
+    monkeypatch.setattr(
+        "sparse_frontier.modelling.attention.query_robust.batched_independent_active_fit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("active-set used")),
+    )
+
+    summary, bias = attention._summarize(
+        torch.tensor([[[[1.0, 3.0]], [[5.0, 7.0]]]]), layer_idx=0
+    )
+
+    assert calls == [
+        ((1, 4, 2), (1, 4), {
+            "tolerance": 1e-3,
+            "fast_iterations": 1024,
+            "retry_iterations": 8192,
+            "armijo_backtracks": 12,
+        })
+    ]
+    torch.testing.assert_close(summary.float(), torch.tensor([[[3.0, 5.0]]]))
+    assert torch.isfinite(bias).all()
+    assert attention.solver_retry_count == 3
+
+
+def test_triton_global_armijo_serving_path_uses_global_solver(monkeypatch):
+    attention = _attention(
+        solver_backend="triton_global_armijo",
+        solver_fail_closed=False,
+    )
+    attention.robust_pool_available = True
+    attention.request_queries[0] = torch.tensor(
+        [[[0.5, -0.25], [0.25, 0.5], [-0.5, 0.25], [0.0, 0.5]]]
+    )
+    attention.request_query_weights[0] = torch.full((1, 4), 0.25)
+    attention._common_query_weights[0] = True
+    calls = []
+
+    def fake_global(scores, partitions, **kwargs):
+        calls.append((scores.shape, partitions.shape, kwargs))
+        chunks = scores.shape[0]
+        p = torch.full((chunks, scores.shape[-1]), 1.0 / scores.shape[-1])
+        zeros = torch.zeros(chunks)
+        return p, zeros, zeros, zeros, torch.ones(chunks, dtype=torch.bool)
+
+    monkeypatch.setattr(
+        "sparse_frontier.modelling.attention.query_robust.triton_global_armijo_full_support_fit",
+        fake_global,
+    )
+    monkeypatch.setattr(
+        "sparse_frontier.modelling.attention.query_robust.batched_independent_active_fit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("active-set used")),
+    )
+
+    summary, bias = attention._summarize(
+        torch.tensor([[[[1.0, 3.0]], [[5.0, 7.0]]]]), layer_idx=0
+    )
+
+    assert calls == [
+        ((1, 4, 2), (1, 4), {
+            "tolerance": 1e-3,
+            "max_iterations": 8192,
+            "armijo_backtracks": 12,
+        })
+    ]
+    torch.testing.assert_close(summary.float(), torch.tensor([[[3.0, 5.0]]]))
+    assert torch.isfinite(bias).all()
+    assert attention.fallback_count == 0
+
+
 def test_prefill_builds_only_full_chunks_and_reset_hides_old_state(monkeypatch):
     attention = _attention()
     attention.preallocate_memory(torch.zeros(1, 1, 2, dtype=torch.bfloat16))

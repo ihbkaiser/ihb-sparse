@@ -15,6 +15,643 @@ from typing import Iterable, Sequence
 import torch
 from torch import Tensor
 
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - exercised only in CPU-only installs.
+    triton = None
+    tl = None
+
+
+if triton is not None:
+
+    @triton.jit
+    def _triton_full_support_minimax_kernel(
+        scores_ptr,
+        partitions_ptr,
+        p_ptr,
+        lower_ptr,
+        upper_ptr,
+        gap_ptr,
+        converged_ptr,
+        num_queries: tl.constexpr,
+        num_tokens: tl.constexpr,
+        max_iterations: tl.constexpr,
+        armijo_backtracks: tl.constexpr,
+        tolerance: tl.constexpr,
+        BLOCK_QUERIES: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+    ):
+        """One full-support minimax solve per program.
+
+        This is deliberately a pilot kernel: it fuses the fixed-full-support
+        dual iterations, Armijo trials, and final full-pool certificate.  The
+        production active-set schedule remains the reference implementation.
+        """
+
+        chunk = tl.program_id(0)
+        query_ids = tl.arange(0, BLOCK_QUERIES)
+        token_ids = tl.arange(0, BLOCK_TOKENS)
+        query_mask = query_ids < num_queries
+        token_mask = token_ids < num_tokens
+        score_offsets = (
+            chunk * num_queries * num_tokens
+            + query_ids[:, None] * num_tokens
+            + token_ids[None, :]
+        )
+        scores = tl.load(
+            scores_ptr + score_offsets,
+            mask=query_mask[:, None] & token_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        partitions = tl.load(
+            partitions_ptr + chunk * num_queries + query_ids,
+            mask=query_mask,
+            other=0.0,
+        ).to(tl.float32)
+        uniform = 1.0 / num_queries
+        lam = tl.where(query_mask, uniform, 0.0)
+        best_lam = lam
+        best_value = -float("inf")
+
+        for _ in range(max_iterations):
+            z = tl.sum(scores * lam[:, None], axis=0)
+            z_max = tl.max(tl.where(token_mask, z, -float("inf")), axis=0)
+            exp_z = tl.exp(z - z_max)
+            exp_z = tl.where(token_mask, exp_z, 0.0)
+            log_partition = z_max + tl.log(tl.sum(exp_z, axis=0))
+            p = exp_z / tl.sum(exp_z, axis=0)
+            gradient = partitions - tl.sum(scores * p[None, :], axis=1)
+            value = tl.sum(lam * partitions, axis=0) - log_partition
+
+            step = 1.0
+            accepted = 0
+            accepted_lam = lam
+            accepted_value = value
+            last_candidate = lam
+            last_candidate_value = value
+            for _ in range(armijo_backtracks):
+                log_lam = tl.log(tl.maximum(lam, 1e-30)) + step * gradient
+                log_lam = tl.where(query_mask, log_lam, -float("inf"))
+                candidate = tl.exp(log_lam - tl.max(log_lam, axis=0))
+                candidate = candidate / tl.sum(candidate, axis=0)
+                candidate = tl.where(query_mask, candidate, 0.0)
+                candidate_z = tl.sum(scores * candidate[:, None], axis=0)
+                candidate_z_max = tl.max(
+                    tl.where(token_mask, candidate_z, -float("inf")), axis=0
+                )
+                candidate_exp_z = tl.exp(candidate_z - candidate_z_max)
+                candidate_exp_z = tl.where(token_mask, candidate_exp_z, 0.0)
+                candidate_log_partition = candidate_z_max + tl.log(
+                    tl.sum(candidate_exp_z, axis=0)
+                )
+                candidate_value = (
+                    tl.sum(candidate * partitions, axis=0) - candidate_log_partition
+                )
+                last_candidate = candidate
+                last_candidate_value = candidate_value
+                sufficient = candidate_value >= value + 1e-4 * tl.sum(
+                    gradient * (candidate - lam), axis=0
+                )
+                take = (accepted == 0) & sufficient
+                accepted_lam = tl.where(take, candidate, accepted_lam)
+                accepted_value = tl.where(take, candidate_value, accepted_value)
+                accepted = accepted | sufficient.to(tl.int32)
+                step = tl.where(accepted != 0, step, step * 0.5)
+
+            # The reference retains the last trial if Armijo never accepts.
+            lam = tl.where(accepted != 0, accepted_lam, last_candidate)
+            value = tl.where(accepted != 0, accepted_value, last_candidate_value)
+            improved = value > best_value
+            best_lam = tl.where(improved, lam, best_lam)
+            best_value = tl.where(improved, value, best_value)
+
+        z = tl.sum(scores * best_lam[:, None], axis=0)
+        z_max = tl.max(tl.where(token_mask, z, -float("inf")), axis=0)
+        exp_z = tl.exp(z - z_max)
+        exp_z = tl.where(token_mask, exp_z, 0.0)
+        p = exp_z / tl.sum(exp_z, axis=0)
+        entropy = -tl.sum(p * tl.log(tl.maximum(p, 1e-30)), axis=0)
+        primal = partitions - tl.sum(scores * p[None, :], axis=1) - entropy
+        upper = tl.max(tl.where(query_mask, primal, -float("inf")), axis=0)
+        gap = upper - best_value
+        tl.store(p_ptr + chunk * num_tokens + token_ids, p, mask=token_mask)
+        tl.store(lower_ptr + chunk, best_value)
+        tl.store(upper_ptr + chunk, upper)
+        tl.store(gap_ptr + chunk, gap)
+        tl.store(converged_ptr + chunk, gap <= tolerance)
+
+
+    @triton.jit
+    def _triton_dual_state_kernel(
+        scores_ptr,
+        partitions_ptr,
+        lam_ptr,
+        p_ptr,
+        value_ptr,
+        gradient_ptr,
+        num_queries: tl.constexpr,
+        num_tokens: tl.constexpr,
+        BLOCK_QUERIES: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+    ):
+        chunk = tl.program_id(0)
+        query_ids = tl.arange(0, BLOCK_QUERIES)
+        token_ids = tl.arange(0, BLOCK_TOKENS)
+        query_mask = query_ids < num_queries
+        token_mask = token_ids < num_tokens
+        score_offsets = (
+            chunk * num_queries * num_tokens
+            + query_ids[:, None] * num_tokens
+            + token_ids[None, :]
+        )
+        scores = tl.load(
+            scores_ptr + score_offsets,
+            mask=query_mask[:, None] & token_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        partitions = tl.load(
+            partitions_ptr + chunk * num_queries + query_ids,
+            mask=query_mask,
+            other=0.0,
+        ).to(tl.float32)
+        lam = tl.load(
+            lam_ptr + chunk * num_queries + query_ids,
+            mask=query_mask,
+            other=0.0,
+        ).to(tl.float32)
+        z = tl.sum(scores * lam[:, None], axis=0)
+        z_max = tl.max(tl.where(token_mask, z, -float("inf")), axis=0)
+        exp_z = tl.exp(z - z_max)
+        exp_z = tl.where(token_mask, exp_z, 0.0)
+        normalizer = tl.sum(exp_z, axis=0)
+        p = exp_z / normalizer
+        value = tl.sum(lam * partitions, axis=0) - z_max - tl.log(normalizer)
+        gradient = partitions - tl.sum(scores * p[None, :], axis=1)
+        tl.store(p_ptr + chunk * num_tokens + token_ids, p, mask=token_mask)
+        tl.store(value_ptr + chunk, value)
+        tl.store(
+            gradient_ptr + chunk * num_queries + query_ids,
+            gradient,
+            mask=query_mask,
+        )
+
+
+    @triton.jit
+    def _triton_global_armijo_candidate_kernel(
+        scores_ptr,
+        partitions_ptr,
+        lam_ptr,
+        value_ptr,
+        gradient_ptr,
+        step_ptr,
+        candidate_lam_ptr,
+        candidate_p_ptr,
+        candidate_value_ptr,
+        candidate_gradient_ptr,
+        sufficient_ptr,
+        num_queries: tl.constexpr,
+        num_tokens: tl.constexpr,
+        BLOCK_QUERIES: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+    ):
+        chunk = tl.program_id(0)
+        query_ids = tl.arange(0, BLOCK_QUERIES)
+        token_ids = tl.arange(0, BLOCK_TOKENS)
+        query_mask = query_ids < num_queries
+        token_mask = token_ids < num_tokens
+        score_offsets = (
+            chunk * num_queries * num_tokens
+            + query_ids[:, None] * num_tokens
+            + token_ids[None, :]
+        )
+        scores = tl.load(
+            scores_ptr + score_offsets,
+            mask=query_mask[:, None] & token_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        partitions = tl.load(
+            partitions_ptr + chunk * num_queries + query_ids,
+            mask=query_mask,
+            other=0.0,
+        ).to(tl.float32)
+        lam = tl.load(
+            lam_ptr + chunk * num_queries + query_ids,
+            mask=query_mask,
+            other=0.0,
+        ).to(tl.float32)
+        value = tl.load(value_ptr + chunk).to(tl.float32)
+        gradient = tl.load(
+            gradient_ptr + chunk * num_queries + query_ids,
+            mask=query_mask,
+            other=0.0,
+        ).to(tl.float32)
+        step = tl.load(step_ptr).to(tl.float32)
+        candidate_log_lam = tl.log(tl.maximum(lam, 1e-30)) + step * gradient
+        candidate_log_lam = tl.where(query_mask, candidate_log_lam, -float("inf"))
+        candidate = tl.exp(
+            candidate_log_lam - tl.max(candidate_log_lam, axis=0)
+        )
+        candidate = candidate / tl.sum(candidate, axis=0)
+        candidate = tl.where(query_mask, candidate, 0.0)
+        z = tl.sum(scores * candidate[:, None], axis=0)
+        z_max = tl.max(tl.where(token_mask, z, -float("inf")), axis=0)
+        exp_z = tl.exp(z - z_max)
+        exp_z = tl.where(token_mask, exp_z, 0.0)
+        normalizer = tl.sum(exp_z, axis=0)
+        candidate_p = exp_z / normalizer
+        candidate_value = (
+            tl.sum(candidate * partitions, axis=0) - z_max - tl.log(normalizer)
+        )
+        candidate_gradient = partitions - tl.sum(scores * candidate_p[None, :], axis=1)
+        sufficient = candidate_value >= value + 1e-4 * tl.sum(
+            gradient * (candidate - lam), axis=0
+        )
+        tl.store(
+            candidate_lam_ptr + chunk * num_queries + query_ids,
+            candidate,
+            mask=query_mask,
+        )
+        tl.store(
+            candidate_p_ptr + chunk * num_tokens + token_ids,
+            candidate_p,
+            mask=token_mask,
+        )
+        tl.store(candidate_value_ptr + chunk, candidate_value)
+        tl.store(
+            candidate_gradient_ptr + chunk * num_queries + query_ids,
+            candidate_gradient,
+            mask=query_mask,
+        )
+        tl.store(sufficient_ptr + chunk, sufficient)
+
+
+    @triton.jit
+    def _triton_global_armijo_control_kernel(
+        trial_all_ptr, accepted_ptr, step_ptr, take_ptr
+    ):
+        accepted = tl.load(accepted_ptr).to(tl.int32)
+        trial_all = tl.load(trial_all_ptr).to(tl.int32)
+        take = (accepted == 0) & (trial_all != 0)
+        tl.store(take_ptr, take)
+        tl.store(accepted_ptr, accepted | take)
+        tl.store(step_ptr, tl.where((accepted != 0) | take, tl.load(step_ptr), tl.load(step_ptr) * 0.5))
+
+
+    @triton.jit
+    def _triton_select_state_kernel(
+        take_ptr,
+        lam_ptr,
+        p_ptr,
+        value_ptr,
+        gradient_ptr,
+        candidate_lam_ptr,
+        candidate_p_ptr,
+        candidate_value_ptr,
+        candidate_gradient_ptr,
+        num_queries: tl.constexpr,
+        num_tokens: tl.constexpr,
+        BLOCK_QUERIES: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+    ):
+        chunk = tl.program_id(0)
+        take = tl.load(take_ptr) != 0
+        query_ids = tl.arange(0, BLOCK_QUERIES)
+        token_ids = tl.arange(0, BLOCK_TOKENS)
+        query_mask = query_ids < num_queries
+        token_mask = token_ids < num_tokens
+        query_offset = chunk * num_queries + query_ids
+        token_offset = chunk * num_tokens + token_ids
+        lam = tl.load(lam_ptr + query_offset, mask=query_mask, other=0.0)
+        candidate_lam = tl.load(candidate_lam_ptr + query_offset, mask=query_mask, other=0.0)
+        gradient = tl.load(gradient_ptr + query_offset, mask=query_mask, other=0.0)
+        candidate_gradient = tl.load(candidate_gradient_ptr + query_offset, mask=query_mask, other=0.0)
+        p = tl.load(p_ptr + token_offset, mask=token_mask, other=0.0)
+        candidate_p = tl.load(candidate_p_ptr + token_offset, mask=token_mask, other=0.0)
+        value = tl.load(value_ptr + chunk)
+        candidate_value = tl.load(candidate_value_ptr + chunk)
+        tl.store(lam_ptr + query_offset, tl.where(take, candidate_lam, lam), mask=query_mask)
+        tl.store(gradient_ptr + query_offset, tl.where(take, candidate_gradient, gradient), mask=query_mask)
+        tl.store(p_ptr + token_offset, tl.where(take, candidate_p, p), mask=token_mask)
+        tl.store(value_ptr + chunk, tl.where(take, candidate_value, value))
+
+
+    @triton.jit
+    def _triton_update_best_kernel(
+        lam_ptr,
+        p_ptr,
+        value_ptr,
+        best_lam_ptr,
+        best_p_ptr,
+        best_value_ptr,
+        num_queries: tl.constexpr,
+        num_tokens: tl.constexpr,
+        BLOCK_QUERIES: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+    ):
+        chunk = tl.program_id(0)
+        query_ids = tl.arange(0, BLOCK_QUERIES)
+        token_ids = tl.arange(0, BLOCK_TOKENS)
+        query_mask = query_ids < num_queries
+        token_mask = token_ids < num_tokens
+        query_offset = chunk * num_queries + query_ids
+        token_offset = chunk * num_tokens + token_ids
+        value = tl.load(value_ptr + chunk)
+        best_value = tl.load(best_value_ptr + chunk)
+        improved = value > best_value
+        lam = tl.load(lam_ptr + query_offset, mask=query_mask, other=0.0)
+        best_lam = tl.load(best_lam_ptr + query_offset, mask=query_mask, other=0.0)
+        p = tl.load(p_ptr + token_offset, mask=token_mask, other=0.0)
+        best_p = tl.load(best_p_ptr + token_offset, mask=token_mask, other=0.0)
+        tl.store(best_lam_ptr + query_offset, tl.where(improved, lam, best_lam), mask=query_mask)
+        tl.store(best_p_ptr + token_offset, tl.where(improved, p, best_p), mask=token_mask)
+        tl.store(best_value_ptr + chunk, tl.where(improved, value, best_value))
+
+
+    @triton.jit
+    def _triton_certificate_kernel(
+        scores_ptr,
+        partitions_ptr,
+        p_ptr,
+        lower_ptr,
+        upper_ptr,
+        gap_ptr,
+        converged_ptr,
+        tolerance: tl.constexpr,
+        num_queries: tl.constexpr,
+        num_tokens: tl.constexpr,
+        BLOCK_QUERIES: tl.constexpr,
+        BLOCK_TOKENS: tl.constexpr,
+    ):
+        chunk = tl.program_id(0)
+        query_ids = tl.arange(0, BLOCK_QUERIES)
+        token_ids = tl.arange(0, BLOCK_TOKENS)
+        query_mask = query_ids < num_queries
+        token_mask = token_ids < num_tokens
+        score_offsets = (
+            chunk * num_queries * num_tokens
+            + query_ids[:, None] * num_tokens
+            + token_ids[None, :]
+        )
+        scores = tl.load(scores_ptr + score_offsets, mask=query_mask[:, None] & token_mask[None, :], other=0.0)
+        partitions = tl.load(partitions_ptr + chunk * num_queries + query_ids, mask=query_mask, other=0.0)
+        p = tl.load(p_ptr + chunk * num_tokens + token_ids, mask=token_mask, other=0.0)
+        entropy = -tl.sum(p * tl.log(tl.maximum(p, 1e-30)), axis=0)
+        upper = tl.max(tl.where(query_mask, partitions - tl.sum(scores * p[None, :], axis=1) - entropy, -float("inf")), axis=0)
+        lower = tl.load(lower_ptr + chunk)
+        gap = upper - lower
+        tl.store(upper_ptr + chunk, upper)
+        tl.store(gap_ptr + chunk, gap)
+        tl.store(converged_ptr + chunk, gap <= tolerance)
+
+
+def triton_full_support_minimax_fit(
+    scores: Tensor,
+    partitions: Tensor,
+    *,
+    tolerance: float,
+    max_iterations: int,
+    armijo_backtracks: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Pilot fused full-support minimax fit with a final exact certificate.
+
+    ``scores`` is ``[chunks, empirical_queries, chunk_tokens]``.  It is not
+    wired into serving yet: callers must compare it against
+    :func:`batched_independent_active_fit` before using it in a benchmark.
+    """
+
+    if triton is None:
+        raise RuntimeError("Triton is required for the fused Query-Robust pilot")
+    if not scores.is_cuda or not partitions.is_cuda:
+        raise ValueError("Triton fused pilot requires CUDA scores and partitions")
+    if scores.ndim != 3 or partitions.shape != scores.shape[:2]:
+        raise ValueError("expected scores [chunks, queries, tokens] and matching partitions")
+    if scores.dtype != torch.float32 or partitions.dtype != torch.float32:
+        raise ValueError("Triton fused pilot currently requires float32 inputs")
+    chunks, queries, tokens = scores.shape
+    if not (1 <= queries <= 256 and 1 <= tokens <= 32):
+        raise ValueError("pilot supports at most 256 empirical queries and 32 chunk tokens")
+    if max_iterations < 1 or armijo_backtracks < 1 or tolerance <= 0:
+        raise ValueError("invalid fused solver configuration")
+
+    scores = scores.contiguous()
+    partitions = partitions.contiguous()
+    p = torch.empty((chunks, tokens), device=scores.device, dtype=torch.float32)
+    lower = torch.empty(chunks, device=scores.device, dtype=torch.float32)
+    upper = torch.empty_like(lower)
+    gap = torch.empty_like(lower)
+    converged = torch.empty(chunks, device=scores.device, dtype=torch.bool)
+    _triton_full_support_minimax_kernel[(chunks,)](
+        scores,
+        partitions,
+        p,
+        lower,
+        upper,
+        gap,
+        converged,
+        num_queries=queries,
+        num_tokens=tokens,
+        max_iterations=max_iterations,
+        armijo_backtracks=armijo_backtracks,
+        tolerance=float(tolerance),
+        BLOCK_QUERIES=triton.next_power_of_2(queries),
+        BLOCK_TOKENS=triton.next_power_of_2(tokens),
+        num_warps=4,
+    )
+    return p, lower, upper, gap, converged
+
+
+@torch.no_grad()
+def triton_full_support_minimax_retry_fit(
+    scores: Tensor,
+    partitions: Tensor,
+    *,
+    tolerance: float,
+    fast_iterations: int,
+    retry_iterations: int,
+    armijo_backtracks: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int]:
+    """Fail-closed fast/full-support solve followed by a hard-chunk retry.
+
+    The retry starts from the deterministic original state, not an approximate
+    tangent.  Thus an uncertified fast result can never leak into a serving
+    decision; it is either replaced by the longer solve or remains explicitly
+    uncertified for the caller's existing fallback policy.
+    """
+
+    if fast_iterations < 1 or retry_iterations < fast_iterations:
+        raise ValueError("retry_iterations must be at least fast_iterations")
+    p, lower, upper, gap, converged = triton_full_support_minimax_fit(
+        scores,
+        partitions,
+        tolerance=tolerance,
+        max_iterations=fast_iterations,
+        armijo_backtracks=armijo_backtracks,
+    )
+    hard_indices = torch.nonzero(~converged, as_tuple=False).flatten()
+    retry_count = int(hard_indices.numel())
+    if retry_count == 0:
+        return p, lower, upper, gap, converged, retry_count
+    retry = triton_full_support_minimax_fit(
+        scores.index_select(0, hard_indices),
+        partitions.index_select(0, hard_indices),
+        tolerance=tolerance,
+        max_iterations=retry_iterations,
+        armijo_backtracks=armijo_backtracks,
+    )
+    p.index_copy_(0, hard_indices, retry[0])
+    lower.index_copy_(0, hard_indices, retry[1])
+    upper.index_copy_(0, hard_indices, retry[2])
+    gap.index_copy_(0, hard_indices, retry[3])
+    converged.index_copy_(0, hard_indices, retry[4])
+    return p, lower, upper, gap, converged, retry_count
+
+
+@torch.no_grad()
+def triton_global_armijo_full_support_fit(
+    scores: Tensor,
+    partitions: Tensor,
+    *,
+    tolerance: float,
+    max_iterations: int,
+    armijo_backtracks: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Pilot a GPU-resident reproduction of batched global-Armijo semantics.
+
+    This intentionally keeps the reference solver's batch-wide Armijo
+    decision.  It removes host synchronizations but is limited to fixed full
+    support; active-set growth is outside this pilot's contract.  It is an
+    experimental diagnostic backend: a single hard chunk can reduce the
+    shared step for the whole batch, so it is not the latency-oriented
+    serving default.
+    """
+
+    if triton is None:
+        raise RuntimeError("Triton is required for the global-Armijo pilot")
+    if not scores.is_cuda or not partitions.is_cuda:
+        raise ValueError("Triton global-Armijo pilot requires CUDA inputs")
+    if scores.ndim != 3 or partitions.shape != scores.shape[:2]:
+        raise ValueError("expected scores [chunks, queries, tokens] and matching partitions")
+    if scores.dtype != torch.float32 or partitions.dtype != torch.float32:
+        raise ValueError("Triton global-Armijo pilot currently requires float32 inputs")
+    chunks, queries, tokens = scores.shape
+    if not (1 <= queries <= 256 and 1 <= tokens <= 32):
+        raise ValueError("pilot supports at most 256 empirical queries and 32 chunk tokens")
+    if max_iterations < 1 or armijo_backtracks < 1 or tolerance <= 0:
+        raise ValueError("invalid fused solver configuration")
+
+    scores = scores.contiguous()
+    partitions = partitions.contiguous()
+    block_queries = triton.next_power_of_2(queries)
+    block_tokens = triton.next_power_of_2(tokens)
+    kernel_meta = {
+        "num_queries": queries,
+        "num_tokens": tokens,
+        "BLOCK_QUERIES": block_queries,
+        "BLOCK_TOKENS": block_tokens,
+        "num_warps": 4,
+    }
+    lam = torch.full((chunks, queries), 1.0 / queries, device=scores.device, dtype=torch.float32)
+    p = torch.empty((chunks, tokens), device=scores.device, dtype=torch.float32)
+    value = torch.empty(chunks, device=scores.device, dtype=torch.float32)
+    gradient = torch.empty_like(lam)
+    _triton_dual_state_kernel[(chunks,)](
+        scores, partitions, lam, p, value, gradient, **kernel_meta
+    )
+    best_lam, best_p, best_value = lam.clone(), p.clone(), value.clone()
+    candidate_lam = torch.empty_like(lam)
+    candidate_p = torch.empty_like(p)
+    candidate_value = torch.empty_like(value)
+    candidate_gradient = torch.empty_like(gradient)
+    sufficient = torch.empty(chunks, device=scores.device, dtype=torch.bool)
+    step = torch.empty(1, device=scores.device, dtype=torch.float32)
+    accepted = torch.empty(1, device=scores.device, dtype=torch.uint8)
+    take = torch.empty(1, device=scores.device, dtype=torch.uint8)
+
+    for _ in range(max_iterations):
+        step.fill_(1.0)
+        accepted.zero_()
+        for _ in range(armijo_backtracks):
+            _triton_global_armijo_candidate_kernel[(chunks,)](
+                scores,
+                partitions,
+                lam,
+                value,
+                gradient,
+                step,
+                candidate_lam,
+                candidate_p,
+                candidate_value,
+                candidate_gradient,
+                sufficient,
+                **kernel_meta,
+            )
+            trial_all = torch.all(sufficient).reshape(1).to(torch.uint8)
+            _triton_global_armijo_control_kernel[(1,)](
+                trial_all, accepted, step, take, num_warps=1
+            )
+            _triton_select_state_kernel[(chunks,)](
+                take,
+                lam,
+                p,
+                value,
+                gradient,
+                candidate_lam,
+                candidate_p,
+                candidate_value,
+                candidate_gradient,
+                **kernel_meta,
+            )
+
+        # The reference keeps the final reduced-step candidate if none of the
+        # Armijo trials accepts.  ``accepted`` stays GPU-resident here too.
+        _triton_global_armijo_candidate_kernel[(chunks,)](
+            scores,
+            partitions,
+            lam,
+            value,
+            gradient,
+            step,
+            candidate_lam,
+            candidate_p,
+            candidate_value,
+            candidate_gradient,
+            sufficient,
+            **kernel_meta,
+        )
+        take.copy_(accepted == 0)
+        _triton_select_state_kernel[(chunks,)](
+            take,
+            lam,
+            p,
+            value,
+            gradient,
+            candidate_lam,
+            candidate_p,
+            candidate_value,
+            candidate_gradient,
+            **kernel_meta,
+        )
+        _triton_update_best_kernel[(chunks,)](
+            lam, p, value, best_lam, best_p, best_value, **kernel_meta
+        )
+
+    upper = torch.empty_like(best_value)
+    gap = torch.empty_like(best_value)
+    converged = torch.empty(chunks, device=scores.device, dtype=torch.bool)
+    _triton_certificate_kernel[(chunks,)](
+        scores,
+        partitions,
+        best_p,
+        best_value,
+        upper,
+        gap,
+        converged,
+        tolerance=float(tolerance),
+        **kernel_meta,
+    )
+    return best_p, best_value, upper, gap, converged
+
 
 @dataclass(frozen=True)
 class FitResult:
@@ -435,6 +1072,460 @@ def _batched_dual_value(S: Tensor, f: Tensor, lam: Tensor) -> tuple[Tensor, Tens
     value = (lam * f).sum(-1) - torch.logsumexp(z, dim=-1)
     gradient = f - torch.einsum("can,cn->ca", S, p)
     return value, p, gradient
+
+
+def _mask_active_query_gaps(
+    all_gaps: Tensor, active_indices: Tensor, active_mask: Tensor
+) -> Tensor:
+    """Mask query ids in the active support, ignoring stale support slots."""
+
+    if all_gaps.ndim != 2 or active_indices.shape != active_mask.shape:
+        raise ValueError("active query gaps expect matching [rows, queries] tensors")
+    active_query = torch.zeros_like(all_gaps, dtype=torch.int64)
+    active_query.scatter_add_(1, active_indices, active_mask.to(torch.int64))
+    return all_gaps.masked_fill(active_query > 0, float("-inf"))
+
+
+@torch.no_grad()
+def batched_full_support_newton_fit(
+    S: Tensor,
+    f: Tensor,
+    *,
+    tolerance: float = 1e-3,
+    max_iterations: int = 32,
+    armijo_backtracks: int = 10,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Solve small full-support minimax problems with independent Newton steps.
+
+    Query-Robust's online Pile configuration normally has only a handful of
+    empirical queries per KV head.  For that regime, mirror ascent spends
+    hundreds or thousands of iterations moving along a badly conditioned
+    simplex.  The dual Hessian is a query covariance, so a constrained Newton
+    step solves the local KKT system directly.  All chunk rows keep their own
+    line-search state; there is no batch-wide synchronization or shared step.
+
+    This is intentionally limited to small pools.  Larger pools should use
+    the active-set reference path until a dedicated matrix-free Newton kernel
+    is available.  The final primal scan is always performed, so ``converged``
+    means the returned summary has an explicit minimax certificate.
+    """
+
+    if S.ndim != 3 or f.ndim != 2 or S.shape[:2] != f.shape:
+        raise ValueError("full-support Newton fit expects S [chunks,queries,tokens] and matching f")
+    if not torch.is_floating_point(S) or not torch.is_floating_point(f):
+        raise ValueError("full-support Newton fit requires floating-point inputs")
+    if not torch.isfinite(S).all() or not torch.isfinite(f).all():
+        raise ValueError("full-support Newton fit requires finite inputs")
+    if tolerance <= 0 or max_iterations < 1 or armijo_backtracks < 1:
+        raise ValueError("invalid full-support Newton configuration")
+    chunks, queries, tokens = S.shape
+    if not (1 <= queries <= 32 and 1 <= tokens):
+        raise ValueError("full-support Newton fit supports at most 32 empirical queries")
+
+    # B200's production score range is roughly [-27, 27].  The extra
+    # precision is used only for the tiny dual/KKT state; the input score
+    # matrix and returned summary remain FP32 at the serving boundary.
+    work_dtype = torch.float64
+    work_S = S.to(device=S.device, dtype=work_dtype).contiguous()
+    work_f = f.to(device=S.device, dtype=work_dtype).contiguous()
+    identity = torch.eye(queries, device=S.device, dtype=work_dtype)
+    ones = torch.ones(queries, device=S.device, dtype=work_dtype)
+    active_indices = torch.zeros(
+        chunks, queries, device=S.device, dtype=torch.long
+    )
+    active_indices[:, 0] = 0
+    active_mask = torch.zeros(
+        chunks, queries, device=S.device, dtype=torch.bool
+    )
+    active_mask[:, 0] = True
+    active_size = torch.ones(chunks, device=S.device, dtype=torch.long)
+    lam = active_mask.to(work_dtype)
+    iterations_used = torch.zeros(chunks, device=S.device, dtype=torch.int32)
+    best_p = torch.empty((chunks, tokens), device=S.device, dtype=work_dtype)
+    best_lower = torch.full(
+        (chunks,), -float("inf"), device=S.device, dtype=work_dtype
+    )
+    best_upper = torch.full(
+        (chunks,), float("inf"), device=S.device, dtype=work_dtype
+    )
+    best_gap = torch.full(
+        (chunks,), float("inf"), device=S.device, dtype=work_dtype
+    )
+
+    for _ in range(queries + 1):
+        gather_index = active_indices.unsqueeze(-1).expand(-1, -1, tokens)
+        local_S = work_S.gather(1, gather_index)
+        local_f = work_f.gather(1, active_indices)
+        mask = active_mask.to(work_dtype)
+
+        def stats(current_lam: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            z = torch.bmm(local_S.transpose(1, 2), current_lam.unsqueeze(-1)).squeeze(-1)
+            current_p = torch.softmax(z, dim=-1)
+            current_value = (current_lam * local_f).sum(-1) - torch.logsumexp(z, dim=-1)
+            current_gradient = local_f - torch.bmm(
+                local_S, current_p.unsqueeze(-1)
+            ).squeeze(-1)
+            mean = torch.bmm(local_S, current_p.unsqueeze(-1)).squeeze(-1)
+            centered = local_S - mean.unsqueeze(-1)
+            covariance = torch.einsum(
+                "ct,cit,cjt->cij", current_p, centered, centered
+            )
+            return current_value, current_p, current_gradient, -covariance
+
+        def certificate(current_p: Tensor, current_value: Tensor) -> tuple[Tensor, Tensor]:
+            entropy = -(
+                current_p
+                * current_p.clamp_min(torch.finfo(work_dtype).tiny).log()
+            ).sum(-1)
+            all_gaps = work_f - torch.bmm(
+                work_S, current_p.unsqueeze(-1)
+            ).squeeze(-1) - entropy.unsqueeze(-1)
+            upper = all_gaps.amax(-1)
+            return upper, upper - current_value
+
+        value, p, gradient, hessian = stats(lam)
+        for iteration in range(1, max_iterations + 1):
+            scale = hessian.abs().amax(dim=(-2, -1)).clamp_min(1.0)
+            active_hessian = hessian * mask.unsqueeze(-1) * mask.unsqueeze(-2)
+            active_hessian = active_hessian - (
+                1e-5 * scale
+            ).view(-1, 1, 1) * torch.diag_embed(mask)
+            inactive_diagonal = torch.diag_embed(1.0 - mask)
+            system = torch.zeros(
+                chunks, queries + 1, queries + 1,
+                device=S.device,
+                dtype=work_dtype,
+            )
+            system[:, :queries, :queries] = active_hessian - inactive_diagonal
+            system[:, :queries, queries] = mask
+            system[:, queries, :queries] = mask
+            rhs = torch.cat(
+                [
+                    -(gradient * mask),
+                    torch.zeros(chunks, 1, device=S.device, dtype=work_dtype),
+                ],
+                dim=-1,
+            )
+            solution = torch.linalg.solve(system, rhs.unsqueeze(-1)).squeeze(-1)
+            direction = solution[:, :queries] * mask
+            directional = (gradient * direction).sum(-1)
+            fallback_direction = (gradient - gradient.mean(-1, keepdim=True)) * mask
+            use_fallback = (~torch.isfinite(direction).all(-1)) | (directional <= 0)
+            direction = torch.where(
+                use_fallback.unsqueeze(-1), fallback_direction, direction
+            )
+            directional = (gradient * direction).sum(-1)
+
+            negative = direction < 0
+            ratios = torch.where(
+                negative,
+                -lam / direction.clamp_max(-torch.finfo(work_dtype).tiny),
+                torch.full_like(direction, float("inf")),
+            )
+            feasible_step = ratios.amin(-1).clamp_min(0.0)
+            step = torch.minimum(
+                torch.ones_like(feasible_step), feasible_step * 0.99
+            ).clamp_min(1e-6)
+            accepted = torch.zeros(chunks, device=S.device, dtype=torch.bool)
+            accepted_lam = lam
+            accepted_value = value
+            for _ in range(armijo_backtracks):
+                candidate_lam = lam + step.unsqueeze(-1) * direction
+                candidate_lam = candidate_lam.clamp_min(0.0) * mask
+                candidate_lam = candidate_lam / candidate_lam.sum(
+                    -1, keepdim=True
+                ).clamp_min(1e-30)
+                candidate_value, _, _, _ = stats(candidate_lam)
+                sufficient = candidate_value >= value + 1e-4 * step * directional
+                take = ~accepted & sufficient
+                accepted_lam = torch.where(
+                    take.unsqueeze(-1), candidate_lam, accepted_lam
+                )
+                accepted_value = torch.where(take, candidate_value, accepted_value)
+                accepted |= sufficient
+                step = torch.where(accepted, step, step * 0.5)
+
+            lam = torch.where(accepted.unsqueeze(-1), accepted_lam, lam)
+            value, p, gradient, hessian = stats(lam)
+            iterations_used += 1
+            tau = (lam * gradient).sum(-1, keepdim=True)
+            positive = (lam > 1e-6) & active_mask
+            positive_residual = (gradient - tau).abs().masked_fill(
+                ~positive, 0.0
+            ).amax(-1)
+            boundary_residual = (gradient - tau).clamp_min(0.0).masked_fill(
+                ~active_mask, 0.0
+            ).amax(-1)
+            residual = torch.maximum(positive_residual, boundary_residual)
+            if bool((residual <= min(1e-5, tolerance / 10)).all()):
+                break
+
+        upper, gap = certificate(p, value)
+        improved = gap < best_gap
+        best_p = torch.where(improved.unsqueeze(-1), p, best_p)
+        best_lower = torch.where(improved, value, best_lower)
+        best_upper = torch.where(improved, upper, best_upper)
+        best_gap = torch.where(improved, gap, best_gap)
+        done = gap <= tolerance
+        if bool(done.all()) or bool((active_size >= queries).all()):
+            break
+
+        # A Newton step approaches a boundary from the interior.  Keeping a
+        # nearly-zero coordinate active would cap every subsequent step by
+        # that tiny mass.  Drop only numerically boundary coordinates; the
+        # full-pool scan below can re-admit one if it is still a violator, then
+        # compact the per-row support so the next violator has a free slot.
+        removable = active_mask & (lam <= max(1e-6, float(tolerance) / 10.0))
+        removable &= active_size.unsqueeze(-1) > 1
+        removed_any = bool(removable.any())
+        if removed_any:
+            kept = active_mask & ~removable
+            order = torch.argsort(kept.to(torch.int64), dim=-1, descending=True)
+            active_indices = torch.gather(active_indices, 1, order)
+            lam = torch.gather(lam, 1, order)
+            active_size = active_size - removable.sum(-1).to(torch.long)
+            active_mask = (
+                torch.arange(queries, device=S.device).unsqueeze(0)
+                < active_size.unsqueeze(-1)
+            )
+            lam = lam * active_mask.to(work_dtype)
+            # Re-solve the reduced support before scanning for a new
+            # violator.  The current certificate used the pre-removal
+            # tangent and would otherwise immediately re-add the coordinate
+            # that was just removed.
+            continue
+        unfinished = ~done & (active_size < queries)
+        if not bool(unfinished.any()):
+            break
+        all_gaps = work_f - torch.bmm(
+            work_S, p.unsqueeze(-1)
+        ).squeeze(-1) - (
+            -(
+                p * p.clamp_min(torch.finfo(work_dtype).tiny).log()
+            ).sum(-1)
+        ).unsqueeze(-1)
+        # ``active_indices`` stores query ids in support slots; masking the
+        # slot positions themselves would allow the same violator to be
+        # inserted repeatedly and prevent the support from growing.  Ignore
+        # inactive slots too: after a boundary removal, their old query ids
+        # are stale and must not hide a valid violator.
+        masked_gaps = _mask_active_query_gaps(
+            all_gaps, active_indices, active_mask
+        )
+        candidates = masked_gaps.argmax(-1)
+        rows = torch.nonzero(unfinished, as_tuple=False).flatten()
+        slots = active_size[rows]
+        active_indices[rows, slots] = candidates[rows]
+        active_mask[rows, slots] = True
+        active_size[rows] += 1
+        lam = torch.where(
+            active_mask,
+            torch.where(
+                active_mask & (lam > 0), lam, torch.zeros_like(lam)
+            ),
+            torch.zeros_like(lam),
+        )
+
+    converged = best_gap <= tolerance
+    # The regular active Newton pass is cheap for interior solutions, but a
+    # few high-dynamic-range rows can still land on a support boundary.  For
+    # the serving pool (Q=4), solve only those rows by finite support
+    # enumeration; this keeps the common path fast and makes the returned
+    # certificate fail closed instead of exposing a stalled iterate.
+    if queries <= 4 and bool((~converged).any()):
+        hard_indices = torch.nonzero(~converged, as_tuple=False).flatten()
+        hard = batched_exhaustive_newton_fit(
+            S.index_select(0, hard_indices),
+            f.index_select(0, hard_indices),
+            tolerance=tolerance,
+            max_iterations=min(max_iterations, 16),
+            armijo_backtracks=armijo_backtracks,
+        )
+        best_p.index_copy_(0, hard_indices, hard[0].to(best_p.dtype))
+        best_lower.index_copy_(0, hard_indices, hard[1].to(best_lower.dtype))
+        best_upper.index_copy_(0, hard_indices, hard[2].to(best_upper.dtype))
+        best_gap.index_copy_(0, hard_indices, hard[3].to(best_gap.dtype))
+        iterations_used.index_add_(0, hard_indices, hard[5].to(iterations_used.dtype))
+        converged = best_gap <= tolerance
+    return (
+        best_p.to(torch.float32),
+        best_lower.to(torch.float32),
+        best_upper.to(torch.float32),
+        best_gap.to(torch.float32),
+        converged,
+        iterations_used,
+    )
+
+
+@torch.no_grad()
+def batched_exhaustive_newton_fit(
+    S: Tensor,
+    f: Tensor,
+    *,
+    tolerance: float = 1e-3,
+    max_iterations: int = 16,
+    armijo_backtracks: int = 8,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Solve minimax duals by enumerating supports for very small query pools.
+
+    For ``Q <= 4`` there are at most 15 nonempty supports.  Solving each
+    support as an interior Newton problem makes boundary optima explicit
+    instead of forcing an interior iterate to asymptotically reach zero.  The
+    largest dual value is selected and certified against the complete pool.
+    This is a bounded, deterministic hard-case path for the low-query serving
+    configuration; larger pools deliberately remain on the reference route.
+    """
+
+    if S.ndim != 3 or f.ndim != 2 or S.shape[:2] != f.shape:
+        raise ValueError("exhaustive Newton fit expects S [chunks,queries,tokens] and matching f")
+    if not torch.is_floating_point(S) or not torch.is_floating_point(f):
+        raise ValueError("exhaustive Newton fit requires floating-point inputs")
+    if not torch.isfinite(S).all() or not torch.isfinite(f).all():
+        raise ValueError("exhaustive Newton fit requires finite inputs")
+    if tolerance <= 0 or max_iterations < 1 or armijo_backtracks < 1:
+        raise ValueError("invalid exhaustive Newton configuration")
+    chunks, queries, tokens = S.shape
+    if not (1 <= queries <= 4 and 1 <= tokens):
+        raise ValueError("exhaustive Newton fit supports at most 4 empirical queries")
+
+    work_dtype = torch.float64
+    work_S = S.to(device=S.device, dtype=work_dtype).contiguous()
+    work_f = f.to(device=S.device, dtype=work_dtype).contiguous()
+    best_p = torch.empty((chunks, tokens), device=S.device, dtype=work_dtype)
+    best_lower = torch.full(
+        (chunks,), -float("inf"), device=S.device, dtype=work_dtype
+    )
+    best_upper = torch.full(
+        (chunks,), float("inf"), device=S.device, dtype=work_dtype
+    )
+    best_gap = torch.full(
+        (chunks,), float("inf"), device=S.device, dtype=work_dtype
+    )
+    iterations_used = torch.zeros(chunks, device=S.device, dtype=torch.int32)
+
+    for support_code in range(1, 1 << queries):
+        indices = torch.tensor(
+            [index for index in range(queries) if support_code & (1 << index)],
+            device=S.device,
+            dtype=torch.long,
+        )
+        local_S = work_S.index_select(1, indices)
+        local_f = work_f.index_select(1, indices)
+        support_size = indices.numel()
+        lam = torch.full(
+            (chunks, support_size),
+            1.0 / support_size,
+            device=S.device,
+            dtype=work_dtype,
+        )
+        identity = torch.eye(support_size, device=S.device, dtype=work_dtype)
+        ones = torch.ones(support_size, device=S.device, dtype=work_dtype)
+
+        def stats(current_lam: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            z = torch.bmm(
+                local_S.transpose(1, 2), current_lam.unsqueeze(-1)
+            ).squeeze(-1)
+            current_p = torch.softmax(z, dim=-1)
+            current_value = (current_lam * local_f).sum(-1) - torch.logsumexp(
+                z, dim=-1
+            )
+            current_gradient = local_f - torch.bmm(
+                local_S, current_p.unsqueeze(-1)
+            ).squeeze(-1)
+            mean = torch.bmm(local_S, current_p.unsqueeze(-1)).squeeze(-1)
+            centered = local_S - mean.unsqueeze(-1)
+            covariance = torch.einsum(
+                "ct,cit,cjt->cij", current_p, centered, centered
+            )
+            return current_value, current_p, current_gradient, -covariance
+
+        value, p, gradient, hessian = stats(lam)
+        for iteration in range(1, max_iterations + 1):
+            if support_size == 1:
+                break
+            scale = hessian.abs().amax(dim=(-2, -1)).clamp_min(1.0)
+            system = hessian - (
+                1e-5 * scale
+            ).view(-1, 1, 1) * identity
+            kkt = torch.zeros(
+                chunks,
+                support_size + 1,
+                support_size + 1,
+                device=S.device,
+                dtype=work_dtype,
+            )
+            kkt[:, :support_size, :support_size] = system
+            kkt[:, :support_size, support_size] = ones
+            kkt[:, support_size, :support_size] = ones
+            rhs = torch.cat(
+                [
+                    -gradient,
+                    torch.zeros(chunks, 1, device=S.device, dtype=work_dtype),
+                ],
+                dim=-1,
+            )
+            direction = torch.linalg.solve(kkt, rhs.unsqueeze(-1)).squeeze(-1)[
+                :, :support_size
+            ]
+            directional = (gradient * direction).sum(-1)
+            fallback = gradient - gradient.mean(-1, keepdim=True)
+            use_fallback = (~torch.isfinite(direction).all(-1)) | (directional <= 0)
+            direction = torch.where(use_fallback.unsqueeze(-1), fallback, direction)
+            directional = (gradient * direction).sum(-1)
+            ratios = torch.where(
+                direction < 0,
+                -lam / direction.clamp_max(-torch.finfo(work_dtype).tiny),
+                torch.full_like(direction, float("inf")),
+            )
+            step = torch.minimum(
+                torch.ones(chunks, device=S.device, dtype=work_dtype),
+                ratios.amin(-1) * 0.99,
+            ).clamp_min(1e-8)
+            accepted = torch.zeros(chunks, device=S.device, dtype=torch.bool)
+            accepted_lam = lam
+            accepted_value = value
+            for _ in range(armijo_backtracks):
+                candidate = lam + step.unsqueeze(-1) * direction
+                candidate = candidate.clamp_min(0.0)
+                candidate = candidate / candidate.sum(-1, keepdim=True).clamp_min(1e-30)
+                candidate_value, _, _, _ = stats(candidate)
+                sufficient = candidate_value >= value + 1e-4 * step * directional
+                take = ~accepted & sufficient
+                accepted_lam = torch.where(take.unsqueeze(-1), candidate, accepted_lam)
+                accepted_value = torch.where(take, candidate_value, accepted_value)
+                accepted |= sufficient
+                step = torch.where(accepted, step, step * 0.5)
+            lam = torch.where(accepted.unsqueeze(-1), accepted_lam, lam)
+            value, p, gradient, hessian = stats(lam)
+            iterations_used += 1
+            tau = (lam * gradient).sum(-1, keepdim=True)
+            residual = (gradient - tau).abs().amax(-1)
+            if bool((residual <= min(1e-7, tolerance / 10)).all()):
+                break
+
+        entropy = -(
+            p * p.clamp_min(torch.finfo(work_dtype).tiny).log()
+        ).sum(-1)
+        all_gaps = work_f - torch.bmm(
+            work_S, p.unsqueeze(-1)
+        ).squeeze(-1) - entropy.unsqueeze(-1)
+        upper = all_gaps.amax(-1)
+        gap = upper - value
+        improved = value > best_lower
+        best_p = torch.where(improved.unsqueeze(-1), p, best_p)
+        best_lower = torch.where(improved, value, best_lower)
+        best_upper = torch.where(improved, upper, best_upper)
+        best_gap = torch.where(improved, gap, best_gap)
+
+    converged = best_gap <= tolerance
+    return (
+        best_p.to(torch.float32),
+        best_lower.to(torch.float32),
+        best_upper.to(torch.float32),
+        best_gap.to(torch.float32),
+        converged,
+        iterations_used,
+    )
 
 
 def batched_active_robust_fit(

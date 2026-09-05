@@ -136,6 +136,23 @@ def test_prompt_tokens_preserve_kvpress_context_question_token_boundary():
     assert prompt == [1, 2, 3]
 
 
+def test_prompt_tokens_preserve_a_preformatted_ruler_generator_input():
+    from sparse_frontier.ruler_kvpress import build_prompt_token_ids
+
+    prompt = build_prompt_token_ids(
+        _ChatTokenizer(),
+        {
+            "prompt": "<already-rendered-ruler-input>",
+            "prompt_is_preformatted": True,
+            "context": "",
+            "question": "",
+            "answer_prefix": "",
+        },
+    )
+
+    assert prompt == [ord(char) for char in "<already-rendered-ruler-input>"]
+
+
 def test_scorer_matches_kvpress_all_reference_and_qa_any_reference_rules():
     from sparse_frontier.ruler_kvpress import calculate_ruler_metrics
 

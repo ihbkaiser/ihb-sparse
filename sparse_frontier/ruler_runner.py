@@ -24,6 +24,13 @@ from sparse_frontier.ruler_kvpress import (
     calculate_ruler_metrics,
     load_ruler_rows,
 )
+from sparse_frontier.ruler_protocol import (
+    Table1Protocol,
+    load_table1_protocol,
+    validate_pile_only_query_pool,
+    validate_table1_model_contract,
+    validate_table1_tokenizer_contract,
+)
 
 
 # 96, 128, and 256 remain safely above Query-Robust's mandatory
@@ -32,6 +39,7 @@ from sparse_frontier.ruler_kvpress import (
 # selectable budget matches a 512-token total-access comparison.
 SPARSE_BUDGETS = (96, 128, 256, 512, 1024, 2048)
 _CAPTURE_TASKS = RULER_TASKS
+TABLE1_TOKEN_BUDGET = 2048
 
 
 @dataclass(frozen=True)
@@ -42,6 +50,79 @@ class RunSpec:
     @property
     def name(self) -> str:
         return self.method if self.budget is None else f"{self.method}_b{self.budget}"
+
+
+@dataclass(frozen=True)
+class PreparedTable1ProtocolRun:
+    """Resolved settings that cannot vary between methods in a protocol run."""
+
+    contract: Table1Protocol
+    run_specs: tuple[RunSpec, ...]
+    max_input_tokens: int
+    max_output_tokens: int
+    seed: int
+    tp: int
+    query_pool_path: Path | None
+
+
+def _apply_table1_hardware_policy(contract: Table1Protocol) -> None:
+    """Apply the recorded policy before vLLM creates a worker or CUDA cache."""
+    policy = contract.hardware_policy
+    os.environ["SF_MAX_NUM_BATCHED_TOKENS"] = str(policy["max_num_batched_tokens"])
+    os.environ["SF_GPU_MEMORY_UTILIZATION"] = str(policy["gpu_memory_utilization"])
+    os.environ["SF_CPU_OFFLOAD_GB"] = str(policy["cpu_offload_gb"])
+
+
+def prepare_table1_protocol_run(
+    manifest_path: str | Path,
+    *,
+    query_pool_path: str | Path | None = None,
+    method: str | None = None,
+    budget: int | None = None,
+    context_length: int | None = None,
+    max_input_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+    seed: int | None = None,
+    tp: int | None = None,
+) -> PreparedTable1ProtocolRun:
+    """Resolve and enforce one immutable Table-1-compatible run contract."""
+    contract = load_table1_protocol(manifest_path)
+    if context_length is not None and int(context_length) != contract.context_length:
+        raise ValueError("--context_length conflicts with the locked protocol manifest")
+    if max_input_tokens is not None and int(max_input_tokens) != int(contract.runtime["max_input_tokens"]):
+        raise ValueError("--max_input_tokens conflicts with the locked protocol manifest")
+    if max_output_tokens is not None and int(max_output_tokens) != int(contract.runtime["max_output_tokens"]):
+        raise ValueError("--max_output_tokens conflicts with the locked protocol manifest")
+    if seed is not None and int(seed) != contract.seed:
+        raise ValueError("--seed conflicts with the locked protocol manifest")
+    policy_tp = int(contract.hardware_policy["tensor_parallel_size"])
+    if tp is not None and int(tp) != policy_tp:
+        raise ValueError("--tp conflicts with the locked protocol hardware policy")
+
+    matrix = build_table1_run_matrix()
+    if method is None:
+        specs = tuple(matrix)
+    else:
+        selected = [spec for spec in matrix if spec.method == method]
+        if len(selected) != 1 or selected[0].budget != budget:
+            raise ValueError("--method/--budget conflicts with the locked Table-1 native recipe")
+        specs = tuple(selected)
+
+    resolved_pool: Path | None = None
+    if any(spec.method == "query_robust" for spec in specs):
+        if query_pool_path is None:
+            raise ValueError("Table-1 Query-Robust run requires --query_pool_path")
+        resolved_pool = validate_pile_only_query_pool(query_pool_path)
+    _apply_table1_hardware_policy(contract)
+    return PreparedTable1ProtocolRun(
+        contract=contract,
+        run_specs=specs,
+        max_input_tokens=int(contract.runtime["max_input_tokens"]),
+        max_output_tokens=int(contract.runtime["max_output_tokens"]),
+        seed=contract.seed,
+        tp=policy_tp,
+        query_pool_path=resolved_pool,
+    )
 
 
 def validate_budget(method: str, budget: int | None) -> None:
@@ -64,6 +145,16 @@ def build_run_matrix(smoke: bool = False) -> list[RunSpec]:
         RunSpec("dense", None),
         *(RunSpec("quest", budget) for budget in SPARSE_BUDGETS),
         *(RunSpec("shadowkv", budget) for budget in SPARSE_BUDGETS),
+    ]
+
+
+def build_table1_run_matrix() -> list[RunSpec]:
+    """The single native-recipe matrix used by the locked 128K protocol."""
+    return [
+        RunSpec("dense", None),
+        RunSpec("quest", TABLE1_TOKEN_BUDGET),
+        RunSpec("shadowkv", TABLE1_TOKEN_BUDGET),
+        RunSpec("query_robust", TABLE1_TOKEN_BUDGET),
     ]
 
 
@@ -126,7 +217,11 @@ def _load_model_config(
             "max_input_tokens": int(max_input_tokens),
             "max_output_tokens": int(max_output_tokens),
             "kv_cache_block_size": 256,
-            "model_id": _model_id_from_snapshot(model_path),
+            # A user may place a pinned Hugging Face snapshot in any local
+            # directory.  The checkpoint's declared source identity, when
+            # available, is stable enough for a protocol manifest whereas the
+            # directory name is not.
+            "model_id": str(config.get("_name_or_path") or _model_id_from_snapshot(model_path)),
             "model_revision": Path(model_path).resolve().name,
             "rope_type": str(
                 (config.get("rope_scaling") or {}).get(
@@ -260,7 +355,11 @@ def _prepare_raw_capture_manifest(
         git_commit = "unknown"
     manifest = QueryPoolManifest(
         schema_version=SCHEMA_VERSION,
-        model_id=_model_id_from_snapshot(model_root),
+        # Keep the raw-capture identity identical to the identity used by the
+        # online Query-Robust validator.  A local Modal/volume path is not a
+        # model identity and otherwise makes a freshly finalized pool unusable
+        # by the same checkpoint.
+        model_id=str(model_cfg["model_id"]),
         model_revision=model_root.name,
         num_layers=model_cfg["num_layers"],
         num_q_heads=model_cfg["num_q_heads"],
@@ -287,7 +386,7 @@ def _configure_attention(
     shadowkv_svd_backend: str = "randomized",
     shadowkv_svd_oversample: int = 32,
     shadowkv_svd_niter: int = 2,
-    shadowkv_fused_retrieval: bool = True,
+    shadowkv_fused_retrieval: bool = False,
     capture_query_dir: str | Path | None = None,
     capture_context_path: str | Path | None = None,
     capture_layers: tuple[int, ...] | None = None,
@@ -303,10 +402,10 @@ def _configure_attention(
     query_robust_cvar_alpha: float = 0.95,
     query_robust_initial_support: int = 64,
     query_robust_max_support: int = 1024,
-    query_robust_solver_gap_tolerance: float = 1e-3,
-    query_robust_solver_max_iterations: int = 64,
+    query_robust_solver_gap_tolerance: float = 5e-4,
+    query_robust_solver_max_iterations: int = 8,
     query_robust_solver_violators_per_round: int = 4,
-    query_robust_solver_chunk_batch_size: int = 16,
+    query_robust_solver_chunk_batch_size: int = 1024,
     query_robust_empirical_query_budget: int | None = None,
     query_robust_bias_mode: str = "raw_entropy",
     query_robust_share_chunks_across_kv_heads: bool = True,
@@ -314,7 +413,47 @@ def _configure_attention(
     query_robust_solver_fail_closed: bool = True,
     query_robust_async_prefill_build: bool = False,
     query_robust_solver_armijo: bool = True,
+    query_robust_solver_backend: str = "batched_newton",
+    query_robust_triton_fast_iterations: int = 1024,
+    query_robust_triton_retry_iterations: int = 8192,
+    query_robust_triton_armijo_backtracks: int = 12,
+    table1_recipe: bool = False,
 ) -> None:
+    if table1_recipe:
+        expected_budget = None if spec.method == "dense" else TABLE1_TOKEN_BUDGET
+        if spec.method not in {"dense", "quest", "shadowkv", "query_robust"} or spec.budget != expected_budget:
+            raise ValueError(
+                "Table-1 recipe only permits dense plus 2048-token Quest, ShadowKV, and Query-Robust runs"
+            )
+        if query_robust_prompt_query_root is not None:
+            raise ValueError(
+                "Table-1 recipe forbids request-derived Query-Robust prompt support; use the frozen Pile pool"
+            )
+        if (
+            query_robust_generation_horizon is not None
+            and int(query_robust_generation_horizon) != int(model_cfg["max_output_tokens"])
+        ):
+            raise ValueError(
+                "Table-1 Query-Robust generation_horizon must equal the locked generation cap"
+            )
+        if spec.method == "query_robust" and query_robust_solver_backend != "triton_fast_retry":
+            raise ValueError(
+                "Table-1 Query-Robust main run is locked to triton_fast_retry"
+            )
+        if spec.method == "query_robust" and query_robust_solver_fail_closed:
+            raise ValueError(
+                "Table-1 Query-Robust main run has no dense/FP64 fallback; "
+                "set query_robust_solver_fail_closed=False"
+            )
+        # The paper-compatible accuracy path is the deterministic full SVD,
+        # never the repository's randomized speed-ablation default.
+        shadowkv_svd_backend = "exact"
+        # At 128K the optional fused landmark kernel exceeds its CUDA
+        # shared-memory launch limit and immediately falls back.  Select the
+        # verified PyTorch retrieval path directly; this changes no scores,
+        # top-k ordering, or ShadowKV recipe hyperparameter.
+        if spec.method == "shadowkv":
+            shadowkv_fused_retrieval = False
     os.environ["VLLM_USE_V1"] = "1"
     # This is request-local state. Clear it before configuring any method so a
     # prior Query-Robust run cannot leak its prompt-support source into a later
@@ -384,7 +523,15 @@ def _configure_attention(
         return
 
     if spec.method == "quest":
-        attention_args = {"token_budget": spec.budget, "page_size": 16, "share_pages": True}
+        attention_args = {
+            "token_budget": spec.budget,
+            "page_size": 16,
+            "share_pages": True,
+            # The upstream Quest evaluation keeps its two earliest layers
+            # dense during decode.  This is part of the native recipe, not a
+            # global dense-prefill shortcut.
+            "dense_layers": 2 if table1_recipe else 0,
+        }
     elif spec.method == "shadowkv":
         attention_args = {
             "sparse_budget": spec.budget,
@@ -422,6 +569,10 @@ def _configure_attention(
             "solver_fail_closed": bool(query_robust_solver_fail_closed),
             "async_prefill_build": bool(query_robust_async_prefill_build),
             "solver_armijo": bool(query_robust_solver_armijo),
+            "solver_backend": str(query_robust_solver_backend),
+            "triton_fast_iterations": int(query_robust_triton_fast_iterations),
+            "triton_retry_iterations": int(query_robust_triton_retry_iterations),
+            "triton_armijo_backtracks": int(query_robust_triton_armijo_backtracks),
             "prompt_query_root": (
                 str(Path(query_robust_prompt_query_root).resolve())
                 if query_robust_prompt_query_root is not None
@@ -571,7 +722,7 @@ def run_spec(
     shadowkv_svd_backend: str = "randomized",
     shadowkv_svd_oversample: int = 32,
     shadowkv_svd_niter: int = 2,
-    shadowkv_fused_retrieval: bool = True,
+    shadowkv_fused_retrieval: bool = False,
     capture_query_dir: str | Path | None = None,
     capture_context_path: str | Path | None = None,
     capture_layers: tuple[int, ...] | None = None,
@@ -588,10 +739,10 @@ def run_spec(
     query_robust_cvar_alpha: float = 0.95,
     query_robust_initial_support: int = 64,
     query_robust_max_support: int = 1024,
-    query_robust_solver_gap_tolerance: float = 1e-3,
-    query_robust_solver_max_iterations: int = 64,
+    query_robust_solver_gap_tolerance: float = 5e-4,
+    query_robust_solver_max_iterations: int = 8,
     query_robust_solver_violators_per_round: int = 4,
-    query_robust_solver_chunk_batch_size: int = 16,
+    query_robust_solver_chunk_batch_size: int = 1024,
     query_robust_empirical_query_budget: int | None = None,
     query_robust_bias_mode: str = "raw_entropy",
     query_robust_share_chunks_across_kv_heads: bool = True,
@@ -599,9 +750,33 @@ def run_spec(
     query_robust_solver_fail_closed: bool = True,
     query_robust_async_prefill_build: bool = False,
     query_robust_solver_armijo: bool = True,
+    query_robust_solver_backend: str = "batched_newton",
+    query_robust_triton_fast_iterations: int = 1024,
+    query_robust_triton_retry_iterations: int = 8192,
+    query_robust_triton_armijo_backtracks: int = 12,
+    table1_recipe: bool = False,
+    table1_protocol: Table1Protocol | None = None,
 ) -> dict[str, Any]:
     """Run one method/budget and write predictions plus aggregate artifacts."""
     validate_budget(spec.method, spec.budget)
+    if table1_protocol is not None:
+        if not table1_recipe:
+            raise ValueError("a Table-1 protocol manifest requires table1_recipe=True")
+        expected_specs = {(item.method, item.budget) for item in build_table1_run_matrix()}
+        if (spec.method, spec.budget) not in expected_specs:
+            raise ValueError("run spec is outside the locked Table-1 native recipe")
+        if int(max_input_tokens) != int(table1_protocol.runtime["max_input_tokens"]):
+            raise ValueError("run max_input_tokens differs from the locked protocol")
+        if int(max_output_tokens) != int(table1_protocol.runtime["max_output_tokens"]):
+            raise ValueError("run max_output_tokens differs from the locked protocol")
+        if int(seed) != table1_protocol.seed or int(tp) != int(table1_protocol.hardware_policy["tensor_parallel_size"]):
+            raise ValueError("run seed or TP differs from the locked protocol")
+        if spec.method == "query_robust":
+            if query_pool_path is None:
+                raise ValueError("locked Query-Robust run requires a Pile query pool")
+            query_pool_path = validate_pile_only_query_pool(query_pool_path)
+        if query_robust_prompt_query_root is not None:
+            raise ValueError("locked Table-1 protocol forbids request-derived query support")
     selected_rows = list(rows)
     if smoke:
         selected_rows = selected_rows[:1]
@@ -637,6 +812,8 @@ def run_spec(
         max_input_tokens=max_input_tokens,
         max_output_tokens=max_output_tokens,
     )
+    if table1_protocol is not None:
+        validate_table1_model_contract(table1_protocol, model_cfg)
     resolved_capture_context: Path | None = None
     if capture_query_dir is not None:
         if capture_max_tokens is None:
@@ -688,6 +865,11 @@ def run_spec(
         query_robust_solver_fail_closed=query_robust_solver_fail_closed,
         query_robust_async_prefill_build=query_robust_async_prefill_build,
         query_robust_solver_armijo=query_robust_solver_armijo,
+        query_robust_solver_backend=query_robust_solver_backend,
+        query_robust_triton_fast_iterations=query_robust_triton_fast_iterations,
+        query_robust_triton_retry_iterations=query_robust_triton_retry_iterations,
+        query_robust_triton_armijo_backtracks=query_robust_triton_armijo_backtracks,
+        table1_recipe=table1_recipe,
     )
     metrics_handle = _start_metrics_server(spec)
     model = None
@@ -706,6 +888,10 @@ def run_spec(
             seed=seed,
             enable_thinking=False,
         )
+        if table1_protocol is not None:
+            validate_table1_tokenizer_contract(
+                table1_protocol, model.tokenizer.tokenizer
+            )
         for sample in selected_rows:
             result = _generate_one(
                 model,
@@ -753,6 +939,7 @@ def run_spec(
                         "query_robust_solver_gap_max": stats.get("query_robust_solver_gap_max"),
                         "query_robust_solver_active_max": stats.get("query_robust_solver_active_max"),
                         "query_robust_solver_nonconverged": stats.get("query_robust_solver_nonconverged"),
+                        "query_robust_solver_retry_count": stats.get("query_robust_solver_retry_count"),
                         "query_robust_quantized_error_max": stats.get("query_robust_quantized_error_max"),
                     })
                     if spec.method == "shadowkv" and not result["failure"]:
@@ -873,6 +1060,23 @@ def run_spec(
         "num_examples": len(selected_rows),
         "dataset_path": str(data_path),
         "dataset": RULER_DATASET,
+        "protocol": (
+            {
+                "name": table1_protocol.manifest_path.name,
+                "manifest_path": str(table1_protocol.manifest_path),
+                "source": table1_protocol.source,
+                "rows_path": str(table1_protocol.rows_path),
+                "rows_sha256": table1_protocol.rows_sha256,
+                "context_length": table1_protocol.context_length,
+                "task_set": list(table1_protocol.task_set),
+                "tokenizer": table1_protocol.tokenizer,
+                "hardware_policy": table1_protocol.hardware_policy,
+                "prefill": table1_protocol.runtime["prefill"],
+                "greedy": table1_protocol.runtime["greedy"],
+            }
+            if table1_protocol is not None
+            else None
+        ),
         "run_dataset_path": str(run_data_path),
         "initialization_failure": init_failure,
         "generation_allowances": sorted(
@@ -897,6 +1101,17 @@ def run_spec(
             else None
         ),
         "query_robust_generation_horizon": query_robust_generation_horizon,
+        "query_robust_solver": {
+            "backend": query_robust_solver_backend,
+            "gap_tolerance": query_robust_solver_gap_tolerance,
+            "max_iterations": query_robust_solver_max_iterations,
+            "chunk_batch_size": query_robust_solver_chunk_batch_size,
+            "violators_per_round": query_robust_solver_violators_per_round,
+            "fast_iterations": query_robust_triton_fast_iterations,
+            "retry_iterations": query_robust_triton_retry_iterations,
+            "armijo_backtracks": query_robust_triton_armijo_backtracks,
+            "dense_fallback": query_robust_solver_fail_closed,
+        },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {
@@ -942,24 +1157,88 @@ def _write_matrix_aggregate(
         writer.writerows(task_rows)
 
 
-def run_cli(args: argparse.Namespace) -> int:
-    rows = load_ruler_rows(args.context_length)
-    data_path = f"{RULER_DATASET}/{args.context_length}"
-    max_input_tokens = (
-        int(args.max_input_tokens)
-        if args.max_input_tokens is not None
-        else int(args.context_length) + 512
+def _resolve_query_robust_cli_defaults(
+    *, table1_recipe: bool, backend: str | None, fail_closed: bool | None
+) -> tuple[str, bool]:
+    """Choose safe general defaults without changing the locked Table-1 pilot."""
+
+    if table1_recipe:
+        return (
+            "triton_fast_retry" if backend is None else str(backend),
+            False if fail_closed is None else bool(fail_closed),
+        )
+    return (
+        "batched_newton" if backend is None else str(backend),
+        True if fail_closed is None else bool(fail_closed),
     )
-    if args.tasks is not None:
-        rows = _select_tasks(rows, tuple(args.tasks))
-    if args.task_indices is not None:
-        rows = _select_task_indices(rows, tuple(args.task_indices))
+
+
+def run_cli(args: argparse.Namespace) -> int:
+    table1_protocol: Table1Protocol | None = None
+    table1_recipe = args.protocol == "ruler_128k_table1_recipe"
+    query_robust_solver_backend, query_robust_solver_fail_closed = (
+        _resolve_query_robust_cli_defaults(
+            table1_recipe=table1_recipe,
+            backend=args.query_robust_solver_backend,
+            fail_closed=args.query_robust_solver_fail_closed,
+        )
+    )
+    if args.protocol is not None and not table1_recipe:
+        raise ValueError(f"unsupported protocol {args.protocol!r}")
+    if table1_recipe:
+        if args.protocol_manifest is None:
+            raise ValueError("--protocol_manifest is required with --protocol ruler_128k_table1_recipe")
+        if args.smoke:
+            raise ValueError("the locked Table-1 protocol does not permit --smoke")
+        if args.tasks is not None or args.task_indices is not None:
+            raise ValueError("the locked Table-1 protocol does not permit task subsetting")
+        if args.capture_query_dir is not None or args.capture_prompt_queries:
+            raise ValueError("the locked Table-1 protocol does not permit RULER query capture")
+        if args.query_robust_prompt_query_root is not None:
+            raise ValueError("the locked Table-1 protocol forbids request-derived query support")
+        prepared = prepare_table1_protocol_run(
+            args.protocol_manifest,
+            query_pool_path=args.query_pool_path,
+            method=args.method,
+            budget=args.budget,
+            context_length=args.context_length,
+            max_input_tokens=args.max_input_tokens,
+            max_output_tokens=args.max_output_tokens,
+            seed=args.seed,
+            tp=args.tp,
+        )
+        table1_protocol = prepared.contract
+        rows = list(table1_protocol.rows)
+        data_path = str(table1_protocol.rows_path)
+        max_input_tokens = prepared.max_input_tokens
+        max_output_tokens = prepared.max_output_tokens
+        seed = prepared.seed
+        tp = prepared.tp
+        query_pool_path = prepared.query_pool_path
+        specs = list(prepared.run_specs)
+    else:
+        context_length = 4096 if args.context_length is None else int(args.context_length)
+        rows = load_ruler_rows(context_length)
+        data_path = f"{RULER_DATASET}/{context_length}"
+        max_input_tokens = (
+            int(args.max_input_tokens)
+            if args.max_input_tokens is not None
+            else context_length + 512
+        )
+        max_output_tokens = 1024 if args.max_output_tokens is None else int(args.max_output_tokens)
+        seed = 43 if args.seed is None else int(args.seed)
+        tp = 1 if args.tp is None else int(args.tp)
+        query_pool_path = Path(args.query_pool_path) if args.query_pool_path is not None else None
+        if args.tasks is not None:
+            rows = _select_tasks(rows, tuple(args.tasks))
+        if args.task_indices is not None:
+            rows = _select_task_indices(rows, tuple(args.task_indices))
+        specs = build_run_matrix(smoke=args.smoke)
+        if args.method is not None:
+            validate_budget(args.method, args.budget)
+            specs = [RunSpec(args.method, args.budget)]
     if args.capture_query_dir is not None and args.method != "dense":
         raise ValueError("query capture requires an explicit --method dense run")
-    specs = build_run_matrix(smoke=args.smoke)
-    if args.method is not None:
-        validate_budget(args.method, args.budget)
-        specs = [RunSpec(args.method, args.budget)]
 
     # vLLM initializes CUDA in the parent process and cannot safely be
     # re-created for the next method in the same interpreter.  Keep each
@@ -972,8 +1251,6 @@ def run_cli(args: argparse.Namespace) -> int:
                 sys.executable,
                 "-m",
                 "sparse_frontier.ruler_runner",
-                "--context_length",
-                str(args.context_length),
                 "--model_path",
                 str(args.model_path),
                 "--output_dir",
@@ -983,11 +1260,11 @@ def run_cli(args: argparse.Namespace) -> int:
                 "--max_input_tokens",
                 str(max_input_tokens),
                 "--max_output_tokens",
-                str(args.max_output_tokens),
+                str(max_output_tokens),
                 "--seed",
-                str(args.seed),
+                str(seed),
                 "--tp",
-                str(args.tp),
+                str(tp),
                 "--shadowkv_svd_backend",
                 args.shadowkv_svd_backend,
                 "--shadowkv_svd_oversample",
@@ -995,11 +1272,97 @@ def run_cli(args: argparse.Namespace) -> int:
                 "--shadowkv_svd_niter",
                 str(args.shadowkv_svd_niter),
             ]
+            if table1_recipe:
+                command.extend(
+                    [
+                        "--protocol",
+                        "ruler_128k_table1_recipe",
+                        "--protocol_manifest",
+                        str(args.protocol_manifest),
+                    ]
+                )
+            else:
+                command[command.index("--model_path"):command.index("--model_path")] = [
+                    "--context_length",
+                    str(context_length),
+                ]
             command.append(
                 "--shadowkv_fused_retrieval"
                 if args.shadowkv_fused_retrieval
                 else "--no-shadowkv_fused_retrieval"
             )
+            command.extend(
+                [
+                    "--query_robust_solver_gap_tolerance",
+                    str(args.query_robust_solver_gap_tolerance),
+                    "--query_robust_solver_max_iterations",
+                    str(args.query_robust_solver_max_iterations),
+                    "--query_robust_solver_violators_per_round",
+                    str(args.query_robust_solver_violators_per_round),
+                    "--query_robust_solver_chunk_batch_size",
+                    str(args.query_robust_solver_chunk_batch_size),
+                    "--query_robust_solver_backend",
+                    query_robust_solver_backend,
+                    "--query_robust_triton_fast_iterations",
+                    str(args.query_robust_triton_fast_iterations),
+                    "--query_robust_triton_retry_iterations",
+                    str(args.query_robust_triton_retry_iterations),
+                    "--query_robust_triton_armijo_backtracks",
+                    str(args.query_robust_triton_armijo_backtracks),
+                ]
+            )
+            command.append(
+                "--query_robust_solver_fail_closed"
+                if query_robust_solver_fail_closed
+                else "--no-query_robust_solver_fail_closed"
+            )
+            command.append(
+                "--query_robust_solver_armijo"
+                if args.query_robust_solver_armijo
+                else "--no-query_robust_solver_armijo"
+            )
+            command.append(
+                "--query_robust_async_prefill_build"
+                if args.query_robust_async_prefill_build
+                else "--no-query_robust_async_prefill_build"
+            )
+            command.append(
+                "--query_robust_share_chunks_across_kv_heads"
+                if args.query_robust_share_chunks_across_kv_heads
+                else "--no-query_robust_share_chunks_across_kv_heads"
+            )
+            command.extend(
+                [
+                    "--query_robust_objective",
+                    args.query_robust_objective,
+                    "--query_robust_cvar_alpha",
+                    str(args.query_robust_cvar_alpha),
+                    "--query_robust_initial_support",
+                    str(args.query_robust_initial_support),
+                    "--query_robust_max_support",
+                    str(args.query_robust_max_support),
+                    "--query_robust_bias_mode",
+                    args.query_robust_bias_mode,
+                    "--query_robust_shared_chunk_aggregation",
+                    args.query_robust_shared_chunk_aggregation,
+                    "--query_robust_recent_chunks",
+                    str(args.query_robust_recent_chunks),
+                ]
+            )
+            if args.query_robust_empirical_query_budget is not None:
+                command.extend(
+                    [
+                        "--query_robust_empirical_query_budget",
+                        str(args.query_robust_empirical_query_budget),
+                    ]
+                )
+            if args.query_robust_generation_horizon is not None:
+                command.extend(
+                    [
+                        "--query_robust_generation_horizon",
+                        str(args.query_robust_generation_horizon),
+                    ]
+                )
             if spec.budget is not None:
                 command.extend(["--budget", str(spec.budget)])
             if args.smoke:
@@ -1026,8 +1389,8 @@ def run_cli(args: argparse.Namespace) -> int:
                 command.append("--capture_prompt_queries")
             command.extend(["--prompt_query_samples", str(args.prompt_query_samples)])
             command.extend(["--prompt_query_seed", str(args.prompt_query_seed)])
-            if args.query_pool_path is not None:
-                command.extend(["--query_pool_path", str(args.query_pool_path)])
+            if query_pool_path is not None:
+                command.extend(["--query_pool_path", str(query_pool_path)])
             if args.query_robust_prompt_query_root is not None:
                 command.extend(
                     [
@@ -1049,9 +1412,9 @@ def run_cli(args: argparse.Namespace) -> int:
             output_dir=args.output_dir,
             model_path=args.model_path,
             max_input_tokens=max_input_tokens,
-            max_output_tokens=args.max_output_tokens,
-            seed=args.seed,
-            tp=args.tp,
+            max_output_tokens=max_output_tokens,
+            seed=seed,
+            tp=tp,
             smoke=args.smoke,
             shadowkv_svd_backend=args.shadowkv_svd_backend,
             shadowkv_svd_oversample=args.shadowkv_svd_oversample,
@@ -1067,7 +1430,7 @@ def run_cli(args: argparse.Namespace) -> int:
             capture_prompt_queries=args.capture_prompt_queries,
             prompt_query_samples=args.prompt_query_samples,
             prompt_query_seed=args.prompt_query_seed,
-            query_pool_path=args.query_pool_path,
+            query_pool_path=query_pool_path,
             query_robust_prompt_query_root=args.query_robust_prompt_query_root,
             query_robust_generation_horizon=args.query_robust_generation_horizon,
             query_robust_recent_chunks=args.query_robust_recent_chunks,
@@ -1083,9 +1446,15 @@ def run_cli(args: argparse.Namespace) -> int:
             query_robust_bias_mode=args.query_robust_bias_mode,
             query_robust_share_chunks_across_kv_heads=args.query_robust_share_chunks_across_kv_heads,
             query_robust_shared_chunk_aggregation=args.query_robust_shared_chunk_aggregation,
-            query_robust_solver_fail_closed=args.query_robust_solver_fail_closed,
+            query_robust_solver_fail_closed=query_robust_solver_fail_closed,
             query_robust_async_prefill_build=args.query_robust_async_prefill_build,
             query_robust_solver_armijo=args.query_robust_solver_armijo,
+            query_robust_solver_backend=query_robust_solver_backend,
+            query_robust_triton_fast_iterations=args.query_robust_triton_fast_iterations,
+            query_robust_triton_retry_iterations=args.query_robust_triton_retry_iterations,
+            query_robust_triton_armijo_backtracks=args.query_robust_triton_armijo_backtracks,
+            table1_recipe=table1_recipe,
+            table1_protocol=table1_protocol,
         )
         all_failures += int(run["failures"])
         print(json.dumps({"run": spec.name, **run}, sort_keys=True))
@@ -1099,9 +1468,18 @@ def main() -> None:
     parser.add_argument(
         "--context_length",
         type=int,
-        choices=(4096, 8192, 16384),
-        default=4096,
-        help="KVPress RULER dataset configuration to load from Hugging Face",
+        choices=(4096, 8192, 16384, 131072),
+        default=None,
+        help="KVPress context configuration, or 131072 only through the locked protocol manifest",
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=("ruler_128k_table1_recipe",),
+        help="immutable benchmark contract; currently the 128K Table-1-compatible recipe",
+    )
+    parser.add_argument(
+        "--protocol_manifest",
+        help="JSON manifest pinning RULER/KVPress source, rows SHA256, tokenizer/template, and hardware policy",
     )
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -1115,9 +1493,9 @@ def main() -> None:
         type=int,
         help="vLLM prompt capacity; defaults to context_length + 512",
     )
-    parser.add_argument("--max_output_tokens", type=int, default=1024)
-    parser.add_argument("--seed", type=int, default=43)
-    parser.add_argument("--tp", type=int, default=1)
+    parser.add_argument("--max_output_tokens", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--tp", type=int)
     parser.add_argument(
         "--task_indices",
         type=int,
@@ -1236,8 +1614,8 @@ def main() -> None:
     parser.add_argument(
         "--query_robust_solver_fail_closed",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="route only certified summaries; disable solely for exploratory router pilots",
+        default=None,
+        help="use dense fallback for uncertified summaries; defaults on for general runs and off for locked Table-1",
     )
     parser.add_argument(
         "--query_robust_async_prefill_build",
@@ -1252,6 +1630,15 @@ def main() -> None:
         help="apply Armijo backtracking; disable only for fixed-support exploratory one-step pilots",
     )
     parser.add_argument(
+        "--query_robust_solver_backend",
+        choices=("active_set", "batched_newton", "triton_fast_retry", "triton_global_armijo"),
+        default=None,
+        help="online Query-Robust solver; defaults to firm batched_newton for general low-query runs",
+    )
+    parser.add_argument("--query_robust_triton_fast_iterations", type=int, default=1024)
+    parser.add_argument("--query_robust_triton_retry_iterations", type=int, default=8192)
+    parser.add_argument("--query_robust_triton_armijo_backtracks", type=int, default=12)
+    parser.add_argument(
         "--shadowkv_svd_backend",
         choices=("exact", "gesvdj", "randomized"),
         default="randomized",
@@ -1262,8 +1649,8 @@ def main() -> None:
     parser.add_argument(
         "--shadowkv_fused_retrieval",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="use the optional fused landmark GEMM+softmax kernel",
+        default=False,
+        help="enable the optional fused landmark kernel (off by default; PyTorch is the verified long-context path)",
     )
     args = parser.parse_args()
     if not args.smoke and args.method is None:

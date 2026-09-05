@@ -9,3 +9,7 @@ __pycache__/
 build
 .DS_Store
 /trash/
+/profile_output/
+/remote_artifacts/
+/refine-logs/
+/.pytest_cache/

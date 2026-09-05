@@ -1,10 +1,15 @@
 import pytest
 import torch
 
+import sparse_frontier.modelling.attention.query_robust_solver as query_robust_solver
+
 from sparse_frontier.modelling.attention.query_robust_solver import (
     empirical_cvar,
     fit_p,
     batched_independent_active_fit,
+    batched_full_support_newton_fit,
+    batched_exhaustive_newton_fit,
+    _mask_active_query_gaps,
     primal_gap,
     project_capped_simplex,
 )
@@ -140,6 +145,78 @@ def test_batched_independent_can_admit_several_full_pool_violators_per_round():
     assert torch.allclose(p.sum(-1), torch.ones(2), atol=1e-5)
 
 
+def test_batched_full_support_newton_returns_a_certified_minimax_fit():
+    """The low-query serving solver must converge without a long mirror loop."""
+
+    generator = torch.Generator().manual_seed(31)
+    scores = (0.35 * torch.randn(6, 4, 16, generator=generator)).float()
+    partitions = torch.logsumexp(scores, dim=-1)
+
+    p, lower, upper, gap, converged, iterations = batched_full_support_newton_fit(
+        scores,
+        partitions,
+        tolerance=1e-4,
+        max_iterations=32,
+        armijo_backtracks=10,
+    )
+
+    assert bool(converged.all())
+    assert bool((gap <= 1e-4).all())
+    assert bool((lower <= upper + 1e-5).all())
+    assert torch.allclose(p.sum(-1), torch.ones(6), atol=1e-5)
+    assert torch.all(iterations <= 32 * scores.shape[1])
+
+
+def test_batched_full_support_newton_handles_b200_like_score_scale():
+    """The serving solver must remain certified for logits around +/-27."""
+
+    generator = torch.Generator().manual_seed(31)
+    scores = (2.0 * torch.randn(2, 4, 16, generator=generator)).float()
+    partitions = torch.logsumexp(scores, dim=-1)
+
+    result = batched_full_support_newton_fit(
+        scores,
+        partitions,
+        tolerance=1e-3,
+        max_iterations=32,
+        armijo_backtracks=10,
+    )
+
+    assert bool(result[4].all())
+    assert bool((result[3] <= 1e-3).all())
+
+
+def test_batched_exhaustive_newton_solves_boundary_supports():
+    """Enumerating the four-query supports must remove zero-weight stalls."""
+
+    generator = torch.Generator().manual_seed(31)
+    scores = (2.0 * torch.randn(2, 4, 16, generator=generator)).float()
+    partitions = torch.logsumexp(scores, dim=-1)
+
+    result = batched_exhaustive_newton_fit(
+        scores,
+        partitions,
+        tolerance=1e-3,
+        max_iterations=16,
+        armijo_backtracks=8,
+    )
+
+    assert bool(result[4].all())
+    assert bool((result[3] <= 1e-3).all())
+
+
+def test_active_query_gap_mask_ignores_stale_inactive_support_slots():
+    gaps = torch.tensor([[10.0, 20.0, 30.0, 40.0]])
+    # Query ids 2 and 1 are active.  The ids in inactive slots are stale and
+    # must not suppress candidates 0 or 3.
+    active_indices = torch.tensor([[2, 0, 1, 3]])
+    active_mask = torch.tensor([[True, False, True, False]])
+
+    masked = _mask_active_query_gaps(gaps, active_indices, active_mask)
+
+    assert masked.tolist() == [[10.0, float("-inf"), float("-inf"), 40.0]]
+
+
 def test_certificate_free_fixed_support_preserves_the_fitted_tangent():
     S, f = _problem(n=12, tokens=5)
     kwargs = dict(
@@ -182,3 +259,114 @@ def test_certificate_free_fixed_support_accepts_an_explicit_unguarded_step():
     assert torch.isfinite(result[0]).all()
     assert torch.allclose(result[0].sum(-1), torch.ones(1), atol=1e-5)
     assert torch.isnan(result[2]).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton pilot requires CUDA")
+def test_triton_full_support_minimax_matches_reference_certificate():
+    """The fused pilot must preserve the certified fixed-full-support solve."""
+
+    fused_fit = getattr(query_robust_solver, "triton_full_support_minimax_fit", None)
+    assert callable(fused_fit), "missing Triton full-support minimax pilot"
+
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    scores = torch.randn(4, 32, 16, device="cuda", generator=generator)
+    partitions = torch.logsumexp(scores, dim=-1)
+    reference = batched_independent_active_fit(
+        scores,
+        partitions,
+        objective="minimax",
+        initial_support=32,
+        max_support=32,
+        tolerance=1e-2,
+        max_iterations=64,
+        active_additions_per_round=4,
+        armijo=True,
+    )
+    p, lower, upper, gap, converged = fused_fit(
+        scores,
+        partitions,
+        tolerance=1e-2,
+        max_iterations=64,
+        armijo_backtracks=12,
+    )
+
+    assert bool(reference[5].all())
+    assert bool(converged.all())
+    assert torch.allclose(p, reference[0], rtol=2e-3, atol=2e-3)
+    assert torch.allclose(lower, reference[1], rtol=2e-3, atol=2e-3)
+    assert torch.allclose(upper, reference[2], rtol=2e-3, atol=2e-3)
+    assert torch.allclose(gap, reference[3], rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton pilot requires CUDA")
+def test_triton_global_armijo_matches_batched_reference_at_serving_shape():
+    """A device-resident global Armijo schedule preserves batched semantics."""
+
+    fused_fit = getattr(
+        query_robust_solver, "triton_global_armijo_full_support_fit", None
+    )
+    assert callable(fused_fit), "missing global-Armijo Triton pilot"
+
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    scores = torch.randn(128, 256, 16, device="cuda", generator=generator)
+    partitions = torch.logsumexp(scores, dim=-1)
+    reference = batched_independent_active_fit(
+        scores,
+        partitions,
+        objective="minimax",
+        initial_support=256,
+        max_support=256,
+        tolerance=1e-2,
+        max_iterations=64,
+        active_additions_per_round=4,
+        armijo=True,
+    )
+    p, lower, upper, gap, converged = fused_fit(
+        scores,
+        partitions,
+        tolerance=1e-2,
+        max_iterations=64,
+        armijo_backtracks=12,
+    )
+
+    assert torch.allclose(p, reference[0], rtol=1e-5, atol=1e-5)
+    assert torch.allclose(lower, reference[1], rtol=1e-5, atol=1e-5)
+    assert torch.allclose(upper, reference[2], rtol=1e-5, atol=1e-5)
+    assert torch.allclose(gap, reference[3], rtol=1e-5, atol=1e-5)
+    assert torch.equal(converged, reference[5])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton pilot requires CUDA")
+def test_triton_full_support_retry_replaces_only_uncertified_chunks():
+    """A retry must match a direct longer solve without weakening certification."""
+
+    retry_fit = getattr(
+        query_robust_solver, "triton_full_support_minimax_retry_fit", None
+    )
+    assert callable(retry_fit), "missing fail-closed Triton retry pilot"
+
+    generator = torch.Generator(device="cuda").manual_seed(53)
+    scores = torch.randn(8, 32, 16, device="cuda", generator=generator)
+    partitions = torch.logsumexp(scores, dim=-1)
+    expected = query_robust_solver.triton_full_support_minimax_fit(
+        scores,
+        partitions,
+        tolerance=1e-2,
+        max_iterations=64,
+        armijo_backtracks=12,
+    )
+    p, lower, upper, gap, converged, retried = retry_fit(
+        scores,
+        partitions,
+        tolerance=1e-2,
+        fast_iterations=1,
+        retry_iterations=64,
+        armijo_backtracks=12,
+    )
+
+    assert retried == scores.shape[0]
+    assert torch.allclose(p, expected[0], rtol=1e-6, atol=1e-6)
+    assert torch.allclose(lower, expected[1], rtol=1e-6, atol=1e-6)
+    assert torch.allclose(upper, expected[2], rtol=1e-6, atol=1e-6)
+    assert torch.allclose(gap, expected[3], rtol=1e-6, atol=1e-6)
+    assert torch.equal(converged, expected[4])

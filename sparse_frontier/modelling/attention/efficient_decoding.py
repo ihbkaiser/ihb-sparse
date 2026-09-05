@@ -121,6 +121,7 @@ class QuestAttention(AbstractAttention):
         max_output_tokens: int,
         num_layers: int,
         share_pages: bool,
+        dense_layers: int = 0,
     ):
         """Initialize Quest attention.
         
@@ -131,6 +132,8 @@ class QuestAttention(AbstractAttention):
             max_output_tokens: Maximum output token length (from config)
             num_layers: Number of transformer layers (from model config)
             share_pages: Whether to share pages across query heads
+            dense_layers: Number of earliest decode layers that retain exact
+                dense attention, matching Quest's reference evaluation path.
         """
         super().__init__()
         self.token_budget = token_budget
@@ -139,6 +142,9 @@ class QuestAttention(AbstractAttention):
         assert token_budget % page_size == 0, "Token budget must be divisible by page size"
 
         self.share_pages = share_pages
+        self.dense_layers = int(dense_layers)
+        if not 0 <= self.dense_layers <= num_layers:
+            raise ValueError("Quest dense_layers must lie in [0, num_layers]")
         
         self.max_pages = ((max_input_tokens + max_output_tokens) + page_size - 1) // page_size
         self.num_layers = num_layers
@@ -147,6 +153,10 @@ class QuestAttention(AbstractAttention):
         self.page_reps_per_layer: List[Optional[torch.Tensor]] = [None] * num_layers
         self._page_reps_ready = [False] * num_layers
         self.offsets = None
+
+    def uses_dense_decode(self, layer_idx: int) -> bool:
+        """Whether this layer follows Quest's exact early-layer decode path."""
+        return 0 <= int(layer_idx) < self.dense_layers
 
     def reset(self) -> None:
         """Reset request-local page summaries."""
@@ -275,6 +285,18 @@ class QuestAttention(AbstractAttention):
         Returns:
             Attention output tensor of shape [1, num_heads, head_dim]
         """
+        if self.uses_dense_decode(layer_idx):
+            return super().decode(
+                query=query,
+                keys=keys,
+                values=values,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                tokens_per_head=tokens_per_head,
+                output=output,
+                layer_idx=layer_idx,
+            )
+
         num_kv_heads, num_blocks, block_size, head_size = k_cache.shape
         _, num_q_heads, _ = query.shape
 
