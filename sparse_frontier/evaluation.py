@@ -38,8 +38,10 @@ def merge_data_and_predictions(data: Sequence[Mapping[str, Any]], predictions: S
 
 
 def _task_metrics(task: str, examples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    if task in {"niah_single", "niah_multikey", "niah_multiquery", "vt", "fwe"}:
-        from sparse_frontier.ruler_pilot import evaluate_ruler_task
+    from sparse_frontier.ruler_kvpress import RULER_TASKS
+
+    if task in RULER_TASKS:
+        from sparse_frontier.ruler_kvpress import evaluate_ruler_task
 
         return evaluate_ruler_task(task, examples)
     # Preserve the pre-existing Hydra task behavior for non-pilot experiments.

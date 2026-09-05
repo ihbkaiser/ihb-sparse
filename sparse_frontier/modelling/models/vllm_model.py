@@ -307,9 +307,24 @@ class VLLMModel(AbstractModel):
         input_text: str,
         max_tokens: Optional[int] = None,
     ) -> dict[str, Any]:
-        from vllm.inputs import TokensPrompt
         model_input = self.tokenizer.encode_for_generation(input_text, return_tensors=False)
-        prompt = TokensPrompt(prompt_token_ids=model_input["input_ids"])
+        return self.generate_token_ids(model_input["input_ids"], max_tokens=max_tokens)
+
+    @torch.no_grad()
+    def generate_token_ids(
+        self,
+        prompt_token_ids: list[int],
+        max_tokens: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """Generate from already serialized token IDs without adding a chat template.
+
+        Benchmark adapters such as KVPress RULER own their prompt contract.
+        Accepting their prepared IDs prevents the generic text path from
+        applying a second, incompatible chat template.
+        """
+        from vllm.inputs import TokensPrompt
+
+        prompt = TokensPrompt(prompt_token_ids=list(prompt_token_ids))
 
         if max_tokens is not None and max_tokens < 1:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}")

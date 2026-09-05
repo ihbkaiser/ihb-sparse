@@ -2,7 +2,6 @@ from .qa.qa_task import QATask
 from .ruler.cwe import CommonWordTask
 from .ruler.niah import NIAHTask
 from .ruler.vt import VariableTrackingTask
-from sparse_frontier.ruler_pilot import RulerPilotTask
 from .story.multihop import MultiHopTask
 from .story.filtering import FilteringTask
 from .story.retrieval import RetrievalTask
@@ -16,11 +15,6 @@ TASK_REGISTRY = {
     "ruler_cwe": CommonWordTask,
     "ruler_niah": NIAHTask,
     "ruler_vt": VariableTrackingTask,
-    "niah_single": RulerPilotTask,
-    "niah_multikey": RulerPilotTask,
-    "niah_multiquery": RulerPilotTask,
-    "vt": RulerPilotTask,
-    "fwe": RulerPilotTask,
     "story_multihop": MultiHopTask,
     "story_filtering": FilteringTask,
     "story_retrieval": RetrievalTask,

@@ -25,12 +25,12 @@ def test_mixed_dataset_evaluation_infers_tasks_and_emits_aggregates(tmp_path):
     out_csv = tmp_path / "aggregate.csv"
 
     data_rows = [
-        {"index": 0, "task": "niah_single", "gold_answer": ["abc"], "outputs": ["abc"]},
-        {"index": 1, "task": "vt", "gold_answer": "AAAAA BBBBB", "outputs": ["AAAAA BBBBB"]},
+        {"index": 0, "task": "niah_single_1", "gold_answer": ["abc"], "answer": ["abc"]},
+        {"index": 1, "task": "vt", "gold_answer": ["AAAAA BBBBB"], "answer": ["AAAAA BBBBB"]},
     ]
     pred_rows = [
-        _row(0, "niah_single", ["abc"], "abc", runtime_s=1.0, decode_latency_s=0.4, peak_gpu_memory_bytes=5),
-        _row(1, "vt", "AAAAA BBBBB", "AAAAA", runtime_s=2.0, decode_latency_s=0.7, peak_gpu_memory_bytes=7),
+        _row(0, "niah_single_1", ["abc"], "abc", runtime_s=1.0, decode_latency_s=0.4, peak_gpu_memory_bytes=5),
+        _row(1, "vt", ["AAAAA BBBBB"], "AAAAA", runtime_s=2.0, decode_latency_s=0.7, peak_gpu_memory_bytes=7),
     ]
     for path, rows in ((data, data_rows), (pred, pred_rows)):
         path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -44,12 +44,12 @@ def test_mixed_dataset_evaluation_infers_tasks_and_emits_aggregates(tmp_path):
         budget=512,
     )
 
-    assert {row["task"] for row in results["tasks"]} == {"niah_single", "vt"}
+    assert {row["task"] for row in results["tasks"]} == {"niah_single_1", "vt"}
     assert all(row["method"] == "quest" and row["budget"] == 512 for row in results["tasks"])
     assert results["failures"] == 0
     assert out_json.exists() and out_csv.exists()
     with out_csv.open(newline="") as fh:
-        assert {row["task"] for row in csv.DictReader(fh)} == {"niah_single", "vt"}
+        assert {row["task"] for row in csv.DictReader(fh)} == {"niah_single_1", "vt"}
 
 
 def test_evaluation_reports_missing_prediction_as_failure(tmp_path):

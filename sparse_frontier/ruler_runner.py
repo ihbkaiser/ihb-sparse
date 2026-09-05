@@ -1,4 +1,4 @@
-"""Reproducible RULER pilot runner for Dense, Quest, ShadowKV, and Query-Robust."""
+"""KVPress-compatible RULER runner for Dense, Quest, ShadowKV, and Query-Robust."""
 
 from __future__ import annotations
 
@@ -17,7 +17,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from sparse_frontier.evaluation import evaluate_jsonl_dataset
-from sparse_frontier.ruler_pilot import load_pilot_rows
+from sparse_frontier.ruler_kvpress import (
+    RULER_DATASET,
+    RULER_TASKS,
+    build_prompt_token_ids,
+    calculate_ruler_metrics,
+    load_ruler_rows,
+)
 
 
 # 96, 128, and 256 remain safely above Query-Robust's mandatory
@@ -25,7 +31,7 @@ from sparse_frontier.ruler_pilot import load_pilot_rows
 # ShadowKV's fixed local/outlier set consumes 416 tokens, so its 96-token
 # selectable budget matches a 512-token total-access comparison.
 SPARSE_BUDGETS = (96, 128, 256, 512, 1024, 2048)
-_CAPTURE_TASKS = ("niah_single", "niah_multikey", "niah_multiquery", "vt", "fwe")
+_CAPTURE_TASKS = RULER_TASKS
 
 
 @dataclass(frozen=True)
@@ -170,7 +176,8 @@ def _capture_context_payload(
             "task": task,
             "task_index": task_index,
             "context_length": context_length,
-            "input_text": str(sample["input_text"]),
+            "context": str(sample.get("context", "")),
+            "question": str(sample.get("question", "")),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -238,7 +245,9 @@ def _prepare_raw_capture_manifest(
     rope_scaling = dict(config.get("rope_scaling") or {})
     rope_type = str(rope_scaling.pop("rope_type", rope_scaling.pop("type", "default")))
     rope_parameters = {**rope_scaling, "rope_theta": config.get("rope_theta")}
-    source_digest = hashlib.sha256(Path(data_path).read_bytes()).hexdigest()
+    source_path = Path(data_path)
+    source_bytes = source_path.read_bytes() if source_path.is_file() else str(data_path).encode("utf-8")
+    source_digest = hashlib.sha256(source_bytes).hexdigest()
     try:
         git_commit = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -487,12 +496,14 @@ def _generate_one(
     context_payload: dict[str, Any] | None = None
     request_source_enabled = bool(os.getenv("SF_QUERY_ROBUST_PROMPT_QUERY_ROOT"))
     try:
+        prompt_token_ids = build_prompt_token_ids(
+            model.tokenizer.tokenizer,
+            sample,
+            enable_thinking=bool(getattr(model, "enable_thinking", False)),
+        )
         if capture_context_path is not None:
-            encoded = model.tokenizer.encode_for_generation(
-                sample["input_text"], return_tensors=False
-            )
             context_payload = _capture_context_payload(
-                sample, int(encoded["input_length"])
+                sample, len(prompt_token_ids)
             )
             _atomic_write_json(
                 capture_context_path,
@@ -500,11 +511,8 @@ def _generate_one(
             )
         if request_source_enabled:
             if context_payload is None:
-                encoded = model.tokenizer.encode_for_generation(
-                    sample["input_text"], return_tensors=False
-                )
                 context_payload = _capture_context_payload(
-                    sample, int(encoded["input_length"])
+                    sample, len(prompt_token_ids)
                 )
             os.environ["SF_QUERY_ROBUST_REQUEST_ID"] = str(
                 int(context_payload["sequence_id_hash"])
@@ -514,9 +522,7 @@ def _generate_one(
         )
         if capture_max_tokens is not None:
             generation_tokens = min(generation_tokens, int(capture_max_tokens))
-        output = model.generate(
-            sample["input_text"], max_tokens=generation_tokens
-        )
+        output = model.generate_token_ids(prompt_token_ids, max_tokens=generation_tokens)
         result = {
             "index": sample["index"],
             "task": sample["task"],
@@ -605,11 +611,19 @@ def run_spec(
     run_dir = Path(output_dir) / spec.name
     run_dir.mkdir(parents=True, exist_ok=True)
     pred_path = run_dir / "predictions.jsonl"
+    kvpress_predictions_path = run_dir / "predictions.csv"
+    kvpress_metrics_path = run_dir / "metrics.json"
     aggregate_json = run_dir / "aggregate.json"
     aggregate_csv = run_dir / "aggregate.csv"
     manifest_path = run_dir / "run.json"
     run_data_path = run_dir / "dataset.jsonl"
-    if pred_path.exists() or aggregate_json.exists() or aggregate_csv.exists():
+    if (
+        pred_path.exists()
+        or kvpress_predictions_path.exists()
+        or kvpress_metrics_path.exists()
+        or aggregate_json.exists()
+        or aggregate_csv.exists()
+    ):
         raise FileExistsError(
             f"Run artifacts already exist in {run_dir}; choose a new output_dir to avoid mixing runs"
         )
@@ -638,7 +652,7 @@ def run_spec(
             capture_query_dir,
             model_path,
             model_cfg,
-            data_path,
+            run_data_path,
             max_decode_offset=capture_max_tokens - 1,
         )
     _configure_attention(
@@ -790,6 +804,39 @@ def run_spec(
     with pred_path.open("w", encoding="utf-8") as handle:
         for result in results:
             handle.write(json.dumps(result, sort_keys=True) + "\n")
+    rows_by_index = {int(row["index"]): row for row in selected_rows}
+    kvpress_rows = []
+    for result in results:
+        row = rows_by_index[int(result["index"])]
+        kvpress_rows.append({**row, **result, "predicted_answer": result["pred"]})
+    kvpress_metrics = calculate_ruler_metrics(kvpress_rows)
+    with kvpress_predictions_path.open("w", newline="", encoding="utf-8") as handle:
+        fields = [
+            "index",
+            "task",
+            "question",
+            "answer_prefix",
+            "answer",
+            "max_new_tokens",
+            "predicted_answer",
+            "method",
+            "budget",
+            "output_tokens_len",
+            "runtime_s",
+            "decode_latency_s",
+            "peak_gpu_memory_bytes",
+            "failure",
+            "error",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in kvpress_rows:
+            csv_row = dict(row)
+            csv_row["answer"] = json.dumps(row["answer"], ensure_ascii=False)
+            writer.writerow(csv_row)
+    kvpress_metrics_path.write_text(
+        json.dumps(kvpress_metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     aggregate = evaluate_jsonl_dataset(
         data_path=run_data_path,
         predictions_path=pred_path,
@@ -825,11 +872,14 @@ def run_spec(
         "shadowkv_fused_retrieval": shadowkv_fused_retrieval,
         "num_examples": len(selected_rows),
         "dataset_path": str(data_path),
+        "dataset": RULER_DATASET,
         "run_dataset_path": str(run_data_path),
         "initialization_failure": init_failure,
         "generation_allowances": sorted(
             {int(sample["tokens_to_generate"]) for sample in selected_rows}
         ),
+        "kvpress_predictions_path": str(kvpress_predictions_path),
+        "kvpress_metrics_path": str(kvpress_metrics_path),
         "capture_query_dir": str(capture_query_dir) if capture_query_dir else None,
         "capture_context_path": (
             str(resolved_capture_context) if resolved_capture_context else None
@@ -851,6 +901,8 @@ def run_spec(
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return {
         "predictions_path": str(pred_path),
+        "kvpress_predictions_path": str(kvpress_predictions_path),
+        "kvpress_metrics_path": str(kvpress_metrics_path),
         "aggregate_json": str(aggregate_json),
         "aggregate_csv": str(aggregate_csv),
         "manifest_path": str(manifest_path),
@@ -891,7 +943,13 @@ def _write_matrix_aggregate(
 
 
 def run_cli(args: argparse.Namespace) -> int:
-    rows = load_pilot_rows(args.data_path)
+    rows = load_ruler_rows(args.context_length)
+    data_path = f"{RULER_DATASET}/{args.context_length}"
+    max_input_tokens = (
+        int(args.max_input_tokens)
+        if args.max_input_tokens is not None
+        else int(args.context_length) + 512
+    )
     if args.tasks is not None:
         rows = _select_tasks(rows, tuple(args.tasks))
     if args.task_indices is not None:
@@ -914,8 +972,8 @@ def run_cli(args: argparse.Namespace) -> int:
                 sys.executable,
                 "-m",
                 "sparse_frontier.ruler_runner",
-                "--data_path",
-                str(args.data_path),
+                "--context_length",
+                str(args.context_length),
                 "--model_path",
                 str(args.model_path),
                 "--output_dir",
@@ -923,7 +981,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 "--method",
                 spec.method,
                 "--max_input_tokens",
-                str(args.max_input_tokens),
+                str(max_input_tokens),
                 "--max_output_tokens",
                 str(args.max_output_tokens),
                 "--seed",
@@ -946,6 +1004,12 @@ def run_cli(args: argparse.Namespace) -> int:
                 command.extend(["--budget", str(spec.budget)])
             if args.smoke:
                 command.append("--smoke")
+            if args.tasks is not None:
+                command.extend(["--tasks", *args.tasks])
+            if args.task_indices is not None:
+                command.extend(
+                    ["--task_indices", *[str(index) for index in args.task_indices]]
+                )
             if args.capture_query_dir is not None:
                 command.extend(["--capture_query_dir", str(args.capture_query_dir)])
             if args.capture_context_path is not None:
@@ -973,7 +1037,7 @@ def run_cli(args: argparse.Namespace) -> int:
                 )
             completed = subprocess.run(command, check=False)
             all_failures += int(completed.returncode != 0)
-        _write_matrix_aggregate(args.output_dir, args.data_path, specs)
+        _write_matrix_aggregate(args.output_dir, data_path, specs)
         return 2 if all_failures else 0
 
     all_failures = 0
@@ -981,10 +1045,10 @@ def run_cli(args: argparse.Namespace) -> int:
         run = run_spec(
             spec=spec,
             rows=rows,
-            data_path=args.data_path,
+            data_path=data_path,
             output_dir=args.output_dir,
             model_path=args.model_path,
-            max_input_tokens=args.max_input_tokens,
+            max_input_tokens=max_input_tokens,
             max_output_tokens=args.max_output_tokens,
             seed=args.seed,
             tp=args.tp,
@@ -1026,13 +1090,19 @@ def run_cli(args: argparse.Namespace) -> int:
         all_failures += int(run["failures"])
         print(json.dumps({"run": spec.name, **run}, sort_keys=True))
     if args.method is None:
-        _write_matrix_aggregate(args.output_dir, args.data_path, specs)
+        _write_matrix_aggregate(args.output_dir, data_path, specs)
     return 2 if all_failures else 0
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Dense/Quest/ShadowKV/Query-Robust RULER pilot")
-    parser.add_argument("--data_path", required=True)
+    parser = argparse.ArgumentParser(description="Run KVPress-compatible RULER sparse-attention evaluation")
+    parser.add_argument(
+        "--context_length",
+        type=int,
+        choices=(4096, 8192, 16384),
+        default=4096,
+        help="KVPress RULER dataset configuration to load from Hugging Face",
+    )
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--smoke", action="store_true", help="one example for each method")
@@ -1040,7 +1110,11 @@ def main() -> None:
         "--method", choices=("dense", "quest", "shadowkv", "query_robust")
     )
     parser.add_argument("--budget", type=int)
-    parser.add_argument("--max_input_tokens", type=int, default=8192)
+    parser.add_argument(
+        "--max_input_tokens",
+        type=int,
+        help="vLLM prompt capacity; defaults to context_length + 512",
+    )
     parser.add_argument("--max_output_tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--tp", type=int, default=1)
@@ -1048,13 +1122,13 @@ def main() -> None:
         "--task_indices",
         type=int,
         nargs="+",
-        help="run these task_index values for every task family",
+        help="run these per-task sample indexes for every RULER task",
     )
     parser.add_argument(
         "--tasks",
-        choices=_CAPTURE_TASKS,
+        choices=RULER_TASKS,
         nargs="+",
-        help="restrict a pilot to named RULER task families without resampling examples",
+        help="restrict evaluation to canonical RULER tasks without resampling examples",
     )
     parser.add_argument(
         "--capture_query_dir",

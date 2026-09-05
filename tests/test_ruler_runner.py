@@ -242,16 +242,18 @@ def test_capture_context_has_no_prompt_text():
     payload = _capture_context_payload(
         {
             "index": 6,
-            "task": "niah_multikey",
+            "task": "niah_multikey_1",
             "task_index": 6,
             "context_length": 8192,
-            "input_text": "secret prompt",
+            "context": "secret context",
+            "question": "secret question",
         },
         prompt_length=8181,
     )
     assert payload["split"] == "validation"
     assert payload["prompt_length"] == 8181
-    assert "secret prompt" not in repr(payload)
+    assert "secret context" not in repr(payload)
+    assert "secret question" not in repr(payload)
     assert 0 <= payload["sequence_id_hash"] < 2**63
 
 
@@ -279,13 +281,13 @@ def test_model_geometry_is_loaded_from_checkpoint(tmp_path):
 def test_select_task_indices_keeps_each_task_and_requested_split():
     rows = [
         {"task": task, "task_index": index}
-        for task in ("niah_single", "vt")
+        for task in ("niah_single_1", "vt")
         for index in range(7)
     ]
     selected = _select_task_indices(rows, (0, 5))
     assert [(row["task"], row["task_index"]) for row in selected] == [
-        ("niah_single", 0),
-        ("niah_single", 5),
+        ("niah_single_1", 0),
+        ("niah_single_1", 5),
         ("vt", 0),
         ("vt", 5),
     ]
@@ -294,13 +296,13 @@ def test_select_task_indices_keeps_each_task_and_requested_split():
 def test_select_tasks_keeps_exact_requested_families():
     rows = [
         {"task": task, "task_index": index}
-        for task in ("niah_single", "fwe", "vt")
+        for task in ("niah_single_1", "fwe", "vt")
         for index in range(2)
     ]
-    selected = _select_tasks(rows, ("fwe", "niah_single"))
+    selected = _select_tasks(rows, ("fwe", "niah_single_1"))
     assert [(row["task"], row["task_index"]) for row in selected] == [
-        ("niah_single", 0),
-        ("niah_single", 1),
+        ("niah_single_1", 0),
+        ("niah_single_1", 1),
         ("fwe", 0),
         ("fwe", 1),
     ]
@@ -347,12 +349,23 @@ def test_query_robust_runner_sets_fail_closed_identity(monkeypatch, tmp_path):
 def test_generate_one_never_exceeds_model_declared_output_horizon():
     class Model:
         max_output_tokens = 8
+        enable_thinking = False
 
         def __init__(self):
             self.requested = None
+            raw_tokenizer = type(
+                "RawTokenizer",
+                (),
+                {
+                    "chat_template": None,
+                    "bos_token": "",
+                    "encode": staticmethod(lambda text, add_special_tokens=False: [1, 2, 3]),
+                },
+            )()
+            self.tokenizer = type("Tokenizer", (), {"tokenizer": raw_tokenizer})()
 
-        def generate(self, text, max_tokens):
-            self.requested = (text, max_tokens)
+        def generate_token_ids(self, token_ids, max_tokens):
+            self.requested = (token_ids, max_tokens)
             return {
                 "text": "ok",
                 "output_tokens_len": max_tokens,
@@ -364,11 +377,13 @@ def test_generate_one_never_exceeds_model_declared_output_horizon():
         model,
         {
             "index": 0,
-            "task": "niah_single",
-            "input_text": "prompt",
+            "task": "niah_single_1",
+            "context": "context",
+            "question": "question",
+            "answer_prefix": "",
             "tokens_to_generate": 128,
         },
         RunSpec("dense", None),
     )
     assert not result["failure"]
-    assert model.requested == ("prompt", 8)
+    assert model.requested == ([1, 2, 3, 1, 2, 3], 8)
