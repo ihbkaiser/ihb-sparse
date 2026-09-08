@@ -18,6 +18,28 @@ from sparsevllm.method_registry import (
 from sparsevllm.utils.log import logger, log_once
 
 
+def resolve_shadowkv_outlier_chunks(
+    sparse_budget: int,
+    configured: int | None = None,
+) -> int:
+    """Resolve ShadowKV's per-KV-head outlier chunk count.
+
+    Lightweight runtime configs may omit normalized fields.  Keeping the
+    derived default here makes the decode payload and cache-manager workspace
+    use the same capacity contract.
+    """
+
+    if configured is None:
+        return max(1, 24 * int(sparse_budget) // 1024)
+    value = int(configured)
+    if value <= 0:
+        raise ValueError(
+            "shadowkv_outlier_chunks must be > 0, "
+            f"got {value}."
+        )
+    return value
+
+
 def normalize_sparse_method_name(config) -> None:
     config.sparse_method = normalize_sparse_method(config.sparse_method)
     if config.sparse_method not in SUPPORTED_SPARSE_METHODS:
@@ -131,6 +153,127 @@ def _normalize_quest(config) -> None:
             )
     if config.quest_skip_layers < 0:
         raise ValueError("quest_skip_layers 不能 < 0")
+
+
+def _normalize_shadowkv(config) -> None:
+    for name in (
+        "shadowkv_sparse_budget",
+        "shadowkv_rank",
+        "shadowkv_chunk_size",
+        "shadowkv_local_chunks",
+        "shadowkv_recent_tokens",
+        "shadowkv_svd_batch_size",
+        "shadowkv_svd_oversample",
+        "shadowkv_svd_niter",
+        "shadowkv_decode_page_size",
+    ):
+        _normalize_positive_int(config, name, fallback=0)
+    if config.sparse_method != "shadowkv":
+        return
+    backend = str(getattr(config, "shadowkv_kernel_backend", "auto")).strip().lower()
+    if backend not in {"auto", "torch", "cutlass"}:
+        raise ValueError(
+            "shadowkv_kernel_backend must be 'auto', 'torch', or 'cutlass', "
+            f"got {config.shadowkv_kernel_backend!r}."
+        )
+    config.shadowkv_kernel_backend = backend
+    decode_backend = str(
+        getattr(config, "shadowkv_decode_backend", "auto")
+    ).strip().lower()
+    if decode_backend not in {"auto", "flashinfer", "triton"}:
+        raise ValueError(
+            "shadowkv_decode_backend must be 'auto', 'flashinfer', or 'triton', "
+            f"got {config.shadowkv_decode_backend!r}."
+        )
+    config.shadowkv_decode_backend = decode_backend
+    flashinfer_backend = str(
+        getattr(config, "shadowkv_flashinfer_backend", "auto")
+    ).strip().lower()
+    if flashinfer_backend not in {"auto", "fa2", "fa3", "cute-dsl"}:
+        raise ValueError(
+            "shadowkv_flashinfer_backend must be one of 'auto', 'fa2', 'fa3', "
+            "or 'cute-dsl', "
+            f"got {config.shadowkv_flashinfer_backend!r}."
+        )
+    config.shadowkv_flashinfer_backend = flashinfer_backend
+    storage = str(getattr(config, "shadowkv_storage", "cpu")).strip().lower()
+    if storage not in {"cpu", "gpu_cache"}:
+        raise ValueError(
+            "shadowkv_storage must be 'cpu' or 'gpu_cache', "
+            f"got {config.shadowkv_storage!r}."
+        )
+    config.shadowkv_storage = storage
+    config.shadowkv_multistream_gather = _coerce_bool_config(
+        "shadowkv_multistream_gather",
+        getattr(config, "shadowkv_multistream_gather", True),
+    )
+    config.shadowkv_gather_copy_with_offsets = _coerce_bool_config(
+        "shadowkv_gather_copy_with_offsets",
+        getattr(config, "shadowkv_gather_copy_with_offsets", True),
+    )
+    if config.shadowkv_decode_page_size not in {1, 2, 4, 8, 16, 32, 64}:
+        raise ValueError(
+            "shadowkv_decode_page_size must be one of 1, 2, 4, 8, 16, 32, or 64, "
+            f"got {config.shadowkv_decode_page_size}."
+        )
+    _normalize_int_attr(config, "shadowkv_gpu_cache_tokens", fallback=0)
+    if config.shadowkv_gpu_cache_tokens < 0:
+        raise ValueError(
+            "shadowkv_gpu_cache_tokens must be non-negative, got "
+            f"{config.shadowkv_gpu_cache_tokens}."
+        )
+    if storage == "gpu_cache" and config.shadowkv_gpu_cache_tokens <= 0:
+        raise ValueError(
+            "shadowkv_storage='gpu_cache' requires a positive "
+            "shadowkv_gpu_cache_tokens capacity."
+        )
+    max_model_len = getattr(config, "max_model_len", None)
+    if (
+        storage == "gpu_cache"
+        and max_model_len is not None
+        and config.shadowkv_gpu_cache_tokens < int(max_model_len)
+    ):
+        raise ValueError(
+            "shadowkv_gpu_cache_tokens must cover max_model_len in gpu_cache mode: "
+            f"capacity={config.shadowkv_gpu_cache_tokens} max_model_len={max_model_len}."
+        )
+    svd_method = str(getattr(config, "shadowkv_svd_method", "exact")).strip().lower()
+    if svd_method not in {"exact", "lowrank"}:
+        raise ValueError(
+            "shadowkv_svd_method must be 'exact' or 'lowrank', "
+            f"got {config.shadowkv_svd_method!r}."
+        )
+    config.shadowkv_svd_method = svd_method
+    if config.shadowkv_sparse_budget % config.shadowkv_chunk_size:
+        raise ValueError(
+            "shadowkv_sparse_budget must be divisible by shadowkv_chunk_size, got "
+            f"budget={config.shadowkv_sparse_budget} chunk_size={config.shadowkv_chunk_size}."
+        )
+    num_kv_heads = int(getattr(config.hf_config, "num_key_value_heads", 0) or 0)
+    head_dim = int(
+        getattr(config.hf_config, "head_dim", 0)
+        or config.hf_config.hidden_size // config.hf_config.num_attention_heads
+    )
+    flattened_kv_dim = num_kv_heads * head_dim
+    if flattened_kv_dim <= 0:
+        raise ValueError("ShadowKV requires a positive flattened KV dimension.")
+    if config.shadowkv_rank > flattened_kv_dim:
+        raise ValueError(
+            "shadowkv_rank cannot exceed the flattened KV dimension: "
+            f"rank={config.shadowkv_rank} flattened_kv_dim={flattened_kv_dim}."
+        )
+    config.shadowkv_outlier_chunks = resolve_shadowkv_outlier_chunks(
+        config.shadowkv_sparse_budget,
+        config.shadowkv_outlier_chunks,
+    )
+    if config.tensor_parallel_size != 1:
+        raise NotImplementedError(
+            "ShadowKV currently supports tensor_parallel_size=1 only."
+        )
+    if str(config.attention_cache_layout) != "explicit_kv":
+        raise NotImplementedError(
+            "ShadowKV currently requires homogeneous explicit KV storage."
+        )
 
 
 def _normalize_snapkv(config) -> None:
@@ -328,6 +471,7 @@ def normalize_sparse_methods(config) -> None:
     _normalize_h2o(config)
     _normalize_rkv(config)
     _normalize_skipkv(config)
+    _normalize_shadowkv(config)
 
 def finalize_sparse_layout(config) -> None:
     configured_full_layers = {int(layer) for layer in config.full_attention_layers}

@@ -7,6 +7,7 @@ import torch
 import sparsevllm.engine.llm_engine as llm_engine
 import sparsevllm.engine.model_runner as model_runner
 from sparsevllm.kernels.external.required import (
+    config_requires_sgl_kernel,
     validate_required_cuda_kernel_families,
     validate_required_cuda_kernel_metadata,
 )
@@ -101,6 +102,26 @@ def test_required_cuda_metadata_validation_reports_unhealthy_families() -> None:
         pytest.raises(RuntimeError, match="startup metadata validation"),
     ):
         validate_required_cuda_kernel_metadata()
+
+
+def test_quest_and_shadowkv_do_not_require_optional_sgl_family() -> None:
+    with (
+        patch(
+            "sparsevllm.kernels.external.required.flashinfer_kernel_metadata_health",
+            return_value=_health(
+                "flashinfer-python",
+                KernelFamilyState.READY,
+                "ready",
+            ),
+        ),
+        patch(
+            "sparsevllm.kernels.external.required.sgl_kernel_metadata_health",
+            side_effect=AssertionError("optional SGL health must not be queried"),
+        ),
+    ):
+        assert not config_requires_sgl_kernel(SimpleNamespace(sparse_method="quest"))
+        assert not config_requires_sgl_kernel(SimpleNamespace(sparse_method="shadowkv"))
+        validate_required_cuda_kernel_metadata(require_sgl=False)
 
 
 def test_gpu_engine_validates_metadata_before_starting_workers() -> None:

@@ -11,6 +11,7 @@ from .joint import RKVRuntime, SkipKVRuntime
 from .passthrough import PassThroughRuntime
 from .snapkv import PyramidKVRuntime, SnapKVRuntime
 from .streamingllm import StreamingLLMRuntime
+from .shadowkv import ShadowKVRuntime
 
 
 RUNTIME_BINDINGS: dict[str, type[SparseMethodRuntime]] = {
@@ -24,6 +25,7 @@ RUNTIME_BINDINGS: dict[str, type[SparseMethodRuntime]] = {
     "rkv": RKVRuntime,
     "skipkv": SkipKVRuntime,
     "deltakv": DeltaKVRuntime,
+    "shadowkv": ShadowKVRuntime,
 }
 
 

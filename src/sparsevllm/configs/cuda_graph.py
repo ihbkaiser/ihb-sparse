@@ -228,6 +228,32 @@ def build_decode_cuda_graph_startup_plan(
     )
 
 
+def build_decode_cuda_graph_profile_plan(
+    config,
+) -> list[tuple[int, int, bool]]:
+    """Return the minimum graph set needed to measure startup graph memory.
+
+    The production plan intentionally contains every configured batch bucket
+    and topology path.  During the temporary profiling runtime that full plan
+    needlessly captures the same graph family many times and its allocations
+    are discarded when the production cache runtime is rebuilt.  One largest
+    batch per semantic path is sufficient for the monotonic graph-memory
+    reservation used by startup capacity planning.
+    """
+
+    startup_plan = build_decode_cuda_graph_startup_plan(config)
+    representatives: dict[str, tuple[int, int, bool]] = {}
+    for entry in startup_plan:
+        batch_size, context_capacity, is_long_text = entry
+        path_id = decode_graph_path_id(
+            str(config.sparse_method or ""), bool(is_long_text)
+        )
+        current = representatives.get(path_id)
+        if current is None or int(batch_size) > int(current[0]):
+            representatives[path_id] = entry
+    return sorted(representatives.values(), reverse=True)
+
+
 def normalize_decode_cuda_graph(config) -> None:
     startup_capture_setting = config.decode_graph_startup_capture
     startup_capture_auto = startup_capture_setting is None

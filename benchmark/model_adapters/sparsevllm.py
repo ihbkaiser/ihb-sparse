@@ -57,6 +57,16 @@ def get_sparsevllm_generate_api(
             is_single = False
 
         max_tokens = kwargs.get("max_new_tokens", kwargs.get("max_tokens", 128))
+        if isinstance(max_tokens, (list, tuple)):
+            if len(max_tokens) != len(prompts):
+                raise ValueError(
+                    "A per-prompt max_new_tokens sequence must have one value per prompt."
+                )
+            max_tokens = [int(value) for value in max_tokens]
+            if any(value <= 0 for value in max_tokens):
+                raise ValueError("Every per-prompt max_new_tokens value must be positive.")
+        else:
+            max_tokens = int(max_tokens)
         temperature = kwargs.get("temperature", 1.0)
         top_p = kwargs.get("top_p", 1.0)
         top_k = kwargs.get("top_k", 0)
@@ -67,12 +77,19 @@ def get_sparsevllm_generate_api(
         elif temperature < 1e-5:
             temperature = 1e-5
 
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_tokens=max_tokens,
-            eos_token_ids=kwargs.get("eos_token_id"),
+        def make_sampling_params(value: int) -> SamplingParams:
+            return SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                max_tokens=value,
+                eos_token_ids=kwargs.get("eos_token_id"),
+            )
+
+        sampling_params = (
+            [make_sampling_params(value) for value in max_tokens]
+            if isinstance(max_tokens, list)
+            else make_sampling_params(max_tokens)
         )
         outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
         results = [output["text"] for output in outputs]

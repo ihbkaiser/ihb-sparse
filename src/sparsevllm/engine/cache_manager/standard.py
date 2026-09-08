@@ -26,13 +26,16 @@ from sparsevllm.engine.prefix_cache import (
 from sparsevllm.engine.prefix_prune import PrefixPruneRecord
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
+from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
+import sparsevllm.platforms as platforms
 from sparsevllm.platforms import device_runtime
 
 from .base import (
     AttentionCacheWrite,
     AttentionPayload,
+    AttentionViewMeta,
     CacheManager,
     ExplicitKVPayload,
     LayerBatchStates,
@@ -126,6 +129,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         # idle prefix tree has been pruned.
         self.row_logical_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
+        self._sm100_prefill_k: torch.Tensor | None = None
+        self._sm100_prefill_v: torch.Tensor | None = None
+        self._sm100_prefill_capacity = 0
 
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching and config.sparse_method in ("", "omnikv")
@@ -336,6 +342,104 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             context_lens,
         )
 
+    def _uses_sm100_dense_prefill_pages(self) -> bool:
+        method = normalize_sparse_method(
+            getattr(self.config, "sparse_method", "")
+        )
+        if method not in {"", "vanilla"} or self.device.type != "cuda":
+            return False
+        caps = platforms.current_platform.get_device_caps(int(self.device.index or 0))
+        return caps.compute_capability == (10, 0)
+
+    @torch.no_grad()
+    def _build_sm100_dense_prefill_view(
+        self,
+        layer_idx: int,
+        selection: SparseSelection,
+    ) -> PrefillComputeView:
+        """Pack token-slot storage into the 16-token SM100 page contract.
+
+        StandardCacheManager deliberately keeps the allocator's token-slot
+        layout unchanged.  FlashInfer CuTe-DSL requires 16-token physical
+        pages, so dense SM100 prefill gets a transient, batch-local padded
+        copy.  The logical lengths remain exact and therefore preserve causal
+        semantics; decode continues to use the native token-slot cache.
+        """
+
+        context_lens = selection.context_lens.to(torch.int32)
+        batch_size = int(context_lens.numel())
+        if batch_size <= 0:
+            raise ValueError("SM100 dense prefill requires a non-empty batch.")
+        max_context_len = int(context_lens.max().item())
+        if max_context_len <= 0:
+            raise ValueError("SM100 dense prefill requires positive context lengths.")
+        page_size = 16
+        padded_max_len = (max_context_len + page_size - 1) // page_size * page_size
+        required_tokens = batch_size * padded_max_len
+
+        storage = self._require_uniform_explicit_storage(
+            "SM100 dense prefill transient pages"
+        )
+        payload = storage.layer_payload(self.kv_layer_index(layer_idx))
+        if (
+            self._sm100_prefill_k is None
+            or self._sm100_prefill_v is None
+            or self._sm100_prefill_capacity < required_tokens
+            or self._sm100_prefill_k.dtype != payload.k_cache.dtype
+            or self._sm100_prefill_k.device != payload.k_cache.device
+        ):
+            capacity = max(required_tokens, self._sm100_prefill_capacity * 2, page_size)
+            capacity = (capacity + page_size - 1) // page_size * page_size
+            self._sm100_prefill_k = torch.empty(
+                capacity,
+                self.num_kv_heads,
+                self.head_dim,
+                dtype=payload.k_cache.dtype,
+                device=payload.k_cache.device,
+            )
+            self._sm100_prefill_v = torch.empty_like(self._sm100_prefill_k)
+            self._sm100_prefill_capacity = capacity
+
+        assert self._sm100_prefill_k is not None
+        assert self._sm100_prefill_v is not None
+        packed_k = self._sm100_prefill_k[:required_tokens]
+        packed_v = self._sm100_prefill_v[:required_tokens]
+        packed_k.zero_()
+        packed_v.zero_()
+
+        req_indices = selection.req_indices.to(device=self.device, dtype=torch.long)
+        source_slots = self.buffer_req_to_token_slots.index_select(0, req_indices)
+        source_slots = source_slots[:, :max_context_len].reshape(-1)
+        source_k = payload.k_cache.index_select(0, source_slots)
+        source_v = payload.v_cache.index_select(0, source_slots)
+        packed_k.view(batch_size, padded_max_len, self.num_kv_heads, self.head_dim)[
+            :, :max_context_len
+        ].copy_(source_k.view(batch_size, max_context_len, self.num_kv_heads, self.head_dim))
+        packed_v.view(batch_size, padded_max_len, self.num_kv_heads, self.head_dim)[
+            :, :max_context_len
+        ].copy_(source_v.view(batch_size, max_context_len, self.num_kv_heads, self.head_dim))
+
+        active_slots = torch.arange(
+            required_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        ).view(batch_size, padded_max_len)
+        local_req_indices = torch.arange(
+            batch_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return PrefillComputeView(
+            meta=AttentionViewMeta(
+                active_slots=active_slots,
+                req_indices=local_req_indices,
+                context_lens=context_lens,
+                max_context_len=padded_max_len,
+                attn_score=selection.attn_score,
+            ),
+            payload=ExplicitKVPayload(k_cache=packed_k, v_cache=packed_v),
+        )
+
     def get_prefill_compute_payload(
         self,
         layer_idx: int,
@@ -352,6 +456,23 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             active_slots,
             req_indices,
             context_lens,
+        )
+
+    def build_prefill_compute_view(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+    ) -> PrefillComputeView:
+        if self._uses_sm100_dense_prefill_pages():
+            del k_current, v_current
+            return self._build_sm100_dense_prefill_view(layer_idx, selection)
+        return super().build_prefill_compute_view(
+            layer_idx,
+            k_current,
+            v_current,
+            selection,
         )
 
     def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):

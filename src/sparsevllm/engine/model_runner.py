@@ -29,6 +29,7 @@ from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.kernels.external.required import (
+    config_requires_sgl_kernel,
     validate_required_cuda_kernel_families,
 )
 from sparsevllm.method_registry import decode_sparse_long_text_threshold
@@ -300,7 +301,10 @@ class ModelRunner:
         # 初始化分布式环境并绑定对应的设备
         self.platform.set_device(self.device)
         if self.platform.enum is platforms.PlatformEnum.CUDA:
-            validate_required_cuda_kernel_families()
+            if config_requires_sgl_kernel(config):
+                validate_required_cuda_kernel_families()
+            else:
+                validate_required_cuda_kernel_families(require_sgl=False)
         if not dist.is_initialized():
             master_port = select_master_port() if master_port is None else master_port
             _init_process_group(
@@ -398,15 +402,25 @@ class ModelRunner:
                 quantized=config.quantization_config.enabled,
             )
         else:
-            load_model(
-                self.model,
-                config.model,
-                tp_rank=self.parallel_context.tp_rank,
-                tp_size=self.parallel_context.tp_size,
-                num_threads=config.weight_loading_workers_per_rank,
-                show_progress=self.parallel_context.world_rank == 0,
-                progress_rank=0 if self.parallel_context.world_rank == 0 else None,
-            )
+            # Model parameters were constructed on the selected CUDA device,
+            # but safetensors shards must remain CPU-side until each weight is
+            # copied into its destination.  With a CUDA default device,
+            # safetensors' internal tensor allocations can otherwise create a
+            # full-shard GPU staging peak on top of the model weights.
+            load_default_device = torch.get_default_device()
+            torch.set_default_device("cpu")
+            try:
+                load_model(
+                    self.model,
+                    config.model,
+                    tp_rank=self.parallel_context.tp_rank,
+                    tp_size=self.parallel_context.tp_size,
+                    num_threads=config.weight_loading_workers_per_rank,
+                    show_progress=self.parallel_context.world_rank == 0,
+                    progress_rank=0 if self.parallel_context.world_rank == 0 else None,
+                )
+            finally:
+                torch.set_default_device(load_default_device)
         self.model.eval()
         self.multimodal_runtime = MultiModalRuntime(self.model, self.device)
         self._prefill_inputs_embeds = None

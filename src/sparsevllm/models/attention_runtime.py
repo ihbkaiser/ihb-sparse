@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+import sparsevllm.platforms as platforms
+from sparsevllm.configs.sparse import resolve_shadowkv_outlier_chunks
 from sparsevllm.method_registry import (
     normalize_sparse_method,
     resolve_prefill_sparse_method,
@@ -68,12 +70,44 @@ def _resolve_mha_local_shape(
     )
 
 
+def _resolve_shadowkv_prefill_page_size(
+    normalized_method: str,
+    *,
+    device_index: int | None,
+) -> int:
+    """Select the physical prefill page layout for the selected device.
+
+    Blackwell's FlashInfer CuTe-DSL paged prefill requires 16-token pages.
+    Other devices keep the token-page layout so the portable Triton provider
+    remains a valid fallback.  A missing device index is used by CPU/spec
+    tests and deliberately retains the legacy page-1 contract.
+    """
+    if normalized_method != "shadowkv" or device_index is None:
+        return 1
+    caps = platforms.current_platform.get_device_caps(int(device_index))
+    return 16 if caps.compute_capability == (10, 0) else 1
+
+
+def _resolve_dense_prefill_page_size(
+    normalized_method: str,
+    *,
+    device_index: int | None,
+) -> int:
+    """Return the page contract used by the SM100 dense transient view."""
+
+    if normalized_method not in {"", "vanilla"} or device_index is None:
+        return 1
+    caps = platforms.current_platform.get_device_caps(int(device_index))
+    return 16 if caps.compute_capability == (10, 0) else 1
+
+
 def build_mha_prefill_attention_spec(
     config,
     *,
     sparse_method: str | None,
     attention_tp_size: int,
     runtime_config=None,
+    device_index: int | None = None,
 ) -> PrefillAttentionOpSpec:
     query_heads, kv_heads, head_dim, activation_dtype = _resolve_mha_local_shape(
         config,
@@ -117,6 +151,22 @@ def build_mha_prefill_attention_spec(
                 score_config.flashprefill_v2_use_mean_correction
             ),
         )
+    quest_prefill_page_size = getattr(score_config, "quest_chunk_size", None)
+    shadowkv_prefill_page_size = _resolve_shadowkv_prefill_page_size(
+        normalized_method,
+        device_index=device_index,
+    )
+    dense_prefill_page_size = _resolve_dense_prefill_page_size(
+        normalized_method,
+        device_index=device_index,
+    )
+    prefill_page_size = 1
+    if normalized_method == "quest" and quest_prefill_page_size is not None:
+        prefill_page_size = int(quest_prefill_page_size)
+    elif normalized_method == "shadowkv":
+        prefill_page_size = shadowkv_prefill_page_size
+    elif normalized_method in {"", "vanilla"}:
+        prefill_page_size = dense_prefill_page_size
     return PrefillAttentionOpSpec(
         num_query_heads=query_heads,
         num_kv_heads=kv_heads,
@@ -124,7 +174,10 @@ def build_mha_prefill_attention_spec(
         activation_dtype=activation_dtype,
         softmax_scale=head_dim**-0.5,
         causal=True,
-        page_size=1,
+        # QuEST and Blackwell ShadowKV store token slots in contiguous native
+        # pages.  Other devices retain token-page semantics for the portable
+        # providers.
+        page_size=prefill_page_size,
         score_output=contract.main_score_kind,
         layer_varying_page_table=contract.layer_varying_page_table,
         return_softmax_lse=(
@@ -154,6 +207,7 @@ def build_mha_prefill_attention_op(
             sparse_method=sparse_method,
             attention_tp_size=attention_tp_size,
             runtime_config=runtime_config,
+            device_index=int(device.index or 0),
         ),
         device_index=int(device.index or 0),
     )
@@ -173,6 +227,40 @@ def build_mha_decode_attention_spec(
         attention_tp_size=attention_tp_size,
     )
     normalized_method = normalize_sparse_method(sparse_method)
+    shadowkv_compact_width = None
+    if normalized_method == "shadowkv":
+        chunk_size = int(getattr(runtime_config, "shadowkv_chunk_size", 8) or 8)
+        sparse_budget = int(
+            getattr(runtime_config, "shadowkv_sparse_budget", 2048) or 2048
+        )
+        outlier_chunks_per_head = resolve_shadowkv_outlier_chunks(
+            sparse_budget,
+            getattr(runtime_config, "shadowkv_outlier_chunks", None),
+        )
+        local_chunks = int(
+            getattr(runtime_config, "shadowkv_local_chunks", 4) or 4
+        )
+        recent_tokens = int(
+            getattr(runtime_config, "shadowkv_recent_tokens", 512) or 512
+        )
+        shadowkv_page_size = int(
+            getattr(runtime_config, "shadowkv_decode_page_size", 16) or 16
+        )
+        context_capacity = int(getattr(runtime_config, "max_model_len", 0) or 0)
+        # The explicit decode payload is flattened per (request, KV-head), so
+        # every head owns a fixed-size outlier region.  Do not multiply this
+        # width by ``kv_heads``: that would reserve space for a cross-head
+        # union even though the paged payload already separates heads.
+        outlier_chunks = outlier_chunks_per_head
+        raw_compact_width = (
+            outlier_chunks * chunk_size
+            + sparse_budget
+            + min(context_capacity, local_chunks * chunk_size + chunk_size - 1)
+            + min(context_capacity, recent_tokens)
+        )
+        shadowkv_compact_width = (
+            (raw_compact_width + shadowkv_page_size - 1) // shadowkv_page_size
+        ) * shadowkv_page_size
     requires_decode_scores = sparse_decode_attention_requires_scores(
         normalized_method
     )
@@ -183,6 +271,7 @@ def build_mha_decode_attention_spec(
         activation_dtype=activation_dtype,
         softmax_scale=head_dim**-0.5,
         max_batch_size=int(max_batch_size),
+        sparse_method=normalized_method,
         causal=True,
         page_size=(
             int(getattr(runtime_config, "quest_chunk_size", 16))
@@ -228,6 +317,22 @@ def build_mha_decode_attention_spec(
         full_layer_kivi_decode_num_stages=int(
             getattr(runtime_config, "full_layer_kivi_decode_num_stages", 3) or 3
         ),
+        shadowkv_compact_width=shadowkv_compact_width,
+        shadowkv_page_size=(
+            int(getattr(runtime_config, "shadowkv_decode_page_size", 16) or 16)
+            if normalized_method == "shadowkv"
+            else 16
+        ),
+        shadowkv_decode_backend=(
+            str(getattr(runtime_config, "shadowkv_decode_backend", "auto"))
+            if normalized_method == "shadowkv"
+            else "auto"
+        ),
+        shadowkv_flashinfer_backend=(
+            str(getattr(runtime_config, "shadowkv_flashinfer_backend", "auto"))
+            if normalized_method == "shadowkv"
+            else "auto"
+        ),
     )
 
 
@@ -268,6 +373,7 @@ def build_mha_full_attention_provider(
             sparse_method=sparse_method,
             attention_tp_size=attention_tp_size,
             runtime_config=runtime_config,
+            device_index=int(device.index or 0),
         ),
         decode=build_mha_decode_attention_spec(
             config,

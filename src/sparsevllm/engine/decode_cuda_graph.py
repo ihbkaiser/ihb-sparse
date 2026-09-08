@@ -433,13 +433,22 @@ class DecodeCudaGraphRunner:
             )
 
         real_batch_size = len(seqs)
+        is_long_text = self.is_long_text_batch(seqs, False)
         force_eager = getattr(self.cache_manager, "decode_graph_force_eager", None)
-        if force_eager is not None and force_eager():
+        force_eager_batch = getattr(
+            self.cache_manager, "decode_graph_force_eager_for_batch", None
+        )
+        if (
+            (force_eager is not None and force_eager())
+            or (
+                force_eager_batch is not None
+                and force_eager_batch(seqs, is_long_text=is_long_text)
+            )
+        ):
             self.force_eager_count += 1
             return self.run_eager_static(seqs), None
 
         graph_batch_size = self._select_graph_batch_size(real_batch_size)
-        is_long_text = self.is_long_text_batch(seqs, False)
         graph_path_id = self._graph_path_id(is_long_text)
         context_capacity = self._graph_path_capacity(
             seqs, is_long_text=is_long_text

@@ -466,6 +466,10 @@ class CacheManager(ABC):
             from .quest import QuestCacheManager
 
             return create_manager(QuestCacheManager)
+        if sparse_method == "shadowkv":
+            from .shadowkv import ShadowKVCacheManager
+
+            return create_manager(ShadowKVCacheManager)
         if sparse_method == "omnikv":
             from .omnikv import OmniKVCacheManager
 
@@ -1271,6 +1275,21 @@ class CacheManager(ABC):
 
     def decode_graph_force_eager(self) -> bool:
         """Whether this method should bypass graph replay for diagnostics."""
+        return False
+
+    def decode_graph_force_eager_for_batch(
+        self,
+        seqs: list[Sequence],
+        *,
+        is_long_text: bool,
+    ) -> bool:
+        """Optionally bypass graph replay for one semantic batch topology.
+
+        This is intentionally separate from ``decode_graph_force_eager``:
+        method owners can reject only a topology whose graph contract is not
+        valid while retaining graph execution for the validated path.
+        """
+        del seqs, is_long_text
         return False
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):

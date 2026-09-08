@@ -153,6 +153,20 @@ class FlashInferQuestPageSelectionProvider(QuestPageSelectionProvider):
             return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if spec.cuda_graph and not caps.supports_graph_capture:
             return SupportResult.unsupported("device does not support CUDA Graph capture")
+        # FlashInfer's deterministic/tie-broken page transform dispatches to
+        # FilteredTopK.  That path requires >=128 KiB of dynamic shared memory
+        # per SM; SM80/86/89 devices do not provide it and the public API only
+        # reports the failure asynchronously as cudaErrorNotSupported.  Keep
+        # provider resolution honest so Quest uses its exact torch/Triton
+        # route on those devices instead of failing in the first decode step.
+        if (
+            caps.compute_capability is not None
+            and caps.compute_capability < (9, 0)
+        ):
+            return SupportResult.unsupported(
+                "FlashInfer deterministic page-table top-k requires SM90+; "
+                f"got SM{caps.compute_capability[0]}{caps.compute_capability[1]}"
+            )
         supported, reason = flashinfer_top_k_page_table_transform_support()
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 

@@ -26,6 +26,8 @@ METHOD_ALIASES = {
     "r_kv": "rkv",
     "skip-kv": "skipkv",
     "skip_kv": "skipkv",
+    "shadow-kv": "shadowkv",
+    "shadow_kv": "shadowkv",
     # DeltaKV now has one public runtime.  The old names stay as aliases so old
     # config files still load, but all code routes through sparse_method="deltakv".
     "deltakv-less-memory": "deltakv",
@@ -45,6 +47,7 @@ CANONICAL_SPARSE_METHODS = {
     "rkv",
     "skipkv",
     "deltakv",
+    "shadowkv",
 }
 
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
@@ -178,6 +181,7 @@ _PREFILL_LAYER_VARYING_PAGE_TABLE = {
     "rkv": True,
     "skipkv": True,
     "deltakv": True,
+    "shadowkv": False,
 }
 if set(_PREFILL_LAYER_VARYING_PAGE_TABLE) != CANONICAL_SPARSE_METHODS:
     raise RuntimeError(
@@ -297,10 +301,18 @@ _MOE_SPARSE_METHODS = frozenset(
     {"", "streamingllm", "snapkv", "h2o", "pyramidkv", "omnikv", "quest", "rkv"}
 )
 
+_DENSE_SPARSE_METHODS = frozenset(CANONICAL_SPARSE_METHODS - {"shadowkv"})
+
 DENSE_MODEL_COMPATIBILITY = ModelRuntimeCompatibility(
-    sparse_methods=frozenset(CANONICAL_SPARSE_METHODS),
+    sparse_methods=_DENSE_SPARSE_METHODS,
     prefix_cache_methods=frozenset(PREFIX_CACHE_SUPPORTED_METHODS),
-    decode_graph_methods=frozenset(CANONICAL_SPARSE_METHODS),
+    decode_graph_methods=_DENSE_SPARSE_METHODS,
+)
+
+LLAMA_COMPATIBILITY = ModelRuntimeCompatibility(
+    sparse_methods=frozenset((*_DENSE_SPARSE_METHODS, "shadowkv")),
+    prefix_cache_methods=frozenset(PREFIX_CACHE_SUPPORTED_METHODS),
+    decode_graph_methods=frozenset((*_DENSE_SPARSE_METHODS, "shadowkv")),
 )
 
 QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
@@ -362,8 +374,9 @@ GEMMA4_COMPATIBILITY = ModelRuntimeCompatibility(
 MODEL_RUNTIME_COMPATIBILITY = {
     **{
         (model_type, ParallelMode.STANDARD): DENSE_MODEL_COMPATIBILITY
-        for model_type in ("qwen2", "qwen3", "qwen3_5", "llama")
+        for model_type in ("qwen2", "qwen3", "qwen3_5")
     },
+    ("llama", ParallelMode.STANDARD): LLAMA_COMPATIBILITY,
     ("qwen3_moe", ParallelMode.STANDARD): QWEN3_MOE_EP_COMPATIBILITY,
     ("qwen3_moe", ParallelMode.OUTER_TP_MOE): QWEN3_MOE_TP_EP_COMPATIBILITY,
     ("qwen3_5_moe", ParallelMode.STANDARD): QWEN35_MOE_COMPATIBILITY,
@@ -414,6 +427,11 @@ def decode_sparse_long_text_threshold(
 def decode_graph_path_id(method: str, is_long_text: bool) -> str:
     """Identify one graph-stable decode topology family."""
     method = str(method or "")
+    if method == "shadowkv":
+        # ShadowKV's fixed-width view is valid for both short and long
+        # contexts; keeping one path avoids a startup capture at prompt_len=1
+        # that cannot amortize the factorization workspace.
+        return "shadowkv"
     if not method:
         return "dense"
     return "long" if is_long_text else "short"
@@ -430,6 +448,7 @@ _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "rkv": PREFILL_POLICY_ALL_CHUNKED,
     "skipkv": PREFILL_POLICY_ALL_CHUNKED,
     "deltakv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    "shadowkv": PREFILL_POLICY_ALL_CHUNKED,
 }
 
 PREFILL_POLICY_BY_METHOD = {

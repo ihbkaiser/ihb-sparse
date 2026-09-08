@@ -17,6 +17,7 @@ as a lightweight source-tree map.
 | `simulated_deep_research/` | `run.py` | Synthetic multi-round main-agent/subagent workload through the non-uniform OpenAI smart router. |
 | `multimodal/` | `video_qa/`, `image_qa/` | Video QA and image QA benchmark runners. |
 | `ruler_vt/` | `pred.py`, `tasks.py` | Self-contained RULER core runner for NIAH retrieval, variable tracking, CWE, and FWE; the historical directory name is retained for compatibility. |
+| `kvpress_ruler/` | `evaluate.py` | NVIDIA/kvpress-compatible RULER artifact runner for native QuEST and ShadowKV; requires a local model path and emits auditable JSONL/JSON artifacts. |
 | `niah/` | `test_niah.py`, `gen_niah.py` | Needle-in-a-haystack generation and evaluation utility. |
 | `sparsevllm_regression/` | `run_suite.py` | Fixed LongBench v1/v2, RULER quality, performance, and stress regression harness. |
 

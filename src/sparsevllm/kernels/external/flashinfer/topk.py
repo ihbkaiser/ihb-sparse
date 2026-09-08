@@ -63,6 +63,15 @@ def _top_k_page_table_transform():
 
 
 def flashinfer_top_k_page_table_transform_support() -> tuple[bool, str]:
+    if not torch.cuda.is_available():
+        return False, "FlashInfer fused top-k requires CUDA"
+    compute_capability = torch.cuda.get_device_capability()
+    if tuple(compute_capability) < (9, 0):
+        return (
+            False,
+            "FlashInfer deterministic page-table top-k requires SM90+; "
+            f"got SM{compute_capability[0]}{compute_capability[1]}",
+        )
     _, reason = _top_k_page_table_transform()
     return True, reason
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -23,6 +24,7 @@ from sparsevllm.operators.attention_capabilities import (
 from sparsevllm.operators.flashinfer_decode_state import (
     FlashInferPagedDecodeGraphState as _FlashInferPagedDecodeGraphState,
     FlashInferPagedDecodeState as _FlashInferPagedDecodeState,
+    FlashInferShadowKVPerHeadState as _FlashInferShadowKVPerHeadState,
 )
 from sparsevllm.operators.registry import (
     OpRegistry,
@@ -98,6 +100,11 @@ class DecodeAttentionOpSpec:
     full_layer_kivi_decode_block_n: int = 16
     full_layer_kivi_decode_num_warps: int = 2
     full_layer_kivi_decode_num_stages: int = 3
+    sparse_method: str | None = None
+    shadowkv_compact_width: int | None = None
+    shadowkv_page_size: int = 16
+    shadowkv_decode_backend: str = "auto"
+    shadowkv_flashinfer_backend: str = "auto"
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -117,6 +124,24 @@ class DecodeAttentionOpSpec:
             )
         if self.context_capacity is not None and self.context_capacity <= 0:
             raise ValueError("Decode attention context_capacity must be positive.")
+        if self.shadowkv_compact_width is not None and self.shadowkv_compact_width <= 0:
+            raise ValueError("ShadowKV compact payload width must be positive.")
+        if self.shadowkv_page_size <= 0:
+            raise ValueError("ShadowKV physical page size must be positive.")
+        if self.shadowkv_decode_backend not in {"auto", "flashinfer", "triton"}:
+            raise ValueError(
+                "ShadowKV decode backend must be 'auto', 'flashinfer', or 'triton'."
+            )
+        if self.shadowkv_flashinfer_backend not in {
+            "auto",
+            "fa2",
+            "fa3",
+            "cute-dsl",
+        }:
+            raise ValueError(
+                "ShadowKV FlashInfer backend must be one of 'auto', 'fa2', 'fa3', "
+                "or 'cute-dsl'."
+            )
         if (
             self.sparse_context_budget is not None
             and self.sparse_context_budget <= 0
@@ -281,6 +306,21 @@ def build_graph_stable_decode_launch_plan(
     # The grid is derived from the configured capacity, never the current
     # request length. Capping the envelope bounds workspace and empty programs;
     # each replay derives its effective split count from device context_lens.
+    # ShadowKV already materializes a bounded compact payload. A smaller,
+    # wider split envelope avoids launching the generic long-context grid for
+    # every layer while preserving the fixed-grid contract.
+    if spec.sparse_method == "shadowkv":
+        return GraphStableDecodeLaunchPlan(
+            plan_id="shadowkv_fixed_grid_v1",
+            context_capacity=int(spec.context_capacity),
+            max_kv_splits=4,
+            target_tokens_per_split=1024,
+            block_n=128,
+            stage1_num_warps=4,
+            stage1_num_stages=2,
+            stage2_num_warps=4,
+            stage2_num_stages=2,
+        )
     max_kv_splits = min(
         64,
         max(16, math.ceil(int(spec.context_capacity) / 4096)),
@@ -330,6 +370,7 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
             "flashinfer_paged_decode",
         ),
         repo_portable=(
+            "flashinfer_shadowkv_per_head_decode",
             "triton_paged_decode",
             "triton_fixed_grid_paged_decode",
         ),
@@ -365,6 +406,12 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.sparse_method == "shadowkv":
+            return SupportResult.unsupported(
+                "ShadowKV uses per-KV-head compact positions; the SGL FA3 "
+                "page-table contract has one shared token table per request. "
+                "Use the repository head-aware Triton provider."
+            )
         if spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "does not support mixed dense and full-layer KIVI int4 storage"
@@ -523,6 +570,12 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.sparse_method == "shadowkv":
+            return SupportResult.unsupported(
+                "ShadowKV uses per-KV-head compact positions; FlashInfer's "
+                "paged decode contract has one shared page table per request. "
+                "Use the repository head-aware Triton provider."
+            )
         if spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "does not support mixed dense and full-layer KIVI int4 storage"
@@ -746,6 +799,283 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
 
 
 @DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
+class FlashInferShadowKVPerHeadDecodeAttentionProvider(DecodeAttentionProvider):
+    """Use FlashInfer by flattening each ``(request, KV head)`` into a row."""
+
+    name = "flashinfer_shadowkv_per_head_decode"
+    decode_graph_lifecycle = True
+    supports_decode_graph = True
+    capabilities = FlashInferPagedDecodeAttentionProvider.capabilities
+
+    def __init__(self) -> None:
+        self._state: _FlashInferShadowKVPerHeadState | None = None
+        self._active_graph_state: _FlashInferShadowKVPerHeadState | None = None
+        self._spec: DecodeAttentionOpSpec | None = None
+
+    @classmethod
+    def supports(
+        cls,
+        spec: DecodeAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        if spec.sparse_method != "shadowkv":
+            return SupportResult.unsupported("reserved for ShadowKV per-head payloads")
+        if spec.shadowkv_decode_backend == "triton":
+            return SupportResult.unsupported(
+                "ShadowKV decode backend explicitly requests Triton."
+            )
+        flashinfer_backend = spec.shadowkv_flashinfer_backend
+        if flashinfer_backend == "auto":
+            if (
+                caps.compute_capability is not None
+                and int(caps.compute_capability[0]) >= 10
+            ):
+                flashinfer_backend = "cute-dsl"
+            elif spec.cuda_graph:
+                return SupportResult.unsupported(
+                    "ShadowKV per-head CUDA Graph requires FlashInfer CuTe DSL "
+                    "on Blackwell; use triton or disable decode_graph."
+                )
+        if flashinfer_backend == "cute-dsl" and (
+            caps.compute_capability is None
+            or int(caps.compute_capability[0]) < 10
+        ):
+            return SupportResult.unsupported(
+                "ShadowKV FlashInfer CuTe DSL requires Blackwell SM100+."
+            )
+        if flashinfer_backend == "cute-dsl" and spec.shadowkv_page_size not in {
+            8,
+            16,
+            32,
+            64,
+        }:
+            return SupportResult.unsupported(
+                "ShadowKV FlashInfer CuTe DSL requires physical page size in "
+                "{8, 16, 32, 64}."
+            )
+        if spec.cuda_graph and flashinfer_backend != "cute-dsl":
+            return SupportResult.unsupported(
+                "ShadowKV per-head CUDA Graph requires the graph-safe CuTe DSL "
+                f"backend, got {flashinfer_backend!r}."
+            )
+        if spec.page_size != 1:
+            return SupportResult.unsupported("requires token-page payloads")
+        if spec.shadowkv_compact_width is None:
+            return SupportResult.unsupported(
+                "requires a statically configured ShadowKV compact payload width"
+            )
+        common = match_attention_capabilities(
+            spec.kernel_request,
+            caps,
+            cls.capabilities,
+        )
+        if not common.supported:
+            return common
+        supported, reason = flashinfer_paged_decode_support()
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
+
+    def prepare(
+        self,
+        spec: DecodeAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        if spec.shadowkv_compact_width is None:
+            raise RuntimeError("ShadowKV FlashInfer requires compact payload width.")
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        current_device = torch.cuda.current_device()
+        if int(device_index) != current_device:
+            raise RuntimeError(
+                "ShadowKV FlashInfer decode must be prepared on the selected CUDA device: "
+                f"selected={device_index} current={current_device}."
+            )
+        self._spec = spec
+        if not spec.cuda_graph:
+            self._state = _FlashInferShadowKVPerHeadState(
+                spec,
+                batch_capacity=spec.max_batch_size,
+                payload_width=int(spec.shadowkv_compact_width),
+                device=torch.device("cuda", int(device_index)),
+                use_cuda_graph=False,
+            )
+            self._state.prepare_plan(spec)
+
+    def close(self) -> None:
+        self._state = None
+        self._active_graph_state = None
+        self._spec = None
+
+    def binding_metadata(self) -> dict[str, object]:
+        state = self._active_graph_state or self._state
+        return {
+            "implementation_kind": "portable_external_adapter",
+            "implementation_source": "flashinfer-python",
+            "kernel_path": "flashinfer.BatchDecodeWithPagedKVCacheWrapper",
+            "payload_contract": "flattened_(request,kv_head)_rows",
+            "page_size": (
+                int(self._spec.shadowkv_page_size)
+                if self._spec is not None
+                else 16
+            ),
+            "cuda_graph": True,
+            "graph_metadata": "device-packed per-head page table",
+            "flashinfer_backend": (
+                state.flashinfer_backend
+                if state is not None
+                else (
+                    self._spec.shadowkv_flashinfer_backend
+                    if self._spec is not None
+                    else "auto"
+                )
+            ),
+        }
+
+    def init_decode_graph_state(
+        self,
+        spec: DecodeAttentionOpSpec,
+        contract,
+        inputs,
+    ) -> _FlashInferShadowKVPerHeadState:
+        if not spec.cuda_graph:
+            raise RuntimeError("ShadowKV FlashInfer graph state requires CUDA Graph mode.")
+        if spec.shadowkv_compact_width is None:
+            raise RuntimeError("ShadowKV FlashInfer requires compact payload width.")
+        if int(contract.batch_capacity) > int(spec.max_batch_size):
+            raise ValueError(
+                "ShadowKV FlashInfer graph batch exceeds operator capacity: "
+                f"graph={contract.batch_capacity} operator={spec.max_batch_size}."
+            )
+        state = _FlashInferShadowKVPerHeadState(
+            spec,
+            batch_capacity=int(contract.batch_capacity),
+            payload_width=int(spec.shadowkv_compact_width),
+            device=inputs.context_lens.device,
+            use_cuda_graph=True,
+        )
+        return state
+
+    def prepare_decode_graph_out(
+        self,
+        state: _FlashInferShadowKVPerHeadState,
+    ) -> None:
+        if self._spec is None:
+            raise RuntimeError("ShadowKV FlashInfer provider was not prepared.")
+        self._active_graph_state = state
+        state.prepare_plan(self._spec)
+
+    def prepare_decode_graph_in(
+        self,
+        state: _FlashInferShadowKVPerHeadState,
+    ) -> None:
+        self._active_graph_state = state
+
+    def decode_graph_keepalive_tensors(
+        self,
+        state: _FlashInferShadowKVPerHeadState,
+    ) -> list[torch.Tensor]:
+        return state.keepalive_tensors()
+
+    def close_decode_graph_state(
+        self,
+        state: _FlashInferShadowKVPerHeadState,
+    ) -> None:
+        if self._active_graph_state is state:
+            self._active_graph_state = None
+
+    def run(
+        self,
+        spec: DecodeAttentionOpSpec,
+        q: torch.Tensor,
+        view: Any,
+        **kwargs,
+    ) -> torch.Tensor:
+        kwargs.pop("decode_launch_op", None)
+        if kwargs:
+            raise TypeError(
+                "ShadowKV FlashInfer decode received unsupported runtime arguments: "
+                f"{sorted(kwargs)}."
+            )
+        payload = view.payload
+        if getattr(payload, "backend", None) != "shadowkv_per_head":
+            raise RuntimeError(
+                "ShadowKV FlashInfer decode requires a per-head payload, got "
+                f"{getattr(payload, 'backend', None)!r}."
+            )
+        metadata = payload.metadata or {}
+        head_lens = metadata.get("head_context_lens")
+        if not isinstance(head_lens, torch.Tensor):
+            raise RuntimeError("ShadowKV payload is missing head_context_lens metadata.")
+        if q.dtype != spec.activation_dtype:
+            raise TypeError(
+                f"ShadowKV FlashInfer expected {spec.activation_dtype} Q, got {q.dtype}."
+            )
+        if payload.k_cache.dtype != q.dtype or payload.v_cache.dtype != q.dtype:
+            raise TypeError("ShadowKV FlashInfer requires matching Q/K/V dtypes.")
+        if q.ndim != 3 or q.shape[1] != spec.num_query_heads:
+            raise ValueError("ShadowKV FlashInfer expects Q[batch, query_heads, head_dim].")
+        batch_size = int(q.shape[0])
+        payload_width = int(payload.k_cache.shape[2])
+        if spec.shadowkv_compact_width != payload_width:
+            raise ValueError(
+                "ShadowKV FlashInfer payload width changed after provider preparation: "
+                f"payload={payload_width} spec={spec.shadowkv_compact_width}."
+            )
+        state = self._active_graph_state if spec.cuda_graph else self._state
+        if state is None:
+            raise RuntimeError("ShadowKV FlashInfer decode state is not active.")
+        state_batch = int(state.batch_capacity)
+        if batch_size > state_batch:
+            raise ValueError(
+                f"ShadowKV FlashInfer batch={batch_size} exceeds state={state_batch}."
+            )
+        if spec.cuda_graph and batch_size != state_batch:
+            raise RuntimeError(
+                "ShadowKV FlashInfer CUDA Graph requires the captured batch capacity: "
+                f"batch={batch_size} capacity={state_batch}."
+            )
+        if tuple(head_lens.shape) != (batch_size, spec.num_kv_heads):
+            raise ValueError(
+                "ShadowKV FlashInfer head lengths disagree with the payload batch."
+            )
+        if not head_lens.is_contiguous():
+            raise ValueError("ShadowKV FlashInfer head lengths must be contiguous.")
+        if not spec.cuda_graph and int(state.planned_rows) != batch_size * spec.num_kv_heads:
+            state.prepare_plan(spec, batch_size=batch_size)
+        state.pack(head_lens, batch_size=batch_size)
+        group_size = int(spec.num_query_heads // spec.num_kv_heads)
+        q_flat = q.view(batch_size, spec.num_kv_heads, group_size, spec.head_dim).reshape(
+            batch_size * spec.num_kv_heads, group_size, spec.head_dim
+        )
+        k_pages = payload.k_cache.view(
+            -1, state.page_size, 1, spec.head_dim
+        )
+        v_pages = payload.v_cache.view_as(k_pages)
+        output_flat = state.output[: batch_size * spec.num_kv_heads]
+        trace = os.environ.get("SPARSEVLLM_SHADOWKV_TRACE", "0") == "1"
+        if trace:
+            logger.info(
+                "ShadowKV FlashInfer trace run batch={} rows={} width={} lens_shape={} graph={}",
+                batch_size,
+                batch_size * spec.num_kv_heads,
+                payload_width,
+                tuple(head_lens.shape),
+                bool(torch.cuda.is_current_stream_capturing()),
+            )
+        result = state.wrapper.run(
+            q_flat,
+            (k_pages, v_pages),
+            out=output_flat,
+            return_lse=False,
+        )
+        if trace:
+            logger.info("ShadowKV FlashInfer trace run_done")
+        if not isinstance(result, torch.Tensor) or result.data_ptr() != output_flat.data_ptr():
+            raise RuntimeError("ShadowKV FlashInfer did not write its supplied output.")
+        return output_flat.view(batch_size, spec.num_kv_heads, group_size, spec.head_dim).reshape_as(q)
+
+
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     name = "triton_paged_decode"
     capabilities = AttentionKernelCapabilities(
@@ -825,6 +1155,56 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         cache_manager = context.cache_manager
         layer_idx = int(context.now_layer_idx)
         meta = view.meta
+        payload = getattr(view, "payload", None)
+        if payload is not None and getattr(payload, "backend", None) == "shadowkv_per_head":
+            metadata = payload.metadata or {}
+            head_context_lens = metadata.get("head_context_lens")
+            if not isinstance(head_context_lens, torch.Tensor):
+                raise RuntimeError(
+                    "ShadowKV per-head payload is missing head_context_lens metadata."
+                )
+            max_context_len = meta.max_context_len
+            if max_context_len is None:
+                raise RuntimeError(
+                    "ShadowKV per-head decode requires a compact payload width."
+                )
+            block_seq = cache_manager.get_decode_block_seq(layer_idx, 256)
+            if decode_launch_op is not None:
+                block_seq, gqa_block_n, gqa_num_warps = decode_launch_op.launch_config(
+                    block_seq=block_seq,
+                    max_context_len=int(max_context_len),
+                    requires_attention_scores=False,
+                )
+            else:
+                gqa_block_n, gqa_num_warps = 128, 4
+            num_seq_blocks = (int(max_context_len) + block_seq - 1) // block_seq
+            mid_o, mid_lse = get_decode_workspace(
+                context,
+                int(q.shape[0]),
+                spec.num_query_heads,
+                num_seq_blocks,
+                spec.head_dim,
+                q.device,
+            )
+            from sparsevllm.kernels.triton.shadowkv_per_head_decode import (
+                shadowkv_per_head_decode,
+            )
+
+            return shadowkv_per_head_decode(
+                q,
+                payload.k_cache,
+                payload.v_cache,
+                head_context_lens,
+                mid_o,
+                mid_lse,
+                softmax_scale=spec.softmax_scale,
+                target_tokens_per_split=int(block_seq),
+                block_n=int(gqa_block_n),
+                num_warps=int(gqa_num_warps),
+                num_stages=2,
+                stage2_num_warps=int(gqa_num_warps),
+                stage2_num_stages=2,
+            )
         max_context_len = meta.max_context_len
         static_cap = getattr(cache_manager, "_decode_static_max_context_len", None)
         if static_cap is not None:
@@ -925,6 +1305,14 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> SupportResult:
         if not spec.cuda_graph:
             return SupportResult.unsupported("reserved for CUDA Graph")
+        if spec.sparse_method == "shadowkv":
+            if spec.shadowkv_decode_backend == "flashinfer":
+                return SupportResult.unsupported(
+                    "ShadowKV decode backend explicitly requests FlashInfer."
+                )
+            # ``auto`` keeps FlashInfer first in the portfolio; ``triton`` is
+            # an explicit graph-provider ablation for the per-head payload.
+            # The run method below owns the matching semantic adapter.
         if spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "full-layer KIVI int4 requires the DeltaKV fixed-grid provider"
@@ -1012,6 +1400,34 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         ):
             raise RuntimeError("Fixed-grid decode provider was not prepared.")
         payload = view.payload
+        if getattr(payload, "backend", None) == "shadowkv_per_head":
+            metadata = payload.metadata or {}
+            head_context_lens = metadata.get("head_context_lens")
+            if not isinstance(head_context_lens, torch.Tensor):
+                raise RuntimeError(
+                    "ShadowKV per-head payload is missing head_context_lens metadata."
+                )
+            from sparsevllm.kernels.triton.shadowkv_per_head_decode import (
+                shadowkv_per_head_decode,
+            )
+
+            return shadowkv_per_head_decode(
+                q,
+                payload.k_cache,
+                payload.v_cache,
+                head_context_lens,
+                self._mid_o[: int(q.shape[0])],
+                self._mid_lse[: int(q.shape[0])],
+                softmax_scale=spec.softmax_scale,
+                target_tokens_per_split=self.launch_plan.target_tokens_per_split,
+                block_n=self.launch_plan.block_n,
+                num_warps=self.launch_plan.stage1_num_warps,
+                num_stages=self.launch_plan.stage1_num_stages,
+                stage2_num_warps=self.launch_plan.stage2_num_warps,
+                stage2_num_stages=self.launch_plan.stage2_num_stages,
+                output_lse=self._softmax_lse[:, : int(q.shape[0])],
+                return_softmax_lse=spec.h2o_layerwise_probability_scores,
+            )
         if getattr(payload, "backend", None) != "dense":
             raise RuntimeError(
                 "Fixed-grid decode requires dense explicit KV storage."

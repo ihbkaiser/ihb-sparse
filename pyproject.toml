@@ -49,13 +49,13 @@ dependencies = [
 [project.optional-dependencies]
 cu129 = [
     "torch==2.11.0",
-    "flashinfer-python[cu12]>=0.6.15,<0.7",
-    "flashinfer-jit-cache>=0.6.15,<0.7",
+    "flashinfer-python[cu12]>=0.6.18.post1,<0.7",
+    "flashinfer-jit-cache>=0.6.18.post1,<0.7",
 ]
 cu130 = [
     "torch==2.11.0",
-    "flashinfer-python[cu13]>=0.6.15,<0.7",
-    "flashinfer-jit-cache>=0.6.15,<0.7",
+    "flashinfer-python[cu13]>=0.6.18.post1,<0.7",
+    "flashinfer-jit-cache>=0.6.18.post1,<0.7",
 ]
 
 [project.scripts]
@@ -70,6 +70,9 @@ include = ["sparsevllm*"]
 [tool.setuptools.package-data]
 sparsevllm = [
     "configs/profiles/*.json",
+    "kernels/cuda/*.cu",
+    "kernels/cuda/*.h",
+    "kernels/cuda/shadowkv_cutlass/*.h",
     "kernels/triton/profiles/*.json",
     "operators/profiles/*.json",
 ]

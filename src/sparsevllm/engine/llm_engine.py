@@ -18,10 +18,14 @@ from sparsevllm.utils.log import logger
 import sys
 import time
 
-from sparsevllm.configs.cuda_graph import build_decode_cuda_graph_startup_plan
+from sparsevllm.configs.cuda_graph import (
+    build_decode_cuda_graph_profile_plan,
+    build_decode_cuda_graph_startup_plan,
+)
 
 from sparsevllm.config import Config
 from sparsevllm.kernels.external.required import (
+    config_requires_sgl_kernel,
     validate_required_cuda_kernel_metadata,
 )
 from sparsevllm.method_registry import decode_graph_path_id
@@ -213,7 +217,10 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.config = config
         if platforms.get_current_platform().enum is PlatformEnum.CUDA:
-            validate_required_cuda_kernel_metadata()
+            if config_requires_sgl_kernel(config):
+                validate_required_cuda_kernel_metadata()
+            else:
+                validate_required_cuda_kernel_metadata(require_sgl=False)
         
         # 初始化 Profiler
         profiler.set_enabled(config.enable_profiler)
@@ -397,10 +404,15 @@ class LLMEngine:
         prompt_offset: int,
         *,
         respect_runtime_capacity: bool = False,
+        memory_profile_only: bool = False,
     ) -> int:
         if not bool(getattr(self.config, "decode_graph_startup_capture", False)):
             return prompt_offset
-        startup_plan = build_decode_cuda_graph_startup_plan(self.config)
+        startup_plan = (
+            build_decode_cuda_graph_profile_plan(self.config)
+            if memory_profile_only
+            else build_decode_cuda_graph_startup_plan(self.config)
+        )
         skipped_plan = []
         if respect_runtime_capacity:
             plan_records = self.model_runner.call(
@@ -436,11 +448,12 @@ class LLMEngine:
         short_graphs = sum(not is_long for _, _, is_long in startup_plan)
         logger.info(
             "Startup CUDA Graph capture: graphs={} short={} long={} "
-            "skipped_for_kv_capacity={}.",
+            "skipped_for_kv_capacity={} memory_profile_only={}.",
             len(startup_plan),
             short_graphs,
             len(startup_plan) - short_graphs,
             len(skipped_plan),
+            memory_profile_only,
         )
         logger.debug("Startup CUDA Graph capture plan: {}.", startup_plan)
         capture_params = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
@@ -493,12 +506,16 @@ class LLMEngine:
         self.model_runner.call("collect_decode_cuda_graph_metadata")
         self.model_runner.call("exchange_decode_cuda_graph_metadata")
         self.model_runner.call("register_decode_cuda_graph_buffers")
+        # The profiling runtime is destroyed immediately afterwards, but the
+        # collective runtime still requires the capture lifecycle to reach its
+        # sealed state before it can reset for production recapture.
         self.model_runner.call("seal_decode_cuda_graph_startup_plan")
         logger.info(
-            "Startup CUDA Graph capture complete: cached={} capture_count={} replay_count={}.",
+            "Startup CUDA Graph capture complete: cached={} capture_count={} replay_count={} memory_profile_only={}.",
             len(captured),
             graph_runner.capture_count,
             graph_runner.replay_count,
+            memory_profile_only,
         )
         return prompt_offset
 
@@ -540,7 +557,10 @@ class LLMEngine:
 
         logger.info("Startup profile phase=cuda_graph.")
         self.model_runner.call("begin_startup_memory_profile", "cuda_graph")
-        prompt_offset = self._capture_startup_decode_graphs(prompt_offset)
+        prompt_offset = self._capture_startup_decode_graphs(
+            prompt_offset,
+            memory_profile_only=True,
+        )
         self._after_warmup_debug_cleanup()
         graph_records = self.model_runner.call(
             "finish_startup_memory_profile",

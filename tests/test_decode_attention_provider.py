@@ -21,12 +21,15 @@ from sparsevllm.operators.decode_attention import (
     DecodeAttentionRunResult,
     DecodeAttentionOpSpec,
     FlashInferPagedDecodeAttentionProvider,
+    FlashInferShadowKVPerHeadDecodeAttentionProvider,
     FixedGridTritonPagedDecodeAttentionProvider,
     H100GqaDecodeLaunchProvider,
     PreparedDecodeAttentionOp,
     SglFa3PagedDecodeAttentionProvider,
     TritonPagedDecodeAttentionProvider,
     _FlashInferPagedDecodeGraphState,
+    _FlashInferShadowKVPerHeadState,
+    build_graph_stable_decode_launch_plan,
 )
 from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
@@ -46,6 +49,7 @@ from sparsevllm.platforms import DeviceCaps, PlatformEnum
         ("omnikv", True),
         ("skipkv", True),
         ("deltakv", True),
+        ("shadowkv", False),
     ],
 )
 def test_sparse_decode_score_contract_is_method_specific(
@@ -151,6 +155,109 @@ def test_quest_decode_spec_uses_physical_cache_page_size():
     )
 
     assert spec.page_size == runtime_config.quest_chunk_size
+
+
+def test_shadowkv_decode_spec_matches_per_head_outlier_payload_capacity():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        dtype=torch.bfloat16,
+    )
+    runtime_config = SimpleNamespace(
+        max_model_len=4352,
+        shadowkv_chunk_size=8,
+        shadowkv_sparse_budget=2048,
+        shadowkv_outlier_chunks=48,
+        shadowkv_local_chunks=4,
+        shadowkv_recent_tokens=512,
+    )
+
+    spec = build_mha_decode_attention_spec(
+        config,
+        sparse_method="shadowkv",
+        attention_tp_size=1,
+        max_batch_size=16,
+        cuda_graph=True,
+        runtime_config=runtime_config,
+    )
+
+    raw_width = 48 * 8 + 2048 + 39 + 512
+    assert spec.shadowkv_compact_width >= raw_width
+    assert spec.shadowkv_compact_width % spec.shadowkv_page_size == 0
+
+
+def test_shadowkv_decode_spec_derives_omitted_outlier_capacity():
+    """Keep an unnormalized runtime config compatible with the cache manager.
+
+    The evaluator passes a small runtime namespace rather than the fully
+    normalized engine config.  This catches the previous payload-width split,
+    which only appeared when that namespace omitted outlier_chunks.
+    """
+
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        dtype=torch.bfloat16,
+    )
+    runtime_config = SimpleNamespace(
+        max_model_len=4352,
+        shadowkv_chunk_size=8,
+        shadowkv_sparse_budget=2048,
+        shadowkv_local_chunks=4,
+        shadowkv_recent_tokens=512,
+    )
+
+    spec = build_mha_decode_attention_spec(
+        config,
+        sparse_method="shadowkv",
+        attention_tp_size=1,
+        max_batch_size=16,
+        cuda_graph=False,
+        runtime_config=runtime_config,
+    )
+
+    expected_raw_width = 48 * 8 + 2048 + 39 + 512
+    expected_width = ((expected_raw_width + 15) // 16) * 16
+    assert spec.shadowkv_compact_width == expected_width
+
+
+def test_shadowkv_decode_backend_is_an_explicit_provider_contract():
+    triton_spec = _spec(
+        sparse_method="shadowkv",
+        layer_varying_page_table=True,
+        context_capacity=4096,
+        shadowkv_compact_width=256,
+        shadowkv_decode_backend="triton",
+    )
+    assert not FlashInferShadowKVPerHeadDecodeAttentionProvider.supports(
+        triton_spec, _cuda_caps()
+    ).supported
+    assert FixedGridTritonPagedDecodeAttentionProvider.supports(
+        triton_spec, _cuda_caps()
+    ).supported
+
+    flashinfer_spec = _spec(
+        sparse_method="shadowkv",
+        layer_varying_page_table=True,
+        context_capacity=4096,
+        shadowkv_compact_width=256,
+        shadowkv_decode_backend="flashinfer",
+    )
+    assert not FixedGridTritonPagedDecodeAttentionProvider.supports(
+        flashinfer_spec, _cuda_caps()
+    ).supported
+
+    auto_graph_spec = _spec(
+        sparse_method="shadowkv",
+        layer_varying_page_table=True,
+        context_capacity=4096,
+        shadowkv_compact_width=256,
+    )
+    assert not FlashInferShadowKVPerHeadDecodeAttentionProvider.supports(
+        auto_graph_spec, _cuda_caps()
+    ).supported
 
 
 def test_deltakv_kivi_decode_spec_carries_mixed_storage_contract():
@@ -379,6 +486,264 @@ def test_flashinfer_lse_decode_accepts_cuda_graph_contract():
 
     assert result.supported
     support.assert_called_once_with()
+
+
+def test_shadowkv_graph_uses_the_head_aware_flashinfer_adapter():
+    spec = _spec(
+        sparse_method="shadowkv",
+        context_capacity=4096,
+        shadowkv_compact_width=256,
+    )
+    caps = _cuda_caps(
+        device_name="NVIDIA B200",
+        compute_capability=(10, 0),
+    )
+
+    with patch(
+        "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support",
+        return_value=(True, "available"),
+    ):
+        result = FlashInferShadowKVPerHeadDecodeAttentionProvider.supports(spec, caps)
+
+    assert result.supported
+    resolved = OpResolver(DECODE_ATTENTION_REGISTRY).resolve(spec, caps)
+    assert isinstance(resolved.provider, FlashInferShadowKVPerHeadDecodeAttentionProvider)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shadowkv_cute_plan_passes_logical_lengths_as_seq_lens(monkeypatch):
+    """Protect the CuTe-DSL adapter from confusing seq_lens with last_page_len."""
+
+    calls = []
+
+    class FakeWrapper:
+        def __init__(
+            self,
+            workspace,
+            *,
+            use_cuda_graph,
+            paged_kv_indptr_buffer,
+            paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer,
+            backend,
+            **kwargs,
+        ):
+            del workspace, use_cuda_graph, backend, kwargs
+            self._paged_kv_indptr_buf = paged_kv_indptr_buffer
+            self._paged_kv_indices_buf = paged_kv_indices_buffer
+            self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+            self._kv_lens_buffer = torch.empty(
+                2 * 8, dtype=torch.int32, device="cuda"
+            )
+
+        def plan(self, indptr, indices, last_page_len, **kwargs):
+            calls.append(
+                {
+                    "indptr": indptr,
+                    "indices": indices,
+                    "last_page_len": last_page_len,
+                    "kwargs": kwargs,
+                }
+            )
+            self._paged_kv_indptr_buf = indptr
+            self._paged_kv_indices_buf = indices
+            self._paged_kv_last_page_len_buf = last_page_len
+
+    monkeypatch.setattr(
+        "sparsevllm.operators.flashinfer_decode_state.make_flashinfer_paged_decode_wrapper",
+        FakeWrapper,
+    )
+    spec = _spec(
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        max_batch_size=2,
+        sparse_method="shadowkv",
+        shadowkv_compact_width=64,
+        shadowkv_page_size=16,
+        shadowkv_flashinfer_backend="cute-dsl",
+        cuda_graph=True,
+    )
+    state = _FlashInferShadowKVPerHeadState(
+        spec,
+        batch_capacity=2,
+        payload_width=64,
+        device=torch.device("cuda"),
+        use_cuda_graph=True,
+        workspace_bytes=1,
+    )
+    state.prepare_plan(spec)
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert torch.equal(
+        call["last_page_len"].cpu(), torch.full((16,), 16, dtype=torch.int32)
+    )
+    assert (
+        call["kwargs"]["seq_lens"].data_ptr()
+        == state.host_seq_lens[:16].data_ptr()
+    )
+    assert call["kwargs"]["max_kv_len"] == 64
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shadowkv_flashinfer_per_head_eager_matches_attention_oracle():
+    supported, _ = flashinfer_paged_decode_support()
+    if not supported:
+        pytest.skip("FlashInfer paged decode is unavailable")
+    batch, kv_heads, groups, width, head_dim = 2, 8, 4, 64, 128
+    spec = _spec(
+        num_query_heads=kv_heads * groups,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        max_batch_size=batch,
+        sparse_method="shadowkv",
+        shadowkv_compact_width=width,
+        cuda_graph=False,
+    )
+    provider = FlashInferShadowKVPerHeadDecodeAttentionProvider()
+    provider.prepare(spec, device_index=torch.cuda.current_device())
+    try:
+        torch.manual_seed(20260907)
+        q = torch.randn(
+            batch, kv_heads * groups, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        k = torch.randn(
+            batch, kv_heads, width, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        v = torch.randn_like(k)
+        head_lens = torch.tensor(
+            [[64, 53, 41, 32, 27, 19, 11, 7], [60, 52, 40, 31, 25, 18, 10, 5]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        view = SimpleNamespace(
+            payload=SimpleNamespace(
+                backend="shadowkv_per_head",
+                metadata={"head_context_lens": head_lens},
+                k_cache=k,
+                v_cache=v,
+            )
+        )
+
+        # Exercise a smaller batch between two full-batch calls.  The state
+        # must re-plan on active-row changes, not only on capacity changes.
+        provider.run(spec, q[:1], SimpleNamespace(
+            payload=SimpleNamespace(
+                backend="shadowkv_per_head",
+                metadata={"head_context_lens": head_lens[:1]},
+                k_cache=k[:1],
+                v_cache=v[:1],
+            )
+        ))
+        actual = provider.run(spec, q, view)
+        expected = torch.empty_like(actual)
+        q_grouped = q.view(batch, kv_heads, groups, head_dim).float()
+        for batch_idx in range(batch):
+            for head_idx in range(kv_heads):
+                length = int(head_lens[batch_idx, head_idx].item())
+                logits = torch.matmul(
+                    q_grouped[batch_idx, head_idx],
+                    k[batch_idx, head_idx, :length].float().transpose(0, 1),
+                ) * spec.softmax_scale
+                weights = torch.softmax(logits, dim=-1)
+                value = torch.matmul(weights, v[batch_idx, head_idx, :length].float())
+                start = head_idx * groups
+                expected[batch_idx, start : start + groups] = value.to(expected.dtype)
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    finally:
+        provider.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 10,
+    reason="ShadowKV FlashInfer CUDA Graph requires Blackwell CuTe DSL",
+)
+def test_shadowkv_flashinfer_per_head_graph_replay_matches_attention_oracle():
+    supported, _ = flashinfer_paged_decode_support()
+    if not supported:
+        pytest.skip("FlashInfer paged decode is unavailable")
+    batch, kv_heads, groups, width, head_dim = 2, 8, 4, 64, 128
+    spec = _spec(
+        num_query_heads=kv_heads * groups,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        max_batch_size=batch,
+        sparse_method="shadowkv",
+        shadowkv_compact_width=width,
+        context_capacity=width,
+        cuda_graph=True,
+    )
+    provider = FlashInferShadowKVPerHeadDecodeAttentionProvider()
+    provider.prepare(spec, device_index=torch.cuda.current_device())
+    contract = DecodeGraphContract(
+        method="shadowkv",
+        topology_path_id="long",
+        batch_capacity=batch,
+        context_capacity=width,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cuda"),
+        pin_memory=False,
+    )
+    state = provider.init_decode_graph_state(spec, contract, inputs)
+    provider.prepare_decode_graph_out(state)
+    try:
+        torch.manual_seed(20260907)
+        q = torch.randn(
+            batch, kv_heads * groups, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        k = torch.randn(
+            batch, kv_heads, width, head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        v = torch.randn_like(k)
+        head_lens = torch.tensor(
+            [[64, 53, 41, 32, 27, 19, 11, 7], [60, 52, 40, 31, 25, 18, 10, 5]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        view = SimpleNamespace(
+            payload=SimpleNamespace(
+                backend="shadowkv_per_head",
+                metadata={"head_context_lens": head_lens},
+                k_cache=k,
+                v_cache=v,
+            )
+        )
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = provider.run(spec, q, view)
+        q.copy_(q.roll(shifts=1, dims=1))
+        k.copy_(k.roll(shifts=3, dims=2))
+        v.copy_(v.roll(shifts=5, dims=2))
+        head_lens.copy_(torch.tensor(
+            [[63, 51, 39, 30, 26, 17, 9, 6], [59, 50, 38, 29, 24, 16, 8, 4]],
+            dtype=torch.int32,
+            device="cuda",
+        ))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected = torch.empty_like(graph_output)
+        q_grouped = q.view(batch, kv_heads, groups, head_dim).float()
+        for batch_idx in range(batch):
+            for head_idx in range(kv_heads):
+                length = int(head_lens[batch_idx, head_idx].item())
+                logits = torch.matmul(
+                    q_grouped[batch_idx, head_idx],
+                    k[batch_idx, head_idx, :length].float().transpose(0, 1),
+                ) * spec.softmax_scale
+                weights = torch.softmax(logits, dim=-1)
+                value = torch.matmul(weights, v[batch_idx, head_idx, :length].float())
+                start = head_idx * groups
+                expected[batch_idx, start : start + groups] = value.to(expected.dtype)
+        torch.testing.assert_close(graph_output, expected, rtol=3e-2, atol=3e-2)
+    finally:
+        provider.close_decode_graph_state(state)
+        provider.close()
 
 
 def test_prepared_h2o_decode_applies_fixed_probability_scorer():

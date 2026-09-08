@@ -48,6 +48,44 @@ class SparseMethodConfig:
     quest_token_budget: int = field(init=False)
     quest_skip_layers: int = 2
 
+    # ShadowKV keeps value state on pinned host memory and reconstructs a small
+    # decode view from chunk landmarks and a low-rank key factorization.
+    shadowkv_sparse_budget: int = 2048
+    shadowkv_rank: int = 160
+    shadowkv_chunk_size: int = 8
+    shadowkv_local_chunks: int = 4
+    shadowkv_outlier_chunks: int | None = None
+    shadowkv_recent_tokens: int = 512
+    shadowkv_svd_batch_size: int = 4
+    shadowkv_svd_method: str = "exact"
+    shadowkv_svd_oversample: int = 16
+    shadowkv_svd_niter: int = 2
+    # ``auto`` keeps the portable PyTorch path unless a validated CUTLASS
+    # source tree is supplied through ``shadowkv_cutlass_root``.  ``cutlass``
+    # is explicit and fails fast when the external headers are unavailable.
+    shadowkv_kernel_backend: str = "auto"
+    shadowkv_cutlass_root: str | None = None
+    # Decode provider selection is explicit for ShadowKV because its per-head
+    # payload is a non-standard attention contract. ``auto`` preserves the
+    # provider portfolio; ``flashinfer`` and ``triton`` are useful for matched
+    # provider ablations and fail fast when unsupported.
+    shadowkv_decode_backend: str = "auto"
+    # FlashInfer's CUDA-core decoder plans the exact page-count topology.  The
+    # per-KV-head compact length changes during decode, so Blackwell uses the
+    # graph-safe FlashInfer CuTe DSL backend by default.
+    shadowkv_flashinfer_backend: str = "auto"
+    # Keep the original host-shadow implementation as the default.  The GPU
+    # cache mode is opt-in because it trades memory for lower decode latency.
+    shadowkv_storage: str = "cpu"
+    shadowkv_gpu_cache_tokens: int = 0
+    shadowkv_multistream_gather: bool = True
+    shadowkv_gather_copy_with_offsets: bool = True
+    # Physical page size used by the per-head FlashInfer compact payload.
+    # Keeping it separate from ``page_size`` preserves the logical token
+    # selection contract while avoiding the page-1 long-context workspace
+    # cliff on Blackwell.
+    shadowkv_decode_page_size: int = 16
+
     snapkv_window_size: int = 32
     snapkv_num_full_layers: int = 0
     sparse_prefill_score_mode: str | None = None

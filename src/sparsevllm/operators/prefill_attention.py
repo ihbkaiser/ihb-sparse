@@ -192,6 +192,7 @@ PREFILL_ATTENTION_REGISTRY: OpRegistry[
     "paged prefill attention",
     portfolio=PortfolioPolicy(
         upstream_standard=(
+            "flashinfer_paged_prefill_cutedsl_sm100",
             "sgl_fa3_paged_prefill_sm90",
             "flashinfer_paged_prefill_fa3_sm90",
             "flashinfer_paged_prefill_fa2_sm120",
@@ -334,15 +335,54 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
                 plan_scope=plan_scope,
             )
         output = torch.empty_like(q)
+        page_size = int(spec.page_size)
+        if int(payload.k_cache.shape[0]) % page_size:
+            raise ValueError(
+                "FlashInfer paged prefill KV capacity must be divisible by page_size: "
+                f"slots={int(payload.k_cache.shape[0])} page_size={page_size}."
+            )
+        if page_size == 1:
+            k_cache = payload.k_cache.unsqueeze(1)
+            v_cache = payload.v_cache.unsqueeze(1)
+        else:
+            k_cache = payload.k_cache.view(
+                -1, page_size, int(payload.k_cache.shape[1]), int(payload.k_cache.shape[2])
+            )
+            v_cache = payload.v_cache.view_as(k_cache)
         state.wrapper.run(
             q,
-            (
-                payload.k_cache.unsqueeze(1),
-                payload.v_cache.unsqueeze(1),
-            ),
+            (k_cache, v_cache),
             out=output,
         )
         return output
+
+
+@PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+class FlashInferCuteDslPagedPrefillAttentionProvider(
+    FlashInferPagedPrefillAttentionProvider
+):
+    """FlashInfer's Blackwell paged prefill backend for SM100/B200."""
+
+    name = "flashinfer_paged_prefill_cutedsl_sm100"
+    backend = "cute-dsl"
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(10, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({128}),
+        page_sizes=frozenset({16}),
+        score_outputs=frozenset({AttentionScoreKind.NONE}),
+        layer_varying_page_table=False,
+        varlen=True,
+        minimum_runtime_version=(13, 0),
+    )
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            **super().binding_metadata(),
+            "backend": self.backend,
+            "page_size": 16,
+        }
 
 
 class _FlashInferPagedPrefillState:
@@ -447,28 +487,48 @@ class _FlashInferPagedPrefillState:
                 "FlashInfer paged prefill max context is outside the active slot table: "
                 f"max_context_len={max_context_len} width={int(active_slots.shape[1])}."
             )
-        rows = active_slots.index_select(0, req_indices.to(torch.long))[
-            :, :max_context_len
-        ]
-        positions = torch.arange(
-            max_context_len,
-            device=context_lens.device,
-            dtype=context_lens.dtype,
-        )
-        valid = positions.unsqueeze(0) < context_lens.unsqueeze(1)
-        paged_kv_indices = rows.masked_select(valid).to(torch.int32).contiguous()
-        zero = torch.zeros(1, device=context_lens.device, dtype=torch.int32)
-        paged_kv_indptr = torch.cat(
-            (
-                zero,
-                context_lens.to(torch.int32).cumsum(0, dtype=torch.int32),
+        rows = active_slots.index_select(0, req_indices.to(torch.long))[:, :max_context_len]
+        page_size = int(spec.page_size)
+        if page_size == 1:
+            positions = torch.arange(
+                max_context_len,
+                device=context_lens.device,
+                dtype=context_lens.dtype,
             )
-        )
-        last_page_len = torch.ones(
-            batch_size,
-            device=context_lens.device,
-            dtype=torch.int32,
-        )
+            valid = positions.unsqueeze(0) < context_lens.unsqueeze(1)
+            paged_kv_indices = rows.masked_select(valid).to(torch.int32).contiguous()
+            page_counts = context_lens.to(torch.int32)
+            last_page_len = torch.ones(
+                batch_size,
+                device=context_lens.device,
+                dtype=torch.int32,
+            )
+        else:
+            page_positions = torch.arange(
+                0,
+                max_context_len,
+                page_size,
+                device=context_lens.device,
+                dtype=context_lens.dtype,
+            )
+            page_valid = page_positions.unsqueeze(0) < context_lens.unsqueeze(1)
+            page_starts = rows[:, ::page_size]
+            paged_kv_indices = torch.div(
+                page_starts.masked_select(page_valid),
+                page_size,
+                rounding_mode="floor",
+            ).to(torch.int32).contiguous()
+            page_counts = torch.div(
+                context_lens.to(torch.int32) + page_size - 1,
+                page_size,
+                rounding_mode="floor",
+            )
+            last_page_len = torch.remainder(
+                context_lens.to(torch.int32) - 1,
+                page_size,
+            ) + 1
+        zero = torch.zeros(1, device=context_lens.device, dtype=torch.int32)
+        paged_kv_indptr = torch.cat((zero, page_counts.cumsum(0, dtype=torch.int32)))
         plan_args = (
             qo_indptr,
             paged_kv_indptr,

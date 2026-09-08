@@ -16,3 +16,11 @@ wandb/
 /dev_docs/
 docs/dev-notes/
 /scratch
+
+# Local experiment artifacts and run metadata
+/remote_artifacts/
+/raw_samples.jsonl
+/request_samples.jsonl
+/run_manifest.json
+/run_status.json
+/summary.json

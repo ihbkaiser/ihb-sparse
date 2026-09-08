@@ -38,7 +38,7 @@ def _require_parameters(
 
 @lru_cache(maxsize=2)
 def _paged_prefill_wrapper_type(backend: str):
-    if backend not in {"fa2", "fa3"}:
+    if backend not in {"fa2", "fa3", "cute-dsl"}:
         raise ValueError(f"Unsupported FlashInfer prefill backend {backend!r}.")
     feature = f"{backend.upper()} paged prefill"
     _, reason = flashinfer_kernel_support(feature)

@@ -127,6 +127,7 @@ def make_flashinfer_paged_decode_wrapper(
     paged_kv_indptr_buffer: torch.Tensor | None = None,
     paged_kv_indices_buffer: torch.Tensor | None = None,
     paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+    backend: str = "auto",
 ):
     wrapper_type, _ = _paged_decode_wrapper_type()
     return wrapper_type(
@@ -136,7 +137,7 @@ def make_flashinfer_paged_decode_wrapper(
         paged_kv_indptr_buffer=paged_kv_indptr_buffer,
         paged_kv_indices_buffer=paged_kv_indices_buffer,
         paged_kv_last_page_len_buffer=paged_kv_last_page_len_buffer,
-        backend="auto",
+        backend=backend,
     )
 
 

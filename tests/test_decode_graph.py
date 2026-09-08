@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sparsevllm.configs.cuda_graph import (
+    build_decode_cuda_graph_profile_plan,
     build_decode_cuda_graph_startup_plan,
 )
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
@@ -91,6 +92,22 @@ def test_decode_graph_startup_plan_has_one_graph_per_batch_and_path() -> None:
         (4, 4672, False),
         (1, 32768, True),
         (1, 4672, False),
+    ]
+
+
+def test_decode_graph_profile_plan_keeps_largest_batch_per_path() -> None:
+    config = SimpleNamespace(
+        decode_graph_capture_sizes=[1, 4, 8],
+        decode_graph_startup_capture_limit=12,
+        sparse_method="quest",
+        max_model_len=32768,
+        sink_keep_tokens=64,
+        decode_keep_tokens=4096,
+        recent_keep_tokens=512,
+    )
+    assert build_decode_cuda_graph_profile_plan(config) == [
+        (8, 32768, True),
+        (8, 4672, False),
     ]
 
 

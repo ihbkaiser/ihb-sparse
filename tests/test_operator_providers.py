@@ -213,6 +213,25 @@ def test_quest_triton_exact_atomic_capability_is_portable_cuda() -> None:
     ).supported
 
 
+def test_quest_flashinfer_page_selection_rejects_pre_hopper_deterministic_topk() -> None:
+    spec = QuestPageSelectionOpSpec(
+        score_dtype=torch.bfloat16,
+        cuda_graph=False,
+    )
+    with patch(
+        "sparsevllm.operators.quest_selection."
+        "flashinfer_top_k_page_table_transform_support"
+    ) as flashinfer_support:
+        result = FlashInferQuestPageSelectionProvider.supports(
+            spec,
+            _cuda_caps((8, 6), device_name="NVIDIA GeForce RTX 3090"),
+        )
+
+    assert not result.supported
+    assert "SM90+" in result.reason
+    flashinfer_support.assert_not_called()
+
+
 def _moe_spec(
     *,
     activation_dtype=torch.bfloat16,
