@@ -12,6 +12,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     MAX_JOBS=${MAX_JOBS} \
     CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
+    FLASH_ATTN_CUDA_ARCHS=100 \
+    TORCH_CUDA_ARCH_LIST=10.0 \
+    CUDAARCHS=100 \
+    CMAKE_CUDA_ARCHITECTURES=100 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
@@ -45,7 +49,7 @@ RUN python -m pip install --upgrade pip setuptools wheel \
         --extra-index-url https://flashinfer.ai/whl/cu130 \
         "transformers==5.13.1" \
         -e ".[cu130]" \
-    && python -m pip install flash-attn --no-build-isolation \
+    && python -m pip install "flash-attn==2.8.3.post1" --no-build-isolation \
     && python -m pip install flashinfer-cubin --index-url https://flashinfer.ai/whl \
     && python -m pip check
 
