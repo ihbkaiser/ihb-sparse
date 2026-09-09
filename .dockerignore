@@ -1,0 +1,42 @@
+.git
+.gitmodules
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.tox
+
+# Keep checkpoints, datasets, generated benchmark outputs, and credentials out
+# of the image. Mount these at runtime instead.
+models
+checkpoints
+datasets
+data
+runs
+outputs
+wandb
+remote_artifacts
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.jsonl
+.env
+.env.*
+*.pem
+*.key
+*.token
+credentials*
+
+# Local build and editor state.
+dist
+build
+*.egg-info
+.idea
+.vscode
+*.swp
+*.swo

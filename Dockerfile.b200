@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1
+
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+
+LABEL org.opencontainers.image.title="Sparse-vLLM Query-Robust"
+LABEL org.opencontainers.image.description="Sparse-vLLM with Query-Robust, Quest, and ShadowKV support for NVIDIA Blackwell"
+LABEL org.opencontainers.image.source="https://github.com/ihbkaiser/ihb-sparse"
+
+ARG MAX_JOBS=8
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    MAX_JOBS=${MAX_JOBS} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    HF_HOME=/models/huggingface \
+    TRANSFORMERS_CACHE=/models/huggingface
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y \
+        build-essential \
+        ca-certificates \
+        git \
+        libnuma-dev \
+        ninja-build \
+        pkg-config \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.12 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:${PATH}
+
+WORKDIR /opt/Sparse-vLLM
+COPY . .
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --extra-index-url https://flashinfer.ai/whl/cu130 \
+        "transformers==5.13.1" \
+        -e ".[cu130]" \
+    && python -m pip install flash-attn --no-build-isolation \
+    && python -m pip install flashinfer-cubin --index-url https://flashinfer.ai/whl \
+    && python -m pip check
+
+# Runtime-only state is intentionally external to the image.
+VOLUME ["/models", "/data", "/artifacts"]
+
+CMD ["bash"]

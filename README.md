@@ -143,6 +143,27 @@ uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
 
 Use `cu129` instead of `cu130` for CUDA 12.9.
 
+### Docker on NVIDIA Blackwell
+
+`Dockerfile.b200` packages the CUDA 13.0 environment and the Query-Robust,
+Quest, and ShadowKV implementations. It deliberately excludes model weights,
+datasets, benchmark artifacts, and credentials; mount those at runtime.
+
+```bash
+docker build -f Dockerfile.b200 -t ihbkaiserdev/sparse-vllm:qr-b200 .
+docker push ihbkaiserdev/sparse-vllm:qr-b200
+
+docker run --rm --gpus all --ipc=host --shm-size=16g -it \
+  -v /path/to/models:/models \
+  -v /path/to/data:/data \
+  -v /path/to/artifacts:/artifacts \
+  ihbkaiserdev/sparse-vllm:qr-b200
+```
+
+The host needs a compatible NVIDIA driver, Docker, and the NVIDIA Container
+Toolkit. Build the image on an x86_64 host; run it with `--gpus all` on the B200
+host.
+
 `einops`, `sglang-kernel==0.4.5`, and the training, benchmark, and test packages
 are all part of the main installation; no workflow-specific extras are required.
 The SGL kernel package is pinned because its compiled operators must match the
