@@ -9,6 +9,7 @@ from sparsevllm.configs.cuda_graph import build_decode_cuda_graph_startup_plan
 from sparsevllm.engine.cache_manager.storage import CacheLayout
 from sparsevllm.method_registry import (
     decode_sparse_long_text_threshold,
+    is_paged_sparse_method,
     normalize_sparse_method,
 )
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
@@ -85,7 +86,11 @@ class KVCapacityPlan:
 
 def profiling_kv_slots(config) -> int:
     method = normalize_sparse_method(config.sparse_method)
-    page_size = int(config.quest_chunk_size) if method == "quest" else 1
+    page_size = (
+        int(getattr(config, "sparse_page_size", getattr(config, "quest_chunk_size", 16)))
+        if is_paged_sparse_method(method)
+        else 1
+    )
 
     def batch_slots(prompt_lengths: tuple[int, ...], output_tokens: int) -> int:
         return sum(
@@ -125,7 +130,11 @@ def startup_graph_family_kv_slots(
         if is_long_text
         else 1
     )
-    page_size = int(config.quest_chunk_size) if method == "quest" else 1
+    page_size = (
+        int(getattr(config, "sparse_page_size", getattr(config, "quest_chunk_size", 16)))
+        if is_paged_sparse_method(method)
+        else 1
+    )
     slots_per_sequence = ceil((int(prompt_tokens) + 2) / page_size) * page_size
     return int(batch_size) * slots_per_sequence
 
@@ -225,7 +234,7 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         raise AssertionError(f"Unhandled attention cache layout {cache_layout!r}.")
 
     method = normalize_sparse_method(config.sparse_method)
-    if method != "quest":
+    if not is_paged_sparse_method(method):
         if method in {"", "vanilla", "omnikv"}:
             int32_bytes = torch.empty((), dtype=torch.int32).element_size()
             row_mapping_bytes = (
@@ -239,14 +248,34 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
             )
         return int(num_slots * bytes_per_slot * 2)
 
-    page_size = int(config.quest_chunk_size)
+    page_size = int(
+        getattr(config, "sparse_page_size", getattr(config, "quest_chunk_size", 16))
+    )
     pages = ceil(num_slots / page_size)
     token_slots = pages * page_size
-    metadata_bytes_per_page = (
-        bytes_per_slot
-        if cache_layout is CacheLayout.EXPLICIT_KV
-        else 2 * bytes_per_slot
-    )
+    if method == "query_robust":
+        if cache_layout is not CacheLayout.EXPLICIT_KV:
+            raise AssertionError("Query-Robust capacity requires explicit KV storage.")
+        local_shapes = layout.local_kv_shapes(tp_size)
+        if not local_shapes:
+            heads = int(config.hf_config.num_key_value_heads) // int(tp_size)
+            head_dim = resolve_attention_qk_head_dim(config.hf_config)
+            local_shapes = tuple(
+                (heads, head_dim) for _ in range(int(layout.num_kv_layers))
+            )
+        metadata_bytes_per_page = sum(
+            int(heads) * int(head_dim) * torch.empty((), dtype=torch.bfloat16).element_size()
+            + int(heads) * 2 * torch.empty((), dtype=torch.float32).element_size()
+            + int(heads)
+            + int(heads) * torch.empty((), dtype=torch.float32).element_size()
+            for heads, head_dim in local_shapes
+        )
+    else:
+        metadata_bytes_per_page = (
+            bytes_per_slot
+            if cache_layout is CacheLayout.EXPLICIT_KV
+            else 2 * bytes_per_slot
+        )
     int32_bytes = torch.empty((), dtype=torch.int32).element_size()
     fixed_metadata_bytes = (
         int(config.max_num_seqs_in_gpu) * int(config.max_model_len) * int32_bytes

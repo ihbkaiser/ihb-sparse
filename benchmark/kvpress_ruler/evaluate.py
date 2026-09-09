@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate QuEST and ShadowKV on the NVIDIA/kvpress RULER artifact.
+"""Evaluate sparse methods on the NVIDIA/kvpress RULER artifact.
 
 The runner uses the same ``simonjegou/ruler`` dataset, context-length config
 (``data_dir``), greedy generation, answer-prefix handling, and RULER scorer as
@@ -57,8 +57,10 @@ class EvalConfig:
     decode_graph: bool = False
     quest_chunk_size: int = 16
     decode_keep_tokens: int = 2048
-    sink_keep_tokens: int = 64
-    recent_keep_tokens: int = 512
+    # Quest's native protocol exposes one query-aware token budget. Keep the
+    # shared sink/recent regions empty so the effective budget is exactly 2048.
+    sink_keep_tokens: int = 0
+    recent_keep_tokens: int = 0
     shadowkv_sparse_budget: int = 2048
     shadowkv_rank: int = 160
     shadowkv_chunk_size: int = 8
@@ -71,10 +73,20 @@ class EvalConfig:
     shadowkv_cutlass_root: str | None = None
     shadowkv_decode_backend: str = "auto"
     shadowkv_flashinfer_backend: str = "auto"
+    # ShadowKV's paper protocol stores the value cache in the CPU shadow. Keep
+    # the GPU-cache throughput overlay explicit at the command line.
     shadowkv_storage: str = "cpu"
     shadowkv_gpu_cache_tokens: int = 0
     shadowkv_multistream_gather: bool = True
     shadowkv_gather_copy_with_offsets: bool = True
+    query_robust_vertices_path: str | None = None
+    query_robust_num_vertices: int = 8
+    query_robust_chunk_size: int = 16
+    query_robust_solver_iters: int = 24
+    query_robust_solver_lr: float = 0.25
+    query_robust_score_alpha: float = 0.5
+    query_robust_skip_layers: int = 0
+    query_robust_uniform_p: bool = False
 
 
 def _parse_args() -> EvalConfig:
@@ -84,7 +96,11 @@ def _parse_args() -> EvalConfig:
     parser.add_argument("--dataset-name", default="simonjegou/ruler")
     parser.add_argument("--data-dir", default="4096")
     parser.add_argument("--dataset-path", default=None)
-    parser.add_argument("--sparse-method", choices=("quest", "shadowkv"), required=True)
+    parser.add_argument(
+        "--sparse-method",
+        choices=("quest", "shadowkv", "query_robust"),
+        required=True,
+    )
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-context-length", type=int, default=None)
@@ -111,8 +127,8 @@ def _parse_args() -> EvalConfig:
     )
     parser.add_argument("--quest-chunk-size", type=int, default=16)
     parser.add_argument("--decode-keep-tokens", type=int, default=2048)
-    parser.add_argument("--sink-keep-tokens", type=int, default=64)
-    parser.add_argument("--recent-keep-tokens", type=int, default=512)
+    parser.add_argument("--sink-keep-tokens", type=int, default=0)
+    parser.add_argument("--recent-keep-tokens", type=int, default=0)
     parser.add_argument("--shadowkv-sparse-budget", type=int, default=2048)
     parser.add_argument("--shadowkv-rank", type=int, default=160)
     parser.add_argument("--shadowkv-chunk-size", type=int, default=8)
@@ -147,7 +163,12 @@ def _parse_args() -> EvalConfig:
     parser.add_argument(
         "--shadowkv-storage", choices=("cpu", "gpu_cache"), default="cpu"
     )
-    parser.add_argument("--shadowkv-gpu-cache-tokens", type=int, default=0)
+    parser.add_argument(
+        "--shadowkv-gpu-cache-tokens",
+        type=int,
+        default=0,
+        help="GPU-cache capacity in tokens; 0 derives it from max_model_len.",
+    )
     parser.add_argument(
         "--shadowkv-multistream-gather",
         action=argparse.BooleanOptionalAction,
@@ -159,6 +180,18 @@ def _parse_args() -> EvalConfig:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Reuse selected value chunks with ShadowKV's offset-copy kernel.",
+    )
+    parser.add_argument("--query-robust-vertices-path", default=None)
+    parser.add_argument("--query-robust-num-vertices", type=int, default=8)
+    parser.add_argument("--query-robust-chunk-size", type=int, default=16)
+    parser.add_argument("--query-robust-solver-iters", type=int, default=24)
+    parser.add_argument("--query-robust-solver-lr", type=float, default=0.25)
+    parser.add_argument("--query-robust-score-alpha", type=float, default=0.5)
+    parser.add_argument("--query-robust-skip-layers", type=int, default=0)
+    parser.add_argument(
+        "--query-robust-uniform-p",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     args = parser.parse_args()
     if not 0.0 < args.fraction <= 1.0:
@@ -177,12 +210,27 @@ def _parse_args() -> EvalConfig:
         raise ValueError("--shadowkv-svd-niter must be positive.")
     if args.shadowkv_gpu_cache_tokens < 0:
         raise ValueError("--shadowkv-gpu-cache-tokens must be non-negative.")
+    if args.sparse_method == "query_robust":
+        if not args.query_robust_vertices_path:
+            raise ValueError(
+                "--query-robust-vertices-path is required for --sparse-method query_robust."
+            )
+        if args.query_robust_num_vertices < 2:
+            raise ValueError("--query-robust-num-vertices must be at least 2.")
+        if args.query_robust_chunk_size <= 0:
+            raise ValueError("--query-robust-chunk-size must be positive.")
+        if args.query_robust_solver_iters <= 0:
+            raise ValueError("--query-robust-solver-iters must be positive.")
+        if args.query_robust_solver_lr <= 0:
+            raise ValueError("--query-robust-solver-lr must be positive.")
+        if args.query_robust_score_alpha not in (0.0, 0.5, 1.0):
+            raise ValueError(
+                "--query-robust-score-alpha must be one of 0, 0.5, or 1."
+            )
+        if args.query_robust_skip_layers < 0:
+            raise ValueError("--query-robust-skip-layers must be non-negative.")
     if not 0.0 < args.gpu_memory_utilization < 1.0:
         raise ValueError("--gpu-memory-utilization must be in (0, 1).")
-    if args.shadowkv_storage == "gpu_cache" and args.shadowkv_gpu_cache_tokens <= 0:
-        raise ValueError(
-            "--shadowkv-storage=gpu_cache requires --shadowkv-gpu-cache-tokens > 0."
-        )
     return EvalConfig(**vars(args))
 
 
@@ -307,6 +355,71 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _build_infer_config(
+    config: EvalConfig, *, resolved_max_model_len: int
+) -> dict[str, Any]:
+    infer_config: dict[str, Any] = {
+        "max_model_len": resolved_max_model_len,
+        "gpu_memory_utilization": config.gpu_memory_utilization,
+        "tensor_parallel_size": 1,
+        "max_num_seqs_in_batch": config.batch_size,
+        "max_decoding_seqs": config.batch_size,
+        "max_num_seqs_in_gpu": config.batch_size,
+        "decode_graph": config.decode_graph,
+        "decode_graph_capture_sizes": [config.batch_size],
+        "enable_prefix_caching": False,
+    }
+    if config.sparse_method == "quest":
+        infer_config.update(
+            {
+                "quest_chunk_size": config.quest_chunk_size,
+                "decode_keep_tokens": config.decode_keep_tokens,
+                "sink_keep_tokens": config.sink_keep_tokens,
+                "recent_keep_tokens": config.recent_keep_tokens,
+            }
+        )
+    elif config.sparse_method == "shadowkv":
+        infer_config.update(
+            {
+                "shadowkv_sparse_budget": config.shadowkv_sparse_budget,
+                "shadowkv_rank": config.shadowkv_rank,
+                "shadowkv_chunk_size": config.shadowkv_chunk_size,
+                "shadowkv_recent_tokens": config.shadowkv_recent_tokens,
+                "shadowkv_svd_batch_size": config.shadowkv_svd_batch_size,
+                "shadowkv_svd_method": config.shadowkv_svd_method,
+                "shadowkv_svd_oversample": config.shadowkv_svd_oversample,
+                "shadowkv_svd_niter": config.shadowkv_svd_niter,
+                "shadowkv_kernel_backend": config.shadowkv_kernel_backend,
+                "shadowkv_cutlass_root": config.shadowkv_cutlass_root,
+                "shadowkv_decode_backend": config.shadowkv_decode_backend,
+                "shadowkv_flashinfer_backend": config.shadowkv_flashinfer_backend,
+                "shadowkv_storage": config.shadowkv_storage,
+                "shadowkv_gpu_cache_tokens": config.shadowkv_gpu_cache_tokens,
+                "shadowkv_multistream_gather": config.shadowkv_multistream_gather,
+                "shadowkv_gather_copy_with_offsets": config.shadowkv_gather_copy_with_offsets,
+            }
+        )
+    elif config.sparse_method == "query_robust":
+        infer_config.update(
+            {
+                "query_robust_vertices_path": config.query_robust_vertices_path,
+                "query_robust_num_vertices": config.query_robust_num_vertices,
+                "query_robust_chunk_size": config.query_robust_chunk_size,
+                "query_robust_solver_iters": config.query_robust_solver_iters,
+                "query_robust_solver_lr": config.query_robust_solver_lr,
+                "query_robust_score_alpha": config.query_robust_score_alpha,
+                "query_robust_skip_layers": config.query_robust_skip_layers,
+                "query_robust_uniform_p": config.query_robust_uniform_p,
+                "sink_keep_tokens": config.sink_keep_tokens,
+                "decode_keep_tokens": config.decode_keep_tokens,
+                "recent_keep_tokens": config.recent_keep_tokens,
+            }
+        )
+    else:
+        raise ValueError(f"Unsupported sparse method: {config.sparse_method!r}")
+    return infer_config
+
+
 def main() -> None:
     config = _parse_args()
     output_dir = Path(config.output_dir)
@@ -344,65 +457,44 @@ def main() -> None:
             f"--max-model-len={config.max_model_len} is smaller than the evaluated prompt budget "
             f"{inferred_max_model_len}."
         )
-    infer_config: dict[str, Any] = {
-        "max_model_len": config.max_model_len or inferred_max_model_len,
-        "gpu_memory_utilization": config.gpu_memory_utilization,
-        "tensor_parallel_size": 1,
-        "max_num_seqs_in_batch": config.batch_size,
-        "max_decoding_seqs": config.batch_size,
-        "max_num_seqs_in_gpu": config.batch_size,
-        "decode_graph": config.decode_graph,
-        "decode_graph_capture_sizes": [config.batch_size],
-        "enable_prefix_caching": False,
-    }
-    if config.sparse_method == "quest":
-        infer_config.update(
-            {
-                "quest_chunk_size": config.quest_chunk_size,
-                "decode_keep_tokens": config.decode_keep_tokens,
-                "sink_keep_tokens": config.sink_keep_tokens,
-                "recent_keep_tokens": config.recent_keep_tokens,
-            }
-        )
-    else:
-        infer_config.update(
-            {
-                "shadowkv_sparse_budget": config.shadowkv_sparse_budget,
-                "shadowkv_rank": config.shadowkv_rank,
-                "shadowkv_chunk_size": config.shadowkv_chunk_size,
-                "shadowkv_recent_tokens": config.shadowkv_recent_tokens,
-                "shadowkv_svd_batch_size": config.shadowkv_svd_batch_size,
-                "shadowkv_svd_method": config.shadowkv_svd_method,
-                "shadowkv_svd_oversample": config.shadowkv_svd_oversample,
-                "shadowkv_svd_niter": config.shadowkv_svd_niter,
-                "shadowkv_kernel_backend": config.shadowkv_kernel_backend,
-                "shadowkv_cutlass_root": config.shadowkv_cutlass_root,
-                "shadowkv_decode_backend": config.shadowkv_decode_backend,
-                "shadowkv_flashinfer_backend": config.shadowkv_flashinfer_backend,
-                "shadowkv_storage": config.shadowkv_storage,
-                "shadowkv_gpu_cache_tokens": config.shadowkv_gpu_cache_tokens,
-                "shadowkv_multistream_gather": config.shadowkv_multistream_gather,
-                "shadowkv_gather_copy_with_offsets": config.shadowkv_gather_copy_with_offsets,
-            }
-        )
+    resolved_max_model_len = config.max_model_len or inferred_max_model_len
+    if (
+        config.sparse_method == "shadowkv"
+        and config.shadowkv_storage == "gpu_cache"
+        and config.shadowkv_gpu_cache_tokens == 0
+    ):
+        # GPU-cache mode needs a fixed allocation before the first prefill.
+        # Deriving it here keeps the fast profile usable without a duplicated
+        # max-model-len flag while still recording the effective capacity.
+        config.shadowkv_gpu_cache_tokens = int(resolved_max_model_len)
+    infer_config = _build_infer_config(
+        config,
+        resolved_max_model_len=resolved_max_model_len,
+    )
     derived_config = {
         "target_context_length": int(config.data_dir)
         if config.data_dir is not None and str(config.data_dir).isdigit()
         else None,
     }
     if config.sparse_method == "quest":
-        # QuEST's native budget is split across the three retention regions.
-        # Record the sum so a result cannot be misread from individual flags.
+        # The shared config names are retained for other sparse methods, but
+        # Quest's native protocol is a single query-aware token budget.
         derived_config["quest_effective_token_budget"] = (
             config.sink_keep_tokens
             + config.decode_keep_tokens
             + config.recent_keep_tokens
         )
-    else:
+    elif config.sparse_method == "shadowkv":
         from sparsevllm.configs.sparse import resolve_shadowkv_outlier_chunks
 
         derived_config["shadowkv_outlier_chunks"] = resolve_shadowkv_outlier_chunks(
             config.shadowkv_sparse_budget
+        )
+    else:
+        derived_config["query_robust_effective_token_budget"] = (
+            config.sink_keep_tokens
+            + config.decode_keep_tokens
+            + config.recent_keep_tokens
         )
     run_info = {
         "protocol": "NVIDIA/kvpress evaluation/evaluate.py RULER dataset and scorer",

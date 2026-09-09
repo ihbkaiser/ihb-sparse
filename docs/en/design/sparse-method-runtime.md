@@ -128,7 +128,7 @@ mechanics:
 
 | Runtime mechanism | Current methods | Meaning |
 | --- | --- | --- |
-| `PassThroughRuntime` | vanilla, QuEST | Controller selection is full; any native query-aware physical view remains cache-manager/provider owned. |
+| `PassThroughRuntime` | vanilla, QuEST, Query-Robust | Controller selection is full; any native query-aware physical view remains cache-manager/provider owned. |
 | `StreamingLLMRuntime` | StreamingLLM | Pass-through attention view followed by physical sink/recent retention. |
 | `ScoredCompactionRuntime` | SnapKV, PyramidKV | Shared score lifecycle and physical compaction; PyramidKV specializes layer budgets and triggers. |
 | `H2ORuntime` | H2O | H2O-specific prefill score workspace and cache-owned cumulative importance/eviction lifecycle. |

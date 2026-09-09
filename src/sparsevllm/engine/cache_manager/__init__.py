@@ -41,6 +41,7 @@ __all__ = [
     "RKVCacheManager",
     "SkipKVCacheManager",
     "QuestCacheManager",
+    "QueryRobustCacheManager",
     "ShadowKVCacheManager",
     "OmniKVCacheManager",
     "DeltaKVCacheManager",
@@ -79,6 +80,10 @@ def __getattr__(name: str):
         from .quest import QuestCacheManager
 
         return QuestCacheManager
+    if name == "QueryRobustCacheManager":
+        from .query_robust import QueryRobustCacheManager
+
+        return QueryRobustCacheManager
     if name == "ShadowKVCacheManager":
         from .shadowkv import ShadowKVCacheManager
 

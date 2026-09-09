@@ -2,7 +2,7 @@
 
 `benchmark/kvpress_ruler/evaluate.py` evaluates the official processed RULER
 artifact used by NVIDIA/kvpress (`simonjegou/ruler`) with the native
-Sparse-vLLM engine. It uses the same `data_dir` context-length configuration,
+Sparse-vLLM engine for QuEST, ShadowKV, and Query-Robust. It uses the same `data_dir` context-length configuration,
 greedy decoding, `answer_prefix`, and task scorer. The script requires an
 explicit model path so local checkpoints are reproducible and never hardcoded.
 
@@ -27,10 +27,15 @@ python benchmark/kvpress_ruler/evaluate.py \
   --output-dir results/kvpress-ruler/shadowkv-4096
 ```
 
+The evaluator defaults to ShadowKV's paper-like CPU-shadow profile
+(`shadowkv_storage=cpu`). Use `--shadowkv-storage gpu_cache` explicitly for
+the separate throughput overlay; it derives `shadowkv_gpu_cache_tokens` from
+`max_model_len` when the capacity flag is omitted.
+
 `--batch-size` is the maximum concurrent decode batch and is passed to the
 engine as `max_num_seqs_in_batch`, `max_decoding_seqs`, and
 `max_num_seqs_in_gpu`. The default is 4; lower it when the local GPU cannot
-hold the model plus the compressed ShadowKV workspace. Add `--decode-graph`
+hold the model plus the selected ShadowKV workspace. Add `--decode-graph`
 to capture one fixed graph for that batch bucket. ShadowKV's graph path uses
 CUDA-graph-safe gather kernels for pinned host values and selected low-rank
 factors. It keeps chunk landmark means in factorized form, avoiding a full
@@ -45,17 +50,18 @@ experiment manifest; this is useful for high-batch graph capture on smaller
 GPUs, where the default `0.90` may leave insufficient room for the requested
 KV/runtime workspace.
 
-For a speed/memory trade-off, `--shadowkv-storage gpu_cache` keeps the full
-configured prompt-capacity K/V payload for each active layer on the GPU. Set
-`--shadowkv-gpu-cache-tokens` to at least `--max-model-len`; the runner fails
-early when the capacity is insufficient. This is a separate experiment:
+For the separate GPU-cache throughput overlay, pass
+`--shadowkv-storage gpu_cache`. It keeps the full configured prompt-capacity
+K/V payload for each active layer on the GPU and derives
+`--shadowkv-gpu-cache-tokens` from `max-model-len` when the flag is omitted.
 ShadowKV selection is retained, while mapped host reads and decode-time
 reconstruction are removed. GPU-cache finalization computes landmark and
 outlier metadata on the GPU from the exact cache copy, but skips the unused
-low-rank SVD. This avoids turning long-context metadata construction into a
-CPU TTFT bottleneck. `--shadowkv-kernel-backend cutlass` uses the
+low-rank SVD. This avoids turning long-context metadata construction into a CPU
+TTFT bottleneck. `--shadowkv-kernel-backend cutlass` uses the
 CUTLASS strided-batched GEMM backend and requires `--shadowkv-cutlass-root`
 (or `SPARSEVLLM_CUTLASS_ROOT`) pointing to the pinned CUTLASS source tree.
+The paper-like CPU-shadow run remains the default.
 For eager CPU-shadow ablations, `--no-shadowkv-multistream-gather` disables
 copy-stream overlap and `--no-shadowkv-gather-copy-with-offsets` disables
 selected-value chunk reuse; both are enabled by default and are recorded in
@@ -103,7 +109,7 @@ budget:
 MODEL_PATH=/path/to/Meta-Llama-3.1-8B-Instruct
 RULER_128K_PATH=/path/to/processed-ruler-131072.jsonl
 
-# QuEST: page/chunk size 16; 0 sink + 2016 scored + 32 recent = 2048 tokens.
+# QuEST: page/chunk size 16; one query-aware 2048-token budget.
 python benchmark/kvpress_ruler/evaluate.py \
   --model-path "$MODEL_PATH" \
   --sparse-method quest \
@@ -112,8 +118,8 @@ python benchmark/kvpress_ruler/evaluate.py \
   --dataset-path "$RULER_128K_PATH" \
   --quest-chunk-size 16 \
   --sink-keep-tokens 0 \
-  --decode-keep-tokens 2016 \
-  --recent-keep-tokens 32 \
+  --decode-keep-tokens 2048 \
+  --recent-keep-tokens 0 \
   --output-dir results/kvpress-ruler/quest-128k-budget2048
 
 # ShadowKV: paper/repository configuration for 128K RULER.
@@ -126,18 +132,63 @@ python benchmark/kvpress_ruler/evaluate.py \
   --shadowkv-sparse-budget 2048 \
   --shadowkv-rank 160 \
   --shadowkv-chunk-size 8 \
+  --shadowkv-storage cpu \
   --output-dir results/kvpress-ruler/shadowkv-128k-budget2048
 ```
+
+### Query-Robust on the full task artifact
+
+The evaluator does not restrict task names: every row in `--dataset-path` is
+evaluated and the aggregate records `score_by_task`. Therefore a processed
+JSONL containing the full RULER task list can be used without routing through
+the smaller self-contained `benchmark/ruler_vt` task runner. The JSONL must
+contain `context`, `question`, `answer_prefix`, `answer`, `task`, and
+`max_new_tokens` for every row.
+
+For a Table-1-style 128K comparison, use a tokenizer-aligned processed artifact
+and the same 2048-token effective sparse budget:
+
+```bash
+MODEL_PATH=/path/to/Meta-Llama-3.1-8B-Instruct
+RULER_128K_PATH=/path/to/processed-ruler-131072.jsonl
+QR_VERTICES=/path/to/qr_vertices.pt
+
+python benchmark/kvpress_ruler/evaluate.py \
+  --model-path "$MODEL_PATH" \
+  --sparse-method query_robust \
+  --batch-size 4 \
+  --data-dir 131072 \
+  --dataset-path "$RULER_128K_PATH" \
+  --query-robust-vertices-path "$QR_VERTICES" \
+  --query-robust-num-vertices 8 \
+  --query-robust-chunk-size 16 \
+  --query-robust-solver-iters 24 \
+  --query-robust-solver-lr 0.25 \
+  --query-robust-score-alpha 0.5 \
+  --query-robust-skip-layers 0 \
+  --no-query-robust-uniform-p \
+  --sink-keep-tokens 0 \
+  --decode-keep-tokens 2048 \
+  --recent-keep-tokens 0 \
+  --output-dir results/kvpress-ruler/query-robust-128k-budget2048
+```
+
+The 2048-token retention budget is aligned with ShadowKV's 1.56% budget at
+131072 tokens. Query-Robust's vertex count, solver settings, and page size are
+method-specific and are not substitutes for ShadowKV's rank-160/chunk-8
+factorization settings. Run vanilla on the exact same JSONL separately when a
+quality comparison is required.
 
 For CUDA Graph throughput, repeat each command with `--decode-graph` and a
 separate output directory. The evaluator records the selected batch and graph
 settings in `run_info.json`; it does not silently fall back if graph capture
 or the ShadowKV CUDA extension fails.
 
-The current QuEST CLI defaults in this runner are `chunk_size=16`,
-`sink=64`, `scored=2048`, and `recent=512`, which intentionally favor a
-conservative 4096-token smoke configuration. They are not the paper-aligned
-128K comparison: their effective retention budget is 2624 tokens. For a
+The QuEST/Query-Robust defaults in this runner are now `chunk_size=16`,
+`sink=0`, `decode=2048`, and `recent=0`. This mirrors Quest's native
+single-budget protocol. The shared sink/recent flags remain available for
+explicit ablations and for methods that implement fixed prefix/suffix
+retention; they are not part of Quest's original protocol. For a
 quality-oriented QuEST ablation, the upstream example uses approximately a
 1K token budget; that is a different, lower-budget experiment and should be
 reported separately ([Quest repository](https://github.com/mit-han-lab/Quest),

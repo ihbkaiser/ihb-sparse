@@ -583,7 +583,10 @@ def test_shadowkv_cute_plan_passes_logical_lengths_as_seq_lens(monkeypatch):
         call["kwargs"]["seq_lens"].data_ptr()
         == state.host_seq_lens[:16].data_ptr()
     )
-    assert call["kwargs"]["max_kv_len"] == 64
+    # FlashInfer 0.6.18 computes max_kv_len internally from seq_lens; passing
+    # it to the public wrapper.plan() leaks an unsupported keyword to
+    # _plan_impl().
+    assert "max_kv_len" not in call["kwargs"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

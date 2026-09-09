@@ -938,6 +938,112 @@ void gather_gpu_cache_per_head_kv(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename scalar_t>
+__global__ void gather_gpu_cache_per_head_kv_ptrs_kernel(
+    const std::uint64_t* __restrict__ source_k_ptrs,
+    const std::uint64_t* __restrict__ source_v_ptrs,
+    const std::int32_t* __restrict__ positions,
+    const std::int32_t* __restrict__ lengths,
+    scalar_t* __restrict__ output_k,
+    scalar_t* __restrict__ output_v,
+    int batch,
+    int source_width,
+    int heads,
+    int width,
+    int head_dim) {
+  const int64_t total = static_cast<int64_t>(batch) * heads * width * head_dim;
+  for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       linear < total;
+       linear += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int element = static_cast<int>(linear % head_dim);
+    const int64_t row = linear / head_dim;
+    const int token = static_cast<int>(row % width);
+    const int64_t head_row = row / width;
+    const int head = static_cast<int>(head_row % heads);
+    const int batch_idx = static_cast<int>(head_row / heads);
+    const int position = positions[
+        (static_cast<int64_t>(batch_idx) * heads + head) * width + token];
+    scalar_t* destination_k = output_k + linear;
+    scalar_t* destination_v = output_v + linear;
+    if (position < 0 || position >= lengths[batch_idx] ||
+        position >= source_width) {
+      *destination_k = float_to_scalar<scalar_t>(0.0f);
+      *destination_v = float_to_scalar<scalar_t>(0.0f);
+      continue;
+    }
+    const int64_t source_index =
+        (static_cast<int64_t>(position) * heads + head) * head_dim + element;
+    const auto* source_k = reinterpret_cast<const scalar_t*>(source_k_ptrs[batch_idx]);
+    const auto* source_v = reinterpret_cast<const scalar_t*>(source_v_ptrs[batch_idx]);
+    *destination_k = source_k[source_index];
+    *destination_v = source_v[source_index];
+  }
+}
+
+void gather_gpu_cache_per_head_kv_ptrs(
+    torch::Tensor source_k_ptrs,
+    torch::Tensor source_v_ptrs,
+    torch::Tensor positions,
+    torch::Tensor lengths,
+    torch::Tensor output_k,
+    torch::Tensor output_v,
+    int64_t source_width) {
+  TORCH_CHECK(source_k_ptrs.is_cuda() && source_v_ptrs.is_cuda() &&
+                  positions.is_cuda() && lengths.is_cuda() &&
+                  output_k.is_cuda() && output_v.is_cuda(),
+              "ShadowKV pointer-table GPU-cache gather inputs must be CUDA tensors.");
+  TORCH_CHECK(
+      source_k_ptrs.scalar_type() == torch::kInt64 &&
+          source_v_ptrs.scalar_type() == torch::kInt64 &&
+          positions.scalar_type() == torch::kInt32 &&
+          lengths.scalar_type() == torch::kInt32 &&
+          (output_k.scalar_type() == torch::kBFloat16 ||
+           output_k.scalar_type() == torch::kHalf) &&
+          output_v.scalar_type() == output_k.scalar_type(),
+      "ShadowKV pointer-table GPU-cache gather has an invalid dtype.");
+  TORCH_CHECK(
+      source_k_ptrs.dim() == 1 && source_v_ptrs.sizes() == source_k_ptrs.sizes() &&
+          positions.dim() == 3 && lengths.dim() == 1 && output_k.dim() == 4 &&
+          output_v.sizes() == output_k.sizes(),
+      "ShadowKV pointer-table GPU-cache gather expects matching tensor ranks.");
+  const int batch = static_cast<int>(source_k_ptrs.numel());
+  const int heads = static_cast<int>(output_k.size(1));
+  const int width = static_cast<int>(output_k.size(2));
+  const int head_dim = static_cast<int>(output_k.size(3));
+  TORCH_CHECK(
+      batch > 0 && source_width > 0 && positions.size(0) == batch &&
+          positions.size(1) == heads && lengths.numel() == batch &&
+          positions.size(2) == width &&
+          output_k.sizes() == torch::IntArrayRef({batch, heads, width, head_dim}) &&
+          source_k_ptrs.is_contiguous() && source_v_ptrs.is_contiguous() &&
+          positions.is_contiguous() && lengths.is_contiguous() &&
+          output_k.is_contiguous() && output_v.is_contiguous(),
+      "ShadowKV pointer-table GPU-cache gather dimensions or strides disagree.");
+  const int64_t work = static_cast<int64_t>(batch) * heads * width * head_dim;
+  const int blocks = static_cast<int>(std::min<int64_t>((work + 255) / 256, 65535));
+  auto stream = at::cuda::getCurrentCUDAStream(output_k.get_device());
+  if (output_k.scalar_type() == torch::kBFloat16) {
+    gather_gpu_cache_per_head_kv_ptrs_kernel<__nv_bfloat16>
+        <<<blocks, 256, 0, stream.stream()>>>(
+            reinterpret_cast<const std::uint64_t*>(source_k_ptrs.data_ptr()),
+            reinterpret_cast<const std::uint64_t*>(source_v_ptrs.data_ptr()),
+            positions.data_ptr<int32_t>(), lengths.data_ptr<int32_t>(),
+            reinterpret_cast<__nv_bfloat16*>(output_k.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(output_v.data_ptr()), batch,
+            static_cast<int>(source_width), heads, width, head_dim);
+  } else {
+    gather_gpu_cache_per_head_kv_ptrs_kernel<__half>
+        <<<blocks, 256, 0, stream.stream()>>>(
+            reinterpret_cast<const std::uint64_t*>(source_k_ptrs.data_ptr()),
+            reinterpret_cast<const std::uint64_t*>(source_v_ptrs.data_ptr()),
+            positions.data_ptr<int32_t>(), lengths.data_ptr<int32_t>(),
+            reinterpret_cast<__half*>(output_k.data_ptr()),
+            reinterpret_cast<__half*>(output_v.data_ptr()), batch,
+            static_cast<int>(source_width), heads, width, head_dim);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void gather_gemm_rope(
     torch::Tensor pointer_table,
     torch::Tensor positions,
@@ -1036,5 +1142,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("gather_host_per_head", &gather_host_per_head);
   module.def("gather_gpu_cache_per_head", &gather_gpu_cache_per_head);
   module.def("gather_gpu_cache_per_head_kv", &gather_gpu_cache_per_head_kv);
+  module.def("gather_gpu_cache_per_head_kv_ptrs", &gather_gpu_cache_per_head_kv_ptrs);
   module.def("gather_gemm_rope", &gather_gemm_rope);
 }

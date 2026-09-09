@@ -1,5 +1,8 @@
 """Sparse-method normalization and layout-dependent validation."""
 
+import math
+from pathlib import Path
+
 from sparsevllm.configs.common import (
     _coerce_bool_config,
     _normalize_float_attr,
@@ -153,6 +156,122 @@ def _normalize_quest(config) -> None:
             )
     if config.quest_skip_layers < 0:
         raise ValueError("quest_skip_layers 不能 < 0")
+    if config.sparse_method == "quest":
+        config.sparse_page_size = int(config.quest_chunk_size)
+        config.sparse_token_budget = int(config.quest_token_budget)
+        config.sparse_skip_layers = int(config.quest_skip_layers)
+
+
+def _normalize_query_robust(config) -> None:
+    """Validate QR's asset-backed explicit-KV runtime contract."""
+
+    if config.sparse_method != "query_robust":
+        return
+    path = config.query_robust_vertices_path
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(
+            "query_robust requires query_robust_vertices_path pointing to a "
+            "calibrated vertex asset."
+        )
+    path = str(Path(path).expanduser())
+    if not Path(path).is_file():
+        raise FileNotFoundError(
+            "Query-Robust vertex asset does not exist: "
+            f"query_robust_vertices_path={path!r}."
+        )
+    config.query_robust_vertices_path = path
+
+    _normalize_positive_int(config, "query_robust_num_vertices", fallback=0)
+    if config.query_robust_num_vertices < 2:
+        raise ValueError(
+            "query_robust_num_vertices must be at least 2, got "
+            f"{config.query_robust_num_vertices}."
+        )
+    _normalize_positive_int(config, "query_robust_chunk_size", fallback=0)
+    _normalize_positive_int(config, "query_robust_solver_iters", fallback=0)
+    _normalize_float_attr(config, "query_robust_solver_lr")
+    if (
+        not math.isfinite(config.query_robust_solver_lr)
+        or config.query_robust_solver_lr <= 0
+    ):
+        raise ValueError(
+            "query_robust_solver_lr must be finite and > 0, got "
+            f"{config.query_robust_solver_lr}."
+        )
+    _normalize_float_attr(config, "query_robust_score_alpha")
+    if config.query_robust_score_alpha not in (0.0, 0.5, 1.0):
+        raise ValueError(
+            "query_robust_score_alpha must be one of 0, 0.5, or 1, got "
+            f"{config.query_robust_score_alpha}."
+        )
+    _normalize_int_attr(config, "query_robust_skip_layers", fallback=0)
+    if config.query_robust_skip_layers < 0:
+        raise ValueError(
+            "query_robust_skip_layers must be non-negative, got "
+            f"{config.query_robust_skip_layers}."
+        )
+    config.query_robust_uniform_p = _coerce_bool_config(
+        "query_robust_uniform_p",
+        config.query_robust_uniform_p,
+    )
+    if config.query_robust_rope_config is None:
+        hf_config = getattr(config, "hf_config", None)
+        config.query_robust_rope_config = getattr(
+            hf_config,
+            "rope_parameters",
+            getattr(hf_config, "rope_scaling", None),
+        )
+    if config.query_robust_model_fingerprint is not None:
+        config.query_robust_model_fingerprint = str(
+            config.query_robust_model_fingerprint
+        )
+    if str(config.attention_cache_layout) != "explicit_kv":
+        raise NotImplementedError(
+            "Query-Robust currently requires homogeneous explicit KV storage; "
+            f"got attention_cache_layout={config.attention_cache_layout!r}."
+        )
+    runtime_layout = getattr(config, "runtime_layout", None)
+    if getattr(runtime_layout, "linear_attention_layer_indices", ()):
+        raise NotImplementedError(
+            "Query-Robust currently supports transformer models with explicit KV "
+            "layers only; mixed recurrent attention is unsupported."
+        )
+
+    num_kv_heads = int(getattr(config.hf_config, "num_key_value_heads", 0) or 0)
+    parallel_topology = getattr(config, "parallel_topology", None)
+    tp_size = int(
+        getattr(
+            parallel_topology,
+            "attention_tp_size",
+            getattr(config, "tensor_parallel_size", 1),
+        )
+    )
+    shape_resolver = getattr(runtime_layout, "local_kv_shapes", None)
+    local_shapes = shape_resolver(tp_size) if callable(shape_resolver) else ()
+    if len(set(local_shapes)) > 1:
+        raise NotImplementedError(
+            "Query-Robust currently requires one homogeneous explicit-KV shape "
+            "across all attention layers."
+        )
+    if num_kv_heads <= 0 or num_kv_heads % tp_size:
+        raise ValueError(
+            "Query-Robust requires num_key_value_heads divisible by "
+            f"tensor_parallel_size: num_kv_heads={num_kv_heads} "
+            f"tensor_parallel_size={tp_size}."
+        )
+    config.sparse_page_size = int(config.query_robust_chunk_size)
+    config.sparse_token_budget = int(
+        config.sink_keep_tokens
+        + config.decode_keep_tokens
+        + config.recent_keep_tokens
+    )
+    if config.sparse_token_budget <= 0:
+        raise ValueError(
+            "Query-Robust decode token budget must be positive: "
+            "sink_keep_tokens + decode_keep_tokens + recent_keep_tokens = "
+            f"{config.sparse_token_budget}."
+        )
+    config.sparse_skip_layers = int(config.query_robust_skip_layers)
 
 
 def _normalize_shadowkv(config) -> None:
@@ -222,12 +341,14 @@ def _normalize_shadowkv(config) -> None:
             "shadowkv_gpu_cache_tokens must be non-negative, got "
             f"{config.shadowkv_gpu_cache_tokens}."
         )
-    if storage == "gpu_cache" and config.shadowkv_gpu_cache_tokens <= 0:
-        raise ValueError(
-            "shadowkv_storage='gpu_cache' requires a positive "
-            "shadowkv_gpu_cache_tokens capacity."
-        )
     max_model_len = getattr(config, "max_model_len", None)
+    if storage == "gpu_cache" and config.shadowkv_gpu_cache_tokens == 0:
+        if max_model_len is None or int(max_model_len) <= 0:
+            raise ValueError(
+                "shadowkv_storage='gpu_cache' needs max_model_len when "
+                "shadowkv_gpu_cache_tokens is left at the auto sentinel 0."
+            )
+        config.shadowkv_gpu_cache_tokens = int(max_model_len)
     if (
         storage == "gpu_cache"
         and max_model_len is not None
@@ -464,6 +585,7 @@ def normalize_sparse_methods(config) -> None:
             "KV-sharing variants support vanilla and OmniKV."
         )
     _normalize_quest(config)
+    _normalize_query_robust(config)
     _normalize_snapkv(config)
     # _normalize_sparse_prefill_score must run before _normalize_h2o to validate
     # and canonicalize config.sparse_prefill_score_mode before H2O window checks.

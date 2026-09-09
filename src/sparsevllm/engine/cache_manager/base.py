@@ -466,6 +466,10 @@ class CacheManager(ABC):
             from .quest import QuestCacheManager
 
             return create_manager(QuestCacheManager)
+        if sparse_method == "query_robust":
+            from .query_robust import QueryRobustCacheManager
+
+            return create_manager(QueryRobustCacheManager)
         if sparse_method == "shadowkv":
             from .shadowkv import ShadowKVCacheManager
 

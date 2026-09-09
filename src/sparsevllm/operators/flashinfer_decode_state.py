@@ -580,7 +580,6 @@ class FlashInferShadowKVPerHeadState:
         plan_kwargs = (
             {
                 "seq_lens": self.host_seq_lens[:rows],
-                "max_kv_len": self.payload_width,
             }
             if self.flashinfer_backend == "cute-dsl"
             else {}

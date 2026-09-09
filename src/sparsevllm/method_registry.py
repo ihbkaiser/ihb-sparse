@@ -28,6 +28,9 @@ METHOD_ALIASES = {
     "skip_kv": "skipkv",
     "shadow-kv": "shadowkv",
     "shadow_kv": "shadowkv",
+    "query-robust": "query_robust",
+    "query robust": "query_robust",
+    "qr": "query_robust",
     # DeltaKV now has one public runtime.  The old names stay as aliases so old
     # config files still load, but all code routes through sparse_method="deltakv".
     "deltakv-less-memory": "deltakv",
@@ -48,6 +51,7 @@ CANONICAL_SPARSE_METHODS = {
     "skipkv",
     "deltakv",
     "shadowkv",
+    "query_robust",
 }
 
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
@@ -124,6 +128,7 @@ PREFIX_CACHE_SUPPORTED_METHODS = {
     "streamingllm",
     "omnikv",
     "quest",
+    "query_robust",
     "snapkv",
     "h2o",
     "pyramidkv",
@@ -178,6 +183,7 @@ _PREFILL_LAYER_VARYING_PAGE_TABLE = {
     "pyramidkv": True,
     "omnikv": False,
     "quest": False,
+    "query_robust": False,
     "rkv": True,
     "skipkv": True,
     "deltakv": True,
@@ -298,7 +304,17 @@ def sparse_decode_attention_score_kind(
 
 
 _MOE_SPARSE_METHODS = frozenset(
-    {"", "streamingllm", "snapkv", "h2o", "pyramidkv", "omnikv", "quest", "rkv"}
+    {
+        "",
+        "streamingllm",
+        "snapkv",
+        "h2o",
+        "pyramidkv",
+        "omnikv",
+        "quest",
+        "query_robust",
+        "rkv",
+    }
 )
 
 _DENSE_SPARSE_METHODS = frozenset(CANONICAL_SPARSE_METHODS - {"shadowkv"})
@@ -318,14 +334,23 @@ LLAMA_COMPATIBILITY = ModelRuntimeCompatibility(
 QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
     prefix_cache_methods=frozenset(
-        {"", "omnikv", "quest", "snapkv", "h2o", "pyramidkv", "rkv"}
+        {
+            "",
+            "omnikv",
+            "quest",
+            "query_robust",
+            "snapkv",
+            "h2o",
+            "pyramidkv",
+            "rkv",
+        }
     ),
     decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
 QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
     sparse_methods=_MOE_SPARSE_METHODS,
-    prefix_cache_methods=frozenset({"", "snapkv"}),
+    prefix_cache_methods=frozenset({"", "snapkv", "query_robust"}),
     decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
@@ -399,6 +424,7 @@ TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
     "pyramidkv",
     "omnikv",
     "quest",
+    "query_robust",
     "rkv",
     "skipkv",
 }
@@ -445,6 +471,7 @@ _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "pyramidkv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     "omnikv": PREFILL_POLICY_ALL_CHUNKED,
     "quest": PREFILL_POLICY_ALL_CHUNKED,
+    "query_robust": PREFILL_POLICY_ALL_CHUNKED,
     "rkv": PREFILL_POLICY_ALL_CHUNKED,
     "skipkv": PREFILL_POLICY_ALL_CHUNKED,
     "deltakv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -472,6 +499,15 @@ def normalize_sparse_method(method: str | None) -> str:
         return ""
     normalized = str(method).strip().lower()
     return METHOD_ALIASES.get(normalized, normalized)
+
+
+PAGED_SPARSE_METHODS = frozenset({"quest", "query_robust"})
+
+
+def is_paged_sparse_method(method: str | None) -> bool:
+    """Return whether a method uses the shared physical page-table path."""
+
+    return normalize_sparse_method(method) in PAGED_SPARSE_METHODS
 
 
 def validate_sparse_method_assets(method: str | None, model_path: str) -> None:

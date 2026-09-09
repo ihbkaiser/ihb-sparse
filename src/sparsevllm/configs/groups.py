@@ -48,6 +48,23 @@ class SparseMethodConfig:
     quest_token_budget: int = field(init=False)
     quest_skip_layers: int = 2
 
+    # Query-Robust uses the same explicit paged decode contract as QuEST, but
+    # keeps its asset and solver controls separate so alpha can be swept
+    # without changing the stored page summaries.
+    query_robust_vertices_path: str | None = None
+    query_robust_num_vertices: int = 64
+    query_robust_chunk_size: int = 16
+    query_robust_solver_iters: int = 24
+    query_robust_solver_lr: float = 0.25
+    query_robust_score_alpha: float = 0.5
+    query_robust_skip_layers: int = 2
+    query_robust_uniform_p: bool = False
+    query_robust_model_fingerprint: str | None = None
+    query_robust_rope_config: dict | None = None
+    sparse_page_size: int = field(init=False, default=1)
+    sparse_token_budget: int = field(init=False, default=0)
+    sparse_skip_layers: int = field(init=False, default=0)
+
     # ShadowKV keeps value state on pinned host memory and reconstructs a small
     # decode view from chunk landmarks and a low-rank key factorization.
     shadowkv_sparse_budget: int = 2048
@@ -74,9 +91,9 @@ class SparseMethodConfig:
     # per-KV-head compact length changes during decode, so Blackwell uses the
     # graph-safe FlashInfer CuTe DSL backend by default.
     shadowkv_flashinfer_backend: str = "auto"
-    # Keep the original host-shadow implementation as the default.  The GPU
-    # cache mode is opt-in because it trades memory for lower decode latency.
-    shadowkv_storage: str = "cpu"
+    # Default to the throughput profile. GPU-cache capacity is derived from
+    # max_model_len when the sentinel value below is left at zero.
+    shadowkv_storage: str = "gpu_cache"
     shadowkv_gpu_cache_tokens: int = 0
     shadowkv_multistream_gather: bool = True
     shadowkv_gather_copy_with_offsets: bool = True

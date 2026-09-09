@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Protocol
 
-from sparsevllm.method_registry import prefill_sparse_method_fingerprint
+from sparsevllm.method_registry import (
+    is_paged_sparse_method,
+    normalize_sparse_method,
+    prefill_sparse_method_fingerprint,
+)
 
 
 
@@ -37,25 +41,38 @@ def resolve_prefix_cache_block_size(config: Any) -> int:
     configured = getattr(config, "prefix_cache_block_size", None)
     if configured is not None and (isinstance(configured, bool) or not isinstance(configured, int)):
         raise ValueError(f"prefix_cache_block_size must be a positive integer, got {configured!r}.")
-    method = str(getattr(config, "sparse_method", "") or "")
-    if method == "quest":
-        quest_chunk_size = int(getattr(config, "quest_chunk_size"))
+    method = normalize_sparse_method(getattr(config, "sparse_method", ""))
+    if is_paged_sparse_method(method):
+        page_size = int(
+            getattr(
+                config,
+                "sparse_page_size",
+                getattr(config, "quest_chunk_size", 16),
+            )
+        )
         runtime_layout = getattr(config, "runtime_layout", None)
         is_mixed = bool(getattr(runtime_layout, "linear_attention_layer_indices", ()))
         if is_mixed:
-            block_size = quest_chunk_size if configured is None else configured
-            if block_size <= 0 or block_size % quest_chunk_size != 0:
+            block_size = page_size if configured is None else configured
+            if block_size <= 0 or block_size % page_size != 0:
                 raise ValueError(
-                    "mixed Quest prefix_cache_block_size must be a positive multiple of quest_chunk_size: "
-                    f"prefix_cache_block_size={block_size}, quest_chunk_size={quest_chunk_size}."
+                    "Paged sparse prefix_cache_block_size must be a positive "
+                    "multiple of page size: "
+                    f"prefix_cache_block_size={block_size}, page_size={page_size}."
                 )
             return block_size
-        if configured is not None and configured != quest_chunk_size:
-            raise ValueError(
-                "prefix_cache_block_size must equal quest_chunk_size for quest prefix caching: "
-                f"prefix_cache_block_size={configured}, quest_chunk_size={quest_chunk_size}."
+        if configured is not None and configured != page_size:
+            page_name = (
+                "quest_chunk_size"
+                if method == "quest"
+                else "sparse_page_size"
             )
-        return quest_chunk_size
+            raise ValueError(
+                "prefix_cache_block_size must equal the paged sparse page size "
+                f"({page_name}): prefix_cache_block_size={configured}, "
+                f"page_size={page_size}."
+            )
+        return page_size
 
     block_size = 16 if configured is None else configured
     if block_size <= 0:
@@ -83,6 +100,30 @@ def build_prefix_cache_fingerprint(config: Any, block_size: int) -> bytes:
         "obs_layer_ids": _jsonable(getattr(config, "obs_layer_ids", None)),
         "quest_chunk_size": _jsonable(getattr(config, "quest_chunk_size", None)),
         "quest_skip_layers": _jsonable(getattr(config, "quest_skip_layers", None)),
+        "query_robust_vertices_path": _jsonable(
+            getattr(config, "query_robust_vertices_path", None)
+        ),
+        "query_robust_chunk_size": _jsonable(
+            getattr(config, "query_robust_chunk_size", None)
+        ),
+        "query_robust_num_vertices": _jsonable(
+            getattr(config, "query_robust_num_vertices", None)
+        ),
+        "query_robust_solver_iters": _jsonable(
+            getattr(config, "query_robust_solver_iters", None)
+        ),
+        "query_robust_solver_lr": _jsonable(
+            getattr(config, "query_robust_solver_lr", None)
+        ),
+        "query_robust_uniform_p": _jsonable(
+            getattr(config, "query_robust_uniform_p", None)
+        ),
+        "query_robust_skip_layers": _jsonable(
+            getattr(config, "query_robust_skip_layers", None)
+        ),
+        "query_robust_model_fingerprint": _jsonable(
+            getattr(config, "query_robust_model_fingerprint", None)
+        ),
     }
     payload.update(
         {

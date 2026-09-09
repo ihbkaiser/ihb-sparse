@@ -1127,10 +1127,10 @@ class LLMEngine:
         prev_postfix_size: int = 64,
     ) -> dict[str, object]:
         token_ids = [int(token_id) for token_id in token_ids]
-        if str(self.config.sparse_method or "") == "quest":
+        if str(self.config.sparse_method or "") in {"quest", "query_robust"}:
             raise RuntimeError(
-                "QuEST prefix cache/offload remains supported, but physical prefix "
-                "pruning is intentionally unsupported."
+                "QuEST and Query-Robust prefix cache/offload remain supported, but "
+                "physical prefix pruning is intentionally unsupported."
             )
         normalized_policy = validate_prefix_prune_request(
             token_count=len(token_ids),
@@ -1307,6 +1307,16 @@ class LLMEngine:
             "quest_chunk_size",
             "quest_token_budget",
             "quest_skip_layers",
+            "query_robust_vertices_path",
+            "query_robust_num_vertices",
+            "query_robust_chunk_size",
+            "query_robust_solver_iters",
+            "query_robust_solver_lr",
+            "query_robust_score_alpha",
+            "query_robust_skip_layers",
+            "query_robust_uniform_p",
+            "query_robust_model_fingerprint",
+            "query_robust_rope_config",
             "deltakv_checkpoint_path",
             "deltakv_center_ratio",
             "deltakv_latent_dim",

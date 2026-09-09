@@ -12,6 +12,7 @@ from .passthrough import PassThroughRuntime
 from .snapkv import PyramidKVRuntime, SnapKVRuntime
 from .streamingllm import StreamingLLMRuntime
 from .shadowkv import ShadowKVRuntime
+from .query_robust import QueryRobustRuntime
 
 
 RUNTIME_BINDINGS: dict[str, type[SparseMethodRuntime]] = {
@@ -22,6 +23,7 @@ RUNTIME_BINDINGS: dict[str, type[SparseMethodRuntime]] = {
     "pyramidkv": PyramidKVRuntime,
     "omnikv": OmniKVRuntime,
     "quest": PassThroughRuntime,
+    "query_robust": QueryRobustRuntime,
     "rkv": RKVRuntime,
     "skipkv": SkipKVRuntime,
     "deltakv": DeltaKVRuntime,

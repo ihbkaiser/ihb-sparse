@@ -6,6 +6,7 @@ from torch import nn
 import sparsevllm.platforms as platforms
 from sparsevllm.configs.sparse import resolve_shadowkv_outlier_chunks
 from sparsevllm.method_registry import (
+    is_paged_sparse_method,
     normalize_sparse_method,
     resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
@@ -163,6 +164,14 @@ def build_mha_prefill_attention_spec(
     prefill_page_size = 1
     if normalized_method == "quest" and quest_prefill_page_size is not None:
         prefill_page_size = int(quest_prefill_page_size)
+    elif normalized_method == "query_robust":
+        prefill_page_size = int(
+            getattr(
+                score_config,
+                "sparse_page_size",
+                getattr(score_config, "query_robust_chunk_size", 16),
+            )
+        )
     elif normalized_method == "shadowkv":
         prefill_page_size = shadowkv_prefill_page_size
     elif normalized_method in {"", "vanilla"}:
@@ -274,8 +283,14 @@ def build_mha_decode_attention_spec(
         sparse_method=normalized_method,
         causal=True,
         page_size=(
-            int(getattr(runtime_config, "quest_chunk_size", 16))
-            if normalized_method == "quest"
+            int(
+                getattr(
+                    runtime_config,
+                    "sparse_page_size",
+                    getattr(runtime_config, "quest_chunk_size", 16),
+                )
+            )
+            if is_paged_sparse_method(normalized_method)
             else 1
         ),
         # Score demand can change between decode steps for sparse methods.
@@ -290,8 +305,14 @@ def build_mha_decode_attention_spec(
         context_capacity=int(getattr(runtime_config, "max_model_len", 0) or 0)
         or None,
         sparse_context_budget=(
-            int(getattr(runtime_config, "quest_token_budget", 2080))
-            if normalized_method == "quest"
+            int(
+                getattr(
+                    runtime_config,
+                    "sparse_token_budget",
+                    getattr(runtime_config, "quest_token_budget", 2080),
+                )
+            )
+            if is_paged_sparse_method(normalized_method)
             else None
         ),
         may_use_full_layer_kivi_int4=(

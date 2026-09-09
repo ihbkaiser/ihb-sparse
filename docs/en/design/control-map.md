@@ -87,6 +87,7 @@ flowchart TD
 | SnapKV / PyramidKV | `snapkv`, `pyramidkv` | Physical eviction after score-based keep selection; PyramidKV changes per-layer budgets. | `cache_manager/snapkv.py`, `sparse_methods/snapkv.py` |
 | OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. `full_attention_layers=auto` resolves a model profile that may be shared with DeltaKV; unregistered models should be calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers`. | `cache_manager/omnikv.py`, `sparse_methods/dynamic.py`, `omnikv_fused.py` |
 | QuEST | `quest` | Query-aware decode page/chunk selection; persistent page metadata and native view construction remain cache-manager/provider owned. | `cache_manager/quest.py`, `sparse_methods/passthrough.py` |
+| Query-Robust | `query_robust` | Explicit-KV decode page selection from fixed query-hull landmarks, entropy biases, and certificate radii; page lifecycle remains cache-manager/provider owned. | `cache_manager/query_robust.py`, `kernels/triton/query_robust.py`, `sparse_methods/query_robust.py` |
 | DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. Registered models may share OmniKV's `full_attention_layers=auto` profile. | `cache_manager/deltakv*.py`, `sparse_methods/dynamic.py`, `deltakv_kernels.py` |
 
 ## State Ownership Contracts

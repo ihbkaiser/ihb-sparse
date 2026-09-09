@@ -97,7 +97,7 @@ def normalize_prefix_cache(config) -> None:
     if config.enable_prefix_caching and config.sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
         raise ValueError(
             "prefix caching only supports vanilla, streamingllm, omnikv, quest, "
-            "snapkv, h2o, pyramidkv, rkv, and skipkv."
+            "query_robust, snapkv, h2o, pyramidkv, rkv, and skipkv."
         )
     config.prefix_cache_salt = str(config.prefix_cache_salt or "")
 

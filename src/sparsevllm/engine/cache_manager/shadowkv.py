@@ -430,25 +430,6 @@ class ShadowKVCacheManager(StandardCacheManager):
                     f"context_lens={None if context_lens is None else context_lens.numel()} "
                     f"batch={batch_size}."
                 )
-            if self._shadow_gpu_cache_enabled:
-                gpu_index = (context_lens[:batch_size].to(torch.int64) - 1).clamp_min(0)
-                gpu_index = gpu_index[:, None, None, None].expand(
-                    -1, 1, self.num_kv_heads, self.head_dim
-                )
-                workspace["gpu_cache_k"][:batch_size].scatter_(
-                    1,
-                    gpu_index,
-                    k_post_rope.reshape(
-                        batch_size, 1, self.num_kv_heads, self.head_dim
-                    ).to(dtype=workspace["gpu_cache_k"].dtype),
-                )
-                workspace["gpu_cache_v"][:batch_size].scatter_(
-                    1,
-                    gpu_index,
-                    v.reshape(
-                        batch_size, 1, self.num_kv_heads, self.head_dim
-                    ).to(dtype=workspace["gpu_cache_v"].dtype),
-                )
             recent_width = int(workspace["recent_k"].shape[1])
             if recent_width <= 0:
                 raise RuntimeError("ShadowKV CUDA Graph recent-token workspace is empty.")
@@ -501,18 +482,7 @@ class ShadowKVCacheManager(StandardCacheManager):
                     )
                 self._write_shadow(layer_idx, k_post_rope, v, kind="rope_k")
                 return
-            active_rows = list(getattr(self, "_shadow_active_rows", ()))
-            workspace = self._workspace_for_layer(layer_idx)
-            update_workspace = (
-                workspace is not None
-                and len(active_rows) == len(ranges)
-                and all(
-                    int(active_rows[batch_idx]) == int(item[0])
-                    for batch_idx, item in enumerate(ranges)
-                )
-                and int(workspace["gpu_cache_k"].shape[0]) >= len(ranges)
-            )
-            for batch_idx, (row, start, end, source_start, source_end) in enumerate(ranges):
+            for row, start, end, source_start, source_end in ranges:
                 del start, source_end
                 entry = self._entry(row, layer_idx)
                 gpu_k = entry.get("gpu_rope_k")
@@ -524,13 +494,6 @@ class ShadowKVCacheManager(StandardCacheManager):
                     )
                 gpu_k[end - 1].copy_(k_post_rope[source_start], non_blocking=True)
                 gpu_v[end - 1].copy_(v[source_start], non_blocking=True)
-                if update_workspace:
-                    workspace["gpu_cache_k"][batch_idx, end - 1].copy_(
-                        k_post_rope[source_start], non_blocking=True
-                    )
-                    workspace["gpu_cache_v"][batch_idx, end - 1].copy_(
-                        v[source_start], non_blocking=True
-                    )
             # The GPU cache is authoritative in this mode.  Do not mirror
             # generated K/V into the pinned CPU shadow on every decode step.
             for row, _start, end, _source_start, _source_end in ranges:
@@ -1227,21 +1190,14 @@ class ShadowKVCacheManager(StandardCacheManager):
                 }
             )
         if self._shadow_gpu_cache_enabled:
-            gpu_capacity = int(self.config.shadowkv_gpu_cache_tokens)
             expected.update(
                 {
-                    "gpu_cache_k": (
-                        batch_size,
-                        gpu_capacity,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    ),
-                    "gpu_cache_v": (
-                        batch_size,
-                        gpu_capacity,
-                        self.num_kv_heads,
-                        self.head_dim,
-                    ),
+                    # Each request/layer owns its GPU cache entry.  Keep only
+                    # device pointer tables in the graph workspace; copying
+                    # the full 128K K/V cache into every layer workspace would
+                    # duplicate roughly 64 GiB at batch 4.
+                    "gpu_cache_k_ptrs": (batch_size,),
+                    "gpu_cache_v_ptrs": (batch_size,),
                 }
             )
         if current is not None and all(
@@ -1315,8 +1271,8 @@ class ShadowKVCacheManager(StandardCacheManager):
             workspace["offset_v_cache"].zero_()
             workspace["offset_temp"].zero_()
         if self._shadow_gpu_cache_enabled:
-            workspace["gpu_cache_k"].zero_()
-            workspace["gpu_cache_v"].zero_()
+            workspace["gpu_cache_k_ptrs"].zero_()
+            workspace["gpu_cache_v_ptrs"].zero_()
         return workspace
 
     def _load_shadowkv_kernel_backend(self):
@@ -1647,8 +1603,8 @@ class ShadowKVCacheManager(StandardCacheManager):
         workspace["recent_k"].zero_()
         workspace["recent_v"].zero_()
         if self._shadow_gpu_cache_enabled:
-            workspace["gpu_cache_k"].zero_()
-            workspace["gpu_cache_v"].zero_()
+            workspace["gpu_cache_k_ptrs"].zero_()
+            workspace["gpu_cache_v_ptrs"].zero_()
         for batch_idx, row_idx in enumerate(rows):
             entry = self._entry(row_idx, layer_idx)
             required_host_tokens = min(
@@ -1736,12 +1692,8 @@ class ShadowKVCacheManager(StandardCacheManager):
                         "ShadowKV GPU cache entry was not materialized before decode: "
                         f"row={row_idx} layer={layer_idx}."
                     )
-                workspace["gpu_cache_k"][batch_idx, :prompt_len].copy_(
-                    gpu_k[:prompt_len], non_blocking=True
-                )
-                workspace["gpu_cache_v"][batch_idx, :prompt_len].copy_(
-                    gpu_v[:prompt_len], non_blocking=True
-                )
+                workspace["gpu_cache_k_ptrs"][batch_idx] = int(gpu_k.data_ptr())
+                workspace["gpu_cache_v_ptrs"][batch_idx] = int(gpu_v.data_ptr())
 
         # Reuse the same mapped host pointers for every captured replay.  The
         # actual positions are graph inputs, so value/key gathering remains
@@ -2393,20 +2345,21 @@ class ShadowKVCacheManager(StandardCacheManager):
             gpu_cache_gather = self._load_shadowkv_gpu_cache_gather()
             positions = workspace["head_positions"][:batch_size]
             fused_gpu_gather = getattr(
-                gpu_cache_gather, "gather_gpu_cache_per_head_kv", None
+                gpu_cache_gather, "gather_gpu_cache_per_head_kv_ptrs", None
             )
             if fused_gpu_gather is None:
                 raise RuntimeError(
-                    "ShadowKV GPU-cache gather extension is missing the fused "
-                    "gather_gpu_cache_per_head_kv entry point. Rebuild the CUDA extension."
+                    "ShadowKV GPU-cache gather extension is missing the pointer-table "
+                    "gather_gpu_cache_per_head_kv_ptrs entry point. Rebuild the CUDA extension."
                 )
             fused_gpu_gather(
-                workspace["gpu_cache_k"][:batch_size],
-                workspace["gpu_cache_v"][:batch_size],
+                workspace["gpu_cache_k_ptrs"][:batch_size],
+                workspace["gpu_cache_v_ptrs"][:batch_size],
                 positions,
-                context_lens_device,
+                source_lens,
                 head_k_view,
                 head_v_view,
+                int(self.config.shadowkv_gpu_cache_tokens),
             )
         else:
             self._shadow_host_gather.gather_host_per_head(
@@ -2496,7 +2449,7 @@ class ShadowKVCacheManager(StandardCacheManager):
                     offset_event.record(offset_stream)
                     gather_events.append(offset_event)
 
-        if not self._shadow_gpu_cache_enabled and bool(getattr(self.config, "decode_graph", False)):
+        if bool(getattr(self.config, "decode_graph", False)):
             # Prompt KV is mapped from pinned host memory. Generated KV lives
             # in the graph-stable recent buffer and must replace host-gathered
             # zeros for positions beyond the prompt.

@@ -314,6 +314,73 @@ def test_shadowkv_gpu_cache_per_head_gather_matches_oracle_and_graph_replay():
     torch.testing.assert_close(graph_fused_k, expected)
     torch.testing.assert_close(graph_fused_v, expected)
 
+    source_v = source + 17
+    source_k_ptrs = torch.tensor(
+        [int(source[idx].data_ptr()) for idx in range(batch)],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    source_v_ptrs = torch.tensor(
+        [int(source_v[idx].data_ptr()) for idx in range(batch)],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    pointer_fused_k = torch.empty_like(output)
+    pointer_fused_v = torch.empty_like(output)
+    kernel.gather_gpu_cache_per_head_kv_ptrs(
+        source_k_ptrs,
+        source_v_ptrs,
+        positions,
+        lengths,
+        pointer_fused_k,
+        pointer_fused_v,
+        source_width,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(pointer_fused_k, output)
+    expected_v = torch.zeros_like(output)
+    for batch_idx in range(batch):
+        for head_idx in range(heads):
+            for token_idx, position in enumerate(positions[batch_idx, head_idx].cpu().tolist()):
+                if 0 <= position < int(lengths[batch_idx].item()):
+                    expected_v[batch_idx, head_idx, token_idx].copy_(
+                        source_v[batch_idx, position, head_idx]
+                    )
+    torch.testing.assert_close(pointer_fused_v, expected_v)
+
+    graph_positions = positions.clone()
+    graph_pointer_fused_k = torch.empty_like(output)
+    graph_pointer_fused_v = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        kernel.gather_gpu_cache_per_head_kv_ptrs(
+            source_k_ptrs,
+            source_v_ptrs,
+            graph_positions,
+            lengths,
+            graph_pointer_fused_k,
+            graph_pointer_fused_v,
+            source_width,
+        )
+    graph_positions.copy_(positions.flip(-1))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected.zero_()
+    expected_v.zero_()
+    for batch_idx in range(batch):
+        for head_idx in range(heads):
+            for token_idx, position in enumerate(graph_positions[batch_idx, head_idx].cpu().tolist()):
+                if 0 <= position < int(lengths[batch_idx].item()):
+                    expected[batch_idx, head_idx, token_idx].copy_(
+                        source[batch_idx, position, head_idx]
+                    )
+                    expected_v[batch_idx, head_idx, token_idx].copy_(
+                        source_v[batch_idx, position, head_idx]
+                    )
+    torch.testing.assert_close(graph_pointer_fused_k, expected)
+    torch.testing.assert_close(graph_pointer_fused_v, expected_v)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_shadowkv_offset_copy_reuses_device_chunks_and_handles_host_misses():
@@ -476,8 +543,6 @@ def test_shadowkv_graph_gpu_cache_write_is_replay_safe():
     manager.device = torch.device("cuda")
     manager._shadow_decode_workspaces = {
         0: {
-            "gpu_cache_k": torch.zeros(2, 8, 2, 4, dtype=torch.float16, device="cuda"),
-            "gpu_cache_v": torch.zeros(2, 8, 2, 4, dtype=torch.float16, device="cuda"),
             "recent_k": torch.zeros(2, 4, 2, 4, dtype=torch.float16, device="cuda"),
             "recent_v": torch.zeros(2, 4, 2, 4, dtype=torch.float16, device="cuda"),
             "prompt_lens": torch.tensor([3, 4], dtype=torch.int32, device="cuda"),
@@ -503,18 +568,18 @@ def test_shadowkv_graph_gpu_cache_write_is_replay_safe():
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(
-            manager._shadow_decode_workspaces[0]["gpu_cache_k"][0, 4], k_next[0]
+            manager._shadow_decode_workspaces[0]["recent_k"][0, 1], k_next[0]
         )
         torch.testing.assert_close(
-            manager._shadow_decode_workspaces[0]["gpu_cache_v"][1, 6], v_next[1]
+            manager._shadow_decode_workspaces[0]["recent_v"][1, 2], v_next[1]
         )
     finally:
         reset_context()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_shadowkv_eager_gpu_cache_updates_only_the_new_token_in_staged_view():
-    """Catch stale staged GPU-cache rows after removing per-token full restaging."""
+def test_shadowkv_eager_gpu_cache_updates_only_the_new_token_in_authoritative_cache():
+    """Catch stale authoritative GPU-cache rows after removing workspace copies."""
     manager = object.__new__(ShadowKVCacheManager)
     manager.config = SimpleNamespace(
         decode_graph=False,
@@ -526,16 +591,6 @@ def test_shadowkv_eager_gpu_cache_updates_only_the_new_token_in_staged_view():
     manager.device = torch.device("cuda")
     manager._shadow_entries = {}
     manager._shadow_active_rows = [0, 1]
-    manager._shadow_decode_workspaces = {
-        -1: {
-            "gpu_cache_k": torch.zeros(
-                2, 8, 2, 4, dtype=torch.float16, device="cuda"
-            ),
-            "gpu_cache_v": torch.zeros(
-                2, 8, 2, 4, dtype=torch.float16, device="cuda"
-            ),
-        }
-    }
     manager.layer_batch_state = SimpleNamespace(
         req_indices=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
         context_lens=torch.tensor([4, 6], dtype=torch.int32, device="cuda"),
@@ -558,10 +613,10 @@ def test_shadowkv_eager_gpu_cache_updates_only_the_new_token_in_staged_view():
         manager.save_rope_kv_if_needed(0, k, v)
         torch.cuda.synchronize()
         torch.testing.assert_close(
-            manager._shadow_decode_workspaces[-1]["gpu_cache_k"][0, 3], k[0]
+            manager._shadow_entries[(0, 0)]["gpu_rope_k"][3], k[0]
         )
         torch.testing.assert_close(
-            manager._shadow_decode_workspaces[-1]["gpu_cache_v"][1, 5], v[1]
+            manager._shadow_entries[(1, 0)]["gpu_v"][5], v[1]
         )
     finally:
         reset_context()

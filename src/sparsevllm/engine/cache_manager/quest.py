@@ -29,6 +29,7 @@ from sparsevllm.kernels.triton.quest_decode_view import (
     prepare_quest_decode_geometry,
     score_quest_pages,
 )
+from sparsevllm.method_registry import is_paged_sparse_method, normalize_sparse_method
 from sparsevllm.operators.quest_selection import (
     QuestPageSelectionOpSpec,
     resolve_quest_page_selection_provider,
@@ -98,7 +99,13 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             parallel_context,
             allocation_budget_bytes=allocation_budget_bytes,
         )
-        self.page_size = int(config.quest_chunk_size)
+        self.page_size = int(
+            getattr(
+                config,
+                "sparse_page_size",
+                getattr(config, "quest_chunk_size", 16),
+            )
+        )
         self.max_pages_per_row = (self.max_model_len + self.page_size - 1) // self.page_size
         self.page_offsets_i32 = torch.arange(self.page_size, dtype=torch.int32, device=self.device)
         self.page_offsets_i64 = self.page_offsets_i32.to(torch.int64)
@@ -175,14 +182,20 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self._prefill_page_plan: QuestPrefillPagePlan | None = None
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching
-            and config.sparse_method == "quest"
+            and is_paged_sparse_method(config.sparse_method)
             and not getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
         )
         self.prefix_cache_block_size = int(config.prefix_cache_block_size)
         if self.enable_prefix_caching and self.prefix_cache_block_size != self.page_size:
+            page_name = (
+                "quest_chunk_size"
+                if normalize_sparse_method(config.sparse_method) == "quest"
+                else "sparse_page_size"
+            )
             raise ValueError(
-                "Quest prefix cache requires prefix_cache_block_size == quest_chunk_size: "
-                f"prefix_cache_block_size={self.prefix_cache_block_size}, quest_chunk_size={self.page_size}."
+                "Paged sparse prefix cache requires prefix_cache_block_size == "
+                f"{page_name}: prefix_cache_block_size={self.prefix_cache_block_size}, "
+                f"page_size={self.page_size}."
             )
         self.prefix_cache: RadixPrefixIndex | None = None
         if self.enable_prefix_caching:
@@ -215,6 +228,24 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         )
         if bool(getattr(config, "enable_prefix_cache_offload", False)) and not has_linear_layers:
             self._init_prefix_offload()
+
+    def _decode_token_budget(self) -> int:
+        return int(
+            getattr(
+                self.config,
+                "sparse_token_budget",
+                getattr(self.config, "quest_token_budget", 0),
+            )
+        )
+
+    def _decode_skip_layers(self) -> int:
+        return int(
+            getattr(
+                self.config,
+                "sparse_skip_layers",
+                getattr(self.config, "quest_skip_layers", 0),
+            )
+        )
 
     def _init_prefix_offload(self) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
@@ -720,7 +751,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         seq.prefix_cache_hit_block_count = int(hit_blocks)
         seq.prefix_cache_hit_last_block_id = last_block_id
         seq.prefix_cache_block_size = self.page_size
-        seq.prefix_cache_method = "quest"
+        seq.prefix_cache_method = str(self.config.sparse_method or "")
 
     def _free_prefix_cache_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
         pending = getattr(self, "_prefix_write_through_candidates", None)
@@ -2482,9 +2513,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         num_kv_heads: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if isinstance(self.attention_cache_storage, MlaLatentStorage):
-            if layer_idx < self.config.quest_skip_layers:
+            if layer_idx < self._decode_skip_layers():
                 return active_slots, req_indices, context_lens
-            token_budget = int(self.config.quest_token_budget)
+            token_budget = self._decode_token_budget()
             if token_budget <= 0:
                 return active_slots, req_indices, context_lens
             return self._build_token_decode_view_static(
@@ -2503,7 +2534,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 q,
                 req_indices,
                 context_lens,
-                token_budget=int(self.config.quest_token_budget),
+                token_budget=self._decode_token_budget(),
                 num_kv_heads=num_kv_heads,
             )
         )
@@ -2540,7 +2571,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             q,
             selection.req_indices,
             selection.context_lens,
-            token_budget=int(self.config.quest_token_budget),
+            token_budget=self._decode_token_budget(),
             num_kv_heads=num_kv_heads,
         )
         max_context_len = selection.max_context_len
@@ -2826,7 +2857,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 max(1, (max_context_len + self.page_size - 1) // self.page_size),
             )
             if (
-                layer_idx < self.config.quest_skip_layers
+                layer_idx < self._decode_skip_layers()
                 or token_budget <= 0
                 or max_context_len <= max_keep
             ):

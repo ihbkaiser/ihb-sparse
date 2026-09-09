@@ -43,7 +43,7 @@ def config_requires_sgl_kernel(config: object) -> bool:
     provider dependency contracts are made equally explicit.
     """
     sparse_method = str(getattr(config, "sparse_method", "") or "").strip().lower()
-    return sparse_method not in {"quest", "shadowkv"}
+    return sparse_method not in {"quest", "query_robust", "shadowkv"}
 
 
 def validate_required_cuda_kernel_metadata(*, require_sgl: bool = True) -> None:

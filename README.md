@@ -47,7 +47,7 @@ Sparse-vLLM is an inference framework built with sparsity as the first design pr
 
 Sparse-vLLM supports physical eviction, logical masking, query-aware selection,
 and hybrid KV compression. The main method families are `streamingllm`,
-`snapkv`, `h2o`, `pyramidkv`, `omnikv`, `quest`, and `deltakv`.
+`snapkv`, `h2o`, `pyramidkv`, `omnikv`, `quest`, `query_robust`, and `deltakv`.
 
 | Method | Type | Short Description |
 | --- | --- | --- |
@@ -57,7 +57,13 @@ and hybrid KV compression. The main method families are `streamingllm`,
 | `h2o` | Physical eviction | Maintains independent cumulative attention importance for every layer, then physically compacts each layer's KV rows using its own heavy-hitter selection plus a recent suffix. |
 | `omnikv` | Logical masking | Keeps tokens in storage but masks the attention read view so sparse layers attend only selected context. |
 | `quest` | Query-aware selection | Uses decode-time query-aware page selection while keeping prefill dense. |
+| `query_robust` | Query-aware selection | Uses fixed, offline-calibrated query-hull page summaries and certified page-radius routing for explicit-KV decode. |
 | `deltakv` / `deltakv-*` | Hybrid compression | Keeps a small full-precision pool and stores older context through DeltaKV compression or related ablations. |
+
+Query-Robust's certificate is exact on the finite convex hull of its calibrated
+post-RoPE decode-query vertices. With the default 64 vertices in a 128-dimensional
+head space, that hull has measure zero; behavior on held-out serving queries is
+an empirical generalization claim and requires calibration validation.
 
 Read the method overview and integration rules in
 [Core Sparse Methods](docs/en/features/sparse-methods.md).

@@ -18,6 +18,7 @@ Set `sparse_method` to one of the following method names.
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST selects token pages from persistent min/max page summaries. Prefill stays dense. Explicit-KV models score in key coordinates; GLM-4.7-Flash scores the fused MLA latent/RoPE cache with the matching absorbed decode query while keeping the compute payload latent. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
+| `query_robust` | Query-robust page selection | Uses fixed offline post-RoPE query vertices to build one BF16 landmark, FP32 entropy bias, and FP32 certificate radius per sealed page and KV head. Decode scores one shared page route per request by GQA max reduction; prefill remains dense/chunked. v1 requires explicit homogeneous KV storage and a calibrated asset. | `query_robust_vertices_path`, `query_robust_num_vertices`, `query_robust_chunk_size`, `query_robust_solver_iters`, `query_robust_solver_lr`, `query_robust_score_alpha`, `query_robust_skip_layers`, `query_robust_uniform_p` |
 | `deltakv` | Hybrid compression | Slim compressor-backed DeltaKV runtime. Legacy `deltakv-less-memory*` names normalize here for older configs, but real benchmark runs still require a matching compressor checkpoint. | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
 Sparse-vLLM uses `sparse_method` unchanged in public commands, `LLM(...)`, the
@@ -52,7 +53,7 @@ should not redefine method semantics.
 
 | Policy | Runtime Semantics | Current Default Methods |
 | --- | --- | --- |
-| `all_chunked` | Every prefill request is capped by `engine_prefill_chunk_size` and normal scheduler batch limits; `long_prefill_offload_threshold` is ignored. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `omnikv` |
+| `all_chunked` | Every prefill request is capped by `engine_prefill_chunk_size` and normal scheduler batch limits; `long_prefill_offload_threshold` is ignored. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `h2o`, `quest`, `query_robust`, `omnikv` |
 | `long_bs1full_short_batch` | After supported prefix attachment, residuals at or below `long_prefill_offload_threshold` use atomic full prefill and may batch. Larger residuals are isolated and use RawKV offload chunks capped by `engine_prefill_chunk_size`. | `pyramidkv` and DeltaKV-family methods |
 
 DeltaKV-family methods and PyramidKV keep `long_bs1full_short_batch` as the only
@@ -71,7 +72,7 @@ compressed or quantized row metadata.
 ## Prefix cache modes
 
 `enable_prefix_caching=true` supports two deliberately separate layouts.
-`prefix_cache_mode=auto` chooses radix for vanilla/OmniKV/QuEST and a linear
+`prefix_cache_mode=auto` chooses radix for vanilla/OmniKV/QuEST/Query-Robust and a linear
 chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be
 requested explicitly, but incompatible method/mode pairs fail fast.
 GLM-4.7-Flash QuEST is a storage-specific exception: its latent QuEST path does
@@ -125,3 +126,20 @@ contract.
 
 `quest_token_budget` is no longer a runtime input. Passing it fails fast; remove
 it and configure the three common keep-token fields instead.
+
+`query_robust` runtime knobs:
+
+- `query_robust_vertices_path`: `.pt` or `.npz` asset containing BF16 vertices,
+  `num_valid_vertices`, and calibration metadata
+- `query_robust_chunk_size`: physical page size; the default is 16 tokens
+- `query_robust_solver_iters` and `query_robust_solver_lr`: fixed FP32 page-summary
+  solver schedule
+- `query_robust_score_alpha`: routing radius weight, restricted to `0`, `0.5`, or `1`
+- `query_robust_skip_layers`: keep the first N layers on the dense paged view
+- `query_robust_uniform_p`: force the uniform-page mean-landmark baseline
+
+Generate and validate assets with the scripts under `tools/query_robust/`. Query
+captures must be actual post-RoPE decode queries from the frozen model; synthetic
+queries and runtime modification of the vertex set are unsupported. Query-Robust
+prefix caching is available for pure explicit-KV models, but prefix-cache offload
+and MLA/mixed recurrent layouts are rejected in v1.
