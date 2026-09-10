@@ -212,3 +212,133 @@ explicit terminal status. Sparse-vLLM currently compresses after its combined
 context/question prefill, whereas kvpress compresses context before the
 question pass; this semantic difference is recorded in `run_info.json` and
 must be included when interpreting comparisons.
+
+## Full RULER artifacts at 32K, 64K, and 128K
+
+The hosted `simonjegou/ruler` artifact is convenient for 4096/8192/16384, but
+the full long-context files requested for this experiment are not checked into
+Sparse-vLLM. Use the legacy NVIDIA RULER generator from a local checkout and
+the tokenizer of the model being evaluated. The wrapper preserves the
+generator's preformatted prompt and answer prefix, merges all 13 official
+synthetic tasks, validates coverage, and writes exactly:
+
+```text
+ruler-32768.jsonl
+ruler-65536.jsonl
+ruler-131072.jsonl
+```
+
+Each row contains `prompt`, `answer_prefix`, `answer`, `task`,
+`max_new_tokens`, `model_template_type`, and provenance fields. `source_index` preserves the upstream
+task value; `source_row_index` is the unique row ordinal because some NIAH
+tasks reuse the upstream value. The evaluator uses `prompt + answer_prefix`
+directly, so `quest`, `shadowkv`, and `query_robust` receive
+identical tokenizer-visible inputs. The old `context/question` JSONL schema
+remains supported.
+
+First prepare a legacy upstream checkout containing `scripts/data/prepare.py`
+and its essay/QA assets. The current upstream repository also documents newer
+pipeline layouts, so verify that the checkout passes the wrapper's explicit
+legacy-layout check before starting:
+
+```bash
+RULER_REPO=/path/to/NVIDIA-RULER
+git clone --branch main https://github.com/NVIDIA/RULER.git "$RULER_REPO"
+cd "$RULER_REPO/scripts/data/synthetic/json"
+python download_paulgraham_essay.py
+bash download_qa_dataset.sh
+```
+
+Run a small smoke artifact before starting the full generation:
+
+```bash
+MODEL_PATH=/path/to/model
+MODEL_TEMPLATE_TYPE=meta-llama3  # choose the matching entry from RULER template.py
+RULER_WORK=/path/to/ruler-work
+RULER_OUTPUT=/path/to/ruler-artifacts
+
+python benchmark/kvpress_ruler/prepare_full_ruler.py \
+  --model-path "$MODEL_PATH" \
+  --model-template-type "$MODEL_TEMPLATE_TYPE" \
+  --ruler-repo "$RULER_REPO" \
+  --work-dir "$RULER_WORK" \
+  --output-dir "$RULER_OUTPUT/smoke" \
+  --lengths 32768 \
+  --tasks niah_single_1 vt \
+  --num-samples 2
+```
+
+After checking the smoke JSONL, generate all 13 tasks with the default 500
+samples per task and upload the three files. Authenticate with Hugging Face
+beforehand using `hf auth login` or the standard `HF_TOKEN` mechanism; the
+token is never passed as a command-line argument.
+
+```bash
+HF_REPO_ID=your-account/ruler-full-llama31
+HF_UPLOAD_REVISION=main
+
+python benchmark/kvpress_ruler/prepare_full_ruler.py \
+  --model-path "$MODEL_PATH" \
+  --model-template-type "$MODEL_TEMPLATE_TYPE" \
+  --ruler-repo "$RULER_REPO" \
+  --work-dir "$RULER_WORK" \
+  --output-dir "$RULER_OUTPUT/full" \
+  --lengths 32768,65536,131072 \
+  --num-samples 500 \
+  --seed 42 \
+  --hf-repo-id "$HF_REPO_ID" \
+  --hf-revision "$HF_UPLOAD_REVISION"
+```
+
+The upload contains `ruler-32768.jsonl`, `ruler-65536.jsonl`, and
+`ruler-131072.jsonl`. The upstream per-task files and cache metadata remain
+under `RULER_WORK` for resume/debugging. A cache is reused only when model
+path, template, seed, sample count, target length, and generator commit match;
+use a fresh work directory after changing any of them. Place that directory on
+storage with enough free space. Preparation is resumable: a complete
+`ruler-<length>.jsonl` is validated and skipped on later runs, while an
+interrupted run keeps `ruler-<length>.jsonl.partial` and continues from its
+last validated row. The final JSONL is promoted only after complete coverage
+validation, so rerunning the same command does not regenerate completed tasks.
+
+Evaluate any of the three sparse methods by selecting the same HF repository
+and one target length. Omit `--fraction` and `--max-samples` for the complete
+file:
+
+```bash
+LENGTH=131072
+HF_REVISION=<immutable-commit-or-tag>
+
+python benchmark/kvpress_ruler/evaluate.py \
+  --model-path "$MODEL_PATH" \
+  --sparse-method quest \
+  --dataset-repo-id "$HF_REPO_ID" \
+  --dataset-revision "$HF_REVISION" \
+  --data-dir "$LENGTH" \
+  --output-dir "results/kvpress-ruler/quest-$LENGTH"
+
+python benchmark/kvpress_ruler/evaluate.py \
+  --model-path "$MODEL_PATH" \
+  --sparse-method shadowkv \
+  --dataset-repo-id "$HF_REPO_ID" \
+  --dataset-revision "$HF_REVISION" \
+  --data-dir "$LENGTH" \
+  --output-dir "results/kvpress-ruler/shadowkv-$LENGTH"
+
+python benchmark/kvpress_ruler/evaluate.py \
+  --model-path "$MODEL_PATH" \
+  --sparse-method query_robust \
+  --dataset-repo-id "$HF_REPO_ID" \
+  --dataset-revision "$HF_REVISION" \
+  --data-dir "$LENGTH" \
+  --query-robust-vertices-path /path/to/qr_vertices.pt \
+  --output-dir "results/kvpress-ruler/query-robust-$LENGTH"
+```
+
+Repeat with `LENGTH=32768` and `LENGTH=65536`, using distinct output
+directories. `--data-dir` selects one file through the default template
+`ruler-{data_dir}.jsonl`; it does not generate or combine context lengths.
+Keep the model, tokenizer, seed, decoding settings, and immutable artifact
+revision fixed across methods for a matched comparison. If 128K inference
+exceeds available GPU memory, lower `--batch-size` to `1`; this changes
+throughput, not the dataset or scoring protocol.

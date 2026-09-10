@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2",
     "accelerate",
     "datasets",
+    "huggingface_hub",
     "wandb",
     "bitsandbytes",
     "datatrove",

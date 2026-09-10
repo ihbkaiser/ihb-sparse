@@ -22,12 +22,14 @@ import random
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -44,6 +46,9 @@ class EvalConfig:
     dataset_name: str = "simonjegou/ruler"
     data_dir: str = "4096"
     dataset_path: str | None = None
+    dataset_repo_id: str | None = None
+    dataset_revision: str = "main"
+    dataset_file_template: str = "ruler-{data_dir}.jsonl"
     sparse_method: str = "quest"
     fraction: float = 1.0
     max_samples: int | None = None
@@ -96,6 +101,13 @@ def _parse_args() -> EvalConfig:
     parser.add_argument("--dataset-name", default="simonjegou/ruler")
     parser.add_argument("--data-dir", default="4096")
     parser.add_argument("--dataset-path", default=None)
+    parser.add_argument("--dataset-repo-id", default=None)
+    parser.add_argument("--dataset-revision", default="main")
+    parser.add_argument(
+        "--dataset-file-template",
+        default="ruler-{data_dir}.jsonl",
+        help="Filename template used with --dataset-repo-id.",
+    )
     parser.add_argument(
         "--sparse-method",
         choices=("quest", "shadowkv", "query_robust"),
@@ -194,12 +206,30 @@ def _parse_args() -> EvalConfig:
         default=False,
     )
     args = parser.parse_args()
+    if args.dataset_path and args.dataset_repo_id:
+        raise ValueError("Use only one of --dataset-path and --dataset-repo-id.")
+    try:
+        filename = args.dataset_file_template.format(data_dir=args.data_dir)
+    except (KeyError, IndexError, ValueError) as error:
+        raise ValueError(
+            "--dataset-file-template must be format-compatible with {data_dir}."
+        ) from error
+    if args.dataset_repo_id and (
+        not filename or filename.startswith("/") or ".." in Path(filename).parts
+    ):
+        raise ValueError(
+            "--dataset-file-template must resolve to a relative file path without '..'."
+        )
     if not 0.0 < args.fraction <= 1.0:
         raise ValueError("--fraction must be in (0, 1].")
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be positive when set.")
+    if args.max_context_length is not None and args.max_context_length <= 0:
+        raise ValueError("--max-context-length must be positive when set.")
     if args.max_new_tokens is not None and args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive when set.")
+    if args.max_model_len is not None and args.max_model_len <= 0:
+        raise ValueError("--max-model-len must be positive when set.")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
     if args.shadowkv_svd_batch_size <= 0:
@@ -234,44 +264,240 @@ def _parse_args() -> EvalConfig:
     return EvalConfig(**vars(args))
 
 
-def _load_rows(config: EvalConfig) -> list[dict[str, Any]]:
+def _iter_jsonl_rows(path: Path) -> Iterator[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid RULER JSONL at {path}:{line_number}: {error}"
+                ) from error
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"RULER row at {path}:{line_number} must be an object; "
+                    f"got {type(row).__name__}."
+                )
+            yield row
+
+
+def _read_json_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"RULER dataset path does not exist: {path}")
+    if path.suffix == ".jsonl":
+        return list(_iter_jsonl_rows(path))
+    if path.suffix == ".json":
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, list):
+            raise ValueError(f"RULER JSON dataset must contain a list: {path}")
+        if not all(isinstance(row, dict) for row in value):
+            raise ValueError(f"Every RULER JSON row must be an object: {path}")
+        return [dict(row) for row in value]
+    raise ValueError("RULER dataset must be a .json or .jsonl file.")
+
+
+def _download_hf_dataset_file(
+    *, repo_id: str, filename: str, revision: str
+) -> str:
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise RuntimeError(
+            "--dataset-repo-id requires the 'huggingface_hub' package."
+        ) from error
+    return hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        repo_type="dataset",
+        revision=revision,
+    )
+
+
+def _validate_dataset_row(
+    row: dict[str, Any], *, index: int, source: str, schema: str
+) -> None:
+    legacy_required = {
+        "context",
+        "question",
+        "answer_prefix",
+        "answer",
+        "task",
+        "max_new_tokens",
+    }
+    prompt_required = {"prompt", "answer_prefix", "answer", "task", "max_new_tokens"}
+    required = prompt_required if schema == "prompt" else legacy_required
+    missing = sorted(required - set(row))
+    if missing:
+        raise ValueError(
+            f"RULER dataset row {index} from {source} is missing columns: {missing}"
+        )
+    if schema == "prompt" and "prompt" not in row:
+        raise ValueError(
+            f"RULER dataset mixes prompt and context/question schemas at row {index}."
+        )
+    if schema == "context_question" and "prompt" in row:
+        raise ValueError(
+            f"RULER dataset mixes context/question and prompt schemas at row {index}."
+        )
+    text_fields = ("prompt", "answer_prefix") if schema == "prompt" else (
+        "context",
+        "question",
+        "answer_prefix",
+    )
+    for field in text_fields:
+        if not isinstance(row[field], str):
+            raise ValueError(
+                f"RULER dataset row {index} field {field!r} from {source} "
+                f"must be a string; got {type(row[field]).__name__}."
+            )
+    if not row["prompt" if schema == "prompt" else "context"]:
+        raise ValueError(
+            f"RULER dataset row {index} from {source} has an empty prompt/context."
+        )
+    answer = row["answer"]
+    if isinstance(answer, str):
+        if not answer:
+            raise ValueError(
+                f"RULER dataset row {index} from {source} has an empty answer."
+            )
+    elif isinstance(answer, (list, tuple)) and answer:
+        if not all(isinstance(reference, str) and reference for reference in answer):
+            raise ValueError(
+                f"RULER dataset row {index} from {source} has invalid answer references."
+            )
+    else:
+        raise ValueError(
+            f"RULER dataset row {index} from {source} must have a string or "
+            "non-empty list of answer references."
+        )
+    raw_max_new_tokens = row["max_new_tokens"]
+    if isinstance(raw_max_new_tokens, bool):
+        raise ValueError(
+            f"RULER dataset row {index} from {source} has invalid max_new_tokens."
+        )
+    try:
+        parsed_max_new_tokens = int(raw_max_new_tokens)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"RULER dataset row {index} from {source} has non-integer "
+            f"max_new_tokens={raw_max_new_tokens!r}."
+        ) from error
+    if parsed_max_new_tokens <= 0:
+        raise ValueError(
+            f"RULER dataset row {index} from {source} has non-positive "
+            f"max_new_tokens={parsed_max_new_tokens}."
+        )
+
+
+def _validated_row_factory(
+    raw_factory: Callable[[], Iterator[dict[str, Any]]], *, source: str
+) -> Callable[[], Iterator[dict[str, Any]]]:
+    def factory() -> Iterator[dict[str, Any]]:
+        raw_rows = iter(raw_factory())
+        try:
+            first_row = next(raw_rows)
+        except StopIteration as error:
+            raise ValueError(f"RULER dataset is empty: {source}") from error
+        schema = "prompt" if "prompt" in first_row else "context_question"
+        _validate_dataset_row(first_row, index=0, source=source, schema=schema)
+        yield first_row
+        for index, row in enumerate(raw_rows, start=1):
+            _validate_dataset_row(row, index=index, source=source, schema=schema)
+            yield row
+
+    return factory
+
+
+def _dataset_row_factory(
+    config: EvalConfig,
+) -> tuple[Callable[[], Iterator[dict[str, Any]]], str]:
     if config.dataset_path:
         path = Path(config.dataset_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"RULER dataset path does not exist: {path}")
         if path.suffix == ".jsonl":
-            rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        elif path.suffix == ".json":
-            rows = json.loads(path.read_text())
+            raw_factory = lambda: _iter_jsonl_rows(path)
         else:
-            raise ValueError("--dataset-path must point to a .json or .jsonl file.")
+            json_rows = _read_json_rows(path)
+            raw_factory = lambda: iter(json_rows)
+        source = config.dataset_path
+    elif config.dataset_repo_id:
+        try:
+            filename = config.dataset_file_template.format(data_dir=config.data_dir)
+        except (KeyError, IndexError, ValueError) as error:
+            raise ValueError(
+                "--dataset-file-template must be format-compatible with {data_dir}."
+            ) from error
+        downloaded_path = Path(
+            _download_hf_dataset_file(
+                repo_id=config.dataset_repo_id,
+                filename=filename,
+                revision=config.dataset_revision,
+            )
+        )
+        if downloaded_path.suffix != ".jsonl":
+            json_rows = _read_json_rows(downloaded_path)
+            raw_factory = lambda: iter(json_rows)
+        else:
+            raw_factory = lambda: _iter_jsonl_rows(downloaded_path)
+        source = f"hf://datasets/{config.dataset_repo_id}/{filename}@{config.dataset_revision}"
     else:
         try:
             from datasets import load_dataset
         except ImportError as error:
             raise RuntimeError(
-                "The kvpress RULER runner requires the 'datasets' package, or use --dataset-path."
+                "The kvpress RULER runner requires the 'datasets' package, or use "
+                "--dataset-path/--dataset-repo-id."
             ) from error
-        rows = load_dataset(
-            config.dataset_name,
-            data_dir=config.data_dir or None,
-            split="test",
-        )
-        rows = [dict(row) for row in rows]
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("RULER dataset is empty or not a list of rows.")
-    required = {"context", "question", "answer_prefix", "answer", "task", "max_new_tokens"}
-    missing = sorted(required - set(rows[0]))
-    if missing:
-        raise ValueError(f"RULER dataset is missing required columns: {missing}")
-    rng = random.Random(config.seed)
-    rows = list(rows)
+        dataset_rows = [
+            dict(row)
+            for row in load_dataset(
+                config.dataset_name,
+                data_dir=config.data_dir or None,
+                split="test",
+            )
+        ]
+        raw_factory = lambda: iter(dataset_rows)
+        source = f"datasets://{config.dataset_name}/{config.data_dir}"
+    return _validated_row_factory(raw_factory, source=source), source
+
+
+def _selected_row_factory(
+    row_factory: Callable[[], Iterator[dict[str, Any]]], config: EvalConfig
+) -> Callable[[], Iterator[dict[str, Any]]]:
+    selected_indices: list[int] | None = None
     if config.fraction < 1.0:
-        count = max(1, int(len(rows) * config.fraction))
-        rows = [rows[index] for index in sorted(rng.sample(range(len(rows)), count))]
-    if config.max_samples is not None:
-        rows = rows[: config.max_samples]
-    return rows
+        total = sum(1 for _ in row_factory())
+        count = max(1, int(total * config.fraction))
+        rng = random.Random(config.seed)
+        selected_indices = sorted(rng.sample(range(total), count))
+        if config.max_samples is not None:
+            selected_indices = selected_indices[: config.max_samples]
+
+    def factory() -> Iterator[dict[str, Any]]:
+        if selected_indices is None:
+            limit = config.max_samples
+            for index, row in enumerate(row_factory()):
+                if limit is not None and index >= limit:
+                    break
+                yield row
+            return
+        selected = iter(selected_indices)
+        next_selected = next(selected, None)
+        for index, row in enumerate(row_factory()):
+            if next_selected is None:
+                break
+            if index == next_selected:
+                yield row
+                next_selected = next(selected, None)
+
+    return factory
+
+
+def _load_rows(config: EvalConfig) -> list[dict[str, Any]]:
+    row_factory, _ = _dataset_row_factory(config)
+    selected_factory = _selected_row_factory(row_factory, config)
+    return list(selected_factory())
 
 
 def _references(value: Any, *, task: str) -> list[str]:
@@ -308,6 +534,65 @@ def _resolve_max_new_tokens(
     return resolved
 
 
+def _build_evaluation_groups(
+    tasks: list[str], max_new_tokens: list[int]
+) -> list[dict[str, Any]]:
+    """Group selected rows by task and their resolved generation budget.
+
+    Groups retain first-seen order, while each group's indices retain the
+    original selected-dataset order. Including the budget in the key keeps a
+    malformed or custom RULER file from mixing requests with different decode
+    lengths in one batch.
+    """
+    if len(tasks) != len(max_new_tokens):
+        raise ValueError(
+            "tasks and max_new_tokens must have the same number of rows: "
+            f"{len(tasks)} != {len(max_new_tokens)}."
+        )
+    groups_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    groups: list[dict[str, Any]] = []
+    for index, (task, budget) in enumerate(zip(tasks, max_new_tokens)):
+        key = (str(task), int(budget))
+        group = groups_by_key.get(key)
+        if group is None:
+            group = {
+                "task": key[0],
+                "max_new_tokens": key[1],
+                "indices": [],
+            }
+            groups_by_key[key] = group
+            groups.append(group)
+        group["indices"].append(index)
+    return groups
+
+
+def _iter_rows_at_indices(
+    row_factory: Callable[[], Iterator[dict[str, Any]]],
+    indices: list[int],
+) -> Iterator[tuple[int, dict[str, Any]]]:
+    """Replay selected rows at sorted positions without materializing them."""
+    if indices != sorted(indices) or len(indices) != len(set(indices)):
+        raise ValueError("row indices must be sorted and unique")
+    wanted = iter(indices)
+    next_index = next(wanted, None)
+    for index, row in enumerate(row_factory()):
+        if next_index is None:
+            return
+        if index == next_index:
+            yield index, row
+            next_index = next(wanted, None)
+        elif index > next_index:
+            raise RuntimeError(
+                "RULER dataset changed between tokenizer and generation passes: "
+                f"missing selected row index {next_index}."
+            )
+    if next_index is not None:
+        raise RuntimeError(
+            "RULER dataset changed between tokenizer and generation passes: "
+            f"missing selected row index {next_index}."
+        )
+
+
 def _kvpress_prompt(
     tokenizer,
     context: str,
@@ -340,6 +625,34 @@ def _kvpress_prompt(
     return context_ids + question_ids
 
 
+def _row_prompt(tokenizer, row: dict[str, Any], *, max_context_length: int) -> list[int]:
+    """Build one prompt from either the legacy or preformatted RULER schema."""
+    if "prompt" in row:
+        prompt_text = str(row["prompt"])
+        answer_prefix = str(row["answer_prefix"])
+        prompt = tokenizer.encode(
+            prompt_text + answer_prefix,
+            add_special_tokens=False,
+        )
+        if len(prompt) <= max_context_length:
+            return prompt
+        # Keep the generation prefix even when a caller explicitly imposes a
+        # shorter limit. The full prompt path above remains the normal,
+        # boundary-faithful path; this branch is only for truncation.
+        prefix_ids = tokenizer.encode(answer_prefix, add_special_tokens=False)
+        if len(prefix_ids) >= max_context_length:
+            return prefix_ids[-max_context_length:]
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        return prompt_ids[: max_context_length - len(prefix_ids)] + prefix_ids
+    return _kvpress_prompt(
+        tokenizer,
+        str(row["context"]),
+        str(row["question"]),
+        str(row["answer_prefix"]),
+        max_context_length=max_context_length,
+    )
+
+
 def _score(task: str, prediction: str, references: list[str]) -> float:
     normalized = re.sub(r"[\x00-\x1f]", "", prediction.strip()).lower()
     if not references:
@@ -353,6 +666,15 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _make_evaluation_progress(total: int):
+    return tqdm(
+        total=int(total),
+        desc="Evaluating",
+        unit="sample",
+        dynamic_ncols=True,
+    )
 
 
 def _build_infer_config(
@@ -424,7 +746,8 @@ def main() -> None:
     config = _parse_args()
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows = _load_rows(config)
+    row_factory, dataset_source = _dataset_row_factory(config)
+    selected_factory = _selected_row_factory(row_factory, config)
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -435,23 +758,40 @@ def main() -> None:
     from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=False)
-    prompts: list[list[int]] = []
-    max_new_tokens = _resolve_max_new_tokens(rows, override=config.max_new_tokens)
-    for row in rows:
-        context = str(row["context"])
-        max_context_length = config.max_context_length
-        if max_context_length is None:
-            max_context_length = min(int(tokenizer.model_max_length), int(1e10))
-        prompts.append(
-            _kvpress_prompt(
-                tokenizer,
-                context,
-                str(row["question"]),
-                str(row["answer_prefix"]),
-                max_context_length=max_context_length,
+    max_new_tokens: list[int] = []
+    prompt_schema: str | None = None
+    max_context_length = config.max_context_length
+    if max_context_length is None:
+        max_context_length = min(int(tokenizer.model_max_length), int(1e10))
+    # Keep only lengths in memory. A complete 128K artifact can contain
+    # thousands of prompts, so retaining every token-id list would consume
+    # multiple gigabytes before inference starts.
+    prompt_lengths: list[int] = []
+    task_names: list[str] = []
+    for row in selected_factory():
+        if prompt_schema is None:
+            prompt_schema = "prompt" if "prompt" in row else "context_question"
+        task_names.append(str(row["task"]))
+        max_new_tokens.append(
+            _resolve_max_new_tokens([row], override=config.max_new_tokens)[0]
+        )
+        prompt_lengths.append(
+            len(
+                _row_prompt(
+                    tokenizer,
+                    row,
+                    max_context_length=max_context_length,
+                )
             )
         )
-    inferred_max_model_len = max(len(prompt) + tokens for prompt, tokens in zip(prompts, max_new_tokens)) + 16
+    dataset_rows = len(prompt_lengths)
+    if not dataset_rows or prompt_schema is None:
+        raise ValueError("RULER dataset is empty after applying selection.")
+    evaluation_groups = _build_evaluation_groups(task_names, max_new_tokens)
+    inferred_max_model_len = max(
+        prompt_length + tokens
+        for prompt_length, tokens in zip(prompt_lengths, max_new_tokens)
+    ) + 16
     if config.max_model_len is not None and config.max_model_len < inferred_max_model_len:
         raise ValueError(
             f"--max-model-len={config.max_model_len} is smaller than the evaluated prompt budget "
@@ -466,7 +806,9 @@ def main() -> None:
         # GPU-cache mode needs a fixed allocation before the first prefill.
         # Deriving it here keeps the fast profile usable without a duplicated
         # max-model-len flag while still recording the effective capacity.
-        config.shadowkv_gpu_cache_tokens = int(resolved_max_model_len)
+        config = replace(
+            config, shadowkv_gpu_cache_tokens=int(resolved_max_model_len)
+        )
     infer_config = _build_infer_config(
         config,
         resolved_max_model_len=resolved_max_model_len,
@@ -505,8 +847,27 @@ def main() -> None:
         "max_new_tokens_source": (
             "cli_override" if config.max_new_tokens is not None else "dataset_row"
         ),
-        "dataset_rows": len(rows),
-        "prompt_semantics": "kvpress tokenizer-visible context + question + answer_prefix",
+        "dataset_source": dataset_source,
+        "dataset_rows": dataset_rows,
+        "evaluation_grouping": {
+            "policy": "task_and_max_new_tokens",
+            "num_groups": len(evaluation_groups),
+            "groups": [
+                {
+                    "group_index": group_index,
+                    "task": group["task"],
+                    "max_new_tokens": group["max_new_tokens"],
+                    "num_rows": len(group["indices"]),
+                    "row_indices": group["indices"],
+                }
+                for group_index, group in enumerate(evaluation_groups)
+            ],
+        },
+        "prompt_semantics": (
+            "preformatted RULER prompt + answer_prefix"
+            if prompt_schema == "prompt"
+            else "kvpress tokenizer-visible context + question + answer_prefix"
+        ),
         "native_semantic_difference": "Sparse-vLLM compresses after its combined prefill; kvpress presses context before question decoding.",
         "device": config.device,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
@@ -518,6 +879,8 @@ def main() -> None:
     raw_rows: list[dict[str, Any]] = []
     parsed_rows: list[dict[str, Any]] = []
     result_rows: list[dict[str, Any]] = []
+    processed_indices: set[int] = set()
+    progress = _make_evaluation_progress(dataset_rows)
     try:
         if config.device.startswith("cuda"):
             if not torch.cuda.is_available():
@@ -538,37 +901,120 @@ def main() -> None:
         (output_dir / "runtime_bindings.json").write_text(
             json.dumps(runtime_start, indent=2, default=str), encoding="utf-8"
         )
-        outputs = generate(
-            prompts,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=0.0,
-        )
-        if not isinstance(outputs, list) or len(outputs) != len(rows):
-            raise RuntimeError(f"Native generation returned {len(outputs) if isinstance(outputs, list) else type(outputs)} outputs for {len(rows)} rows.")
-        for index, (row, prediction) in enumerate(zip(rows, outputs)):
-            prediction = str(prediction)
-            raw_rows.append({"index": index, "prediction": prediction})
-            parsed_rows.append({"index": index, "predicted_answer": prediction.strip()})
-            result_rows.append(
-                {
-                    "index": index,
-                    "task": str(row["task"]),
-                    "status": "success",
-                    "predicted_answer": prediction,
-                    "answer": _references(row["answer"], task=str(row["task"])),
-                    "score": _score(
-                        str(row["task"]),
-                        prediction,
-                        _references(row["answer"], task=str(row["task"])),
-                    ),
-                    "input_token_count": len(prompts[index]),
-                    "max_new_tokens": max_new_tokens[index],
-                    "output_token_count": len(
-                        tokenizer.encode(prediction, add_special_tokens=False)
-                    ),
-                }
-            )
+        for group in evaluation_groups:
+            group_indices = group["indices"]
+            group_budget = int(group["max_new_tokens"])
+            grouped_rows = iter(_iter_rows_at_indices(selected_factory, group_indices))
+            for batch_start in range(0, len(group_indices), config.batch_size):
+                batch_indices = group_indices[
+                    batch_start : batch_start + config.batch_size
+                ]
+                batch_pairs = list(islice(grouped_rows, len(batch_indices)))
+                if [index for index, _ in batch_pairs] != batch_indices:
+                    raise RuntimeError(
+                        "RULER dataset changed between tokenizer and generation passes: "
+                        f"expected row indices {batch_indices}, got "
+                        f"{[index for index, _ in batch_pairs]}."
+                    )
+                batch_rows = [row for _, row in batch_pairs]
+                for index, row in batch_pairs:
+                    replayed_task = str(row["task"])
+                    replayed_budget = _resolve_max_new_tokens(
+                        [row], override=config.max_new_tokens
+                    )[0]
+                    if replayed_task != group["task"] or replayed_budget != group_budget:
+                        raise RuntimeError(
+                            "RULER dataset changed between tokenizer and generation passes: "
+                            f"row {index} is task={replayed_task!r}, "
+                            f"max_new_tokens={replayed_budget}, expected "
+                            f"task={group['task']!r}, max_new_tokens={group_budget}."
+                        )
+                batch_prompts = [
+                    _row_prompt(
+                        tokenizer,
+                        row,
+                        max_context_length=max_context_length,
+                    )
+                    for row in batch_rows
+                ]
+                outputs = generate(
+                    batch_prompts,
+                    max_new_tokens=[group_budget] * len(batch_rows),
+                    do_sample=False,
+                    temperature=0.0,
+                )
+                if not isinstance(outputs, list) or len(outputs) != len(batch_rows):
+                    raise RuntimeError(
+                        "Native generation returned "
+                        f"{len(outputs) if isinstance(outputs, list) else type(outputs)} "
+                        f"outputs for batch size {len(batch_rows)}."
+                    )
+                for (index, row), prediction in zip(batch_pairs, outputs):
+                    processed_indices.add(index)
+                    prediction = str(prediction)
+                    task = str(row["task"])
+                    raw_rows.append({"index": index, "prediction": prediction})
+                    parsed_rows.append(
+                        {"index": index, "predicted_answer": prediction.strip()}
+                    )
+                    base_result = {
+                        "index": index,
+                        "task": task,
+                        "predicted_answer": prediction,
+                        "input_token_count": prompt_lengths[index],
+                        "max_new_tokens": max_new_tokens[index],
+                    }
+                    try:
+                        references = _references(row["answer"], task=task)
+                    except Exception as row_error:
+                        result_rows.append(
+                            {
+                                **base_result,
+                                "status": "parse_failed",
+                                "error_type": type(row_error).__name__,
+                                "error": str(row_error),
+                                "answer": row.get("answer"),
+                            }
+                        )
+                        continue
+                    try:
+                        score = _score(task, prediction, references)
+                    except Exception as row_error:
+                        result_rows.append(
+                            {
+                                **base_result,
+                                "status": "metric_failed",
+                                "error_type": type(row_error).__name__,
+                                "error": str(row_error),
+                                "answer": references,
+                            }
+                        )
+                        continue
+                    try:
+                        output_token_count = len(
+                            tokenizer.encode(prediction, add_special_tokens=False)
+                        )
+                    except Exception as row_error:
+                        result_rows.append(
+                            {
+                                **base_result,
+                                "status": "parse_failed",
+                                "error_type": type(row_error).__name__,
+                                "error": str(row_error),
+                                "answer": references,
+                            }
+                        )
+                        continue
+                    result_rows.append(
+                        {
+                            **base_result,
+                            "status": "success",
+                            "answer": references,
+                            "score": score,
+                            "output_token_count": output_token_count,
+                        }
+                    )
+                progress.update(len(batch_pairs))
         runtime_diagnostics: dict[str, Any] = {
             "operator_bindings": operator_binding_reports(),
             "cuda": {
@@ -586,7 +1032,9 @@ def main() -> None:
         )
     except Exception as error:
         # Preserve an explicit terminal status for every evaluated sample.
-        for index, row in enumerate(rows):
+        for index, row in enumerate(selected_factory()):
+            if index in processed_indices:
+                continue
             result_rows.append(
                 {
                     "index": index,
@@ -595,7 +1043,7 @@ def main() -> None:
                     "error_type": type(error).__name__,
                     "error": str(error),
                     "answer": _references(row["answer"], task=str(row["task"])),
-                    "input_token_count": len(prompts[index]),
+                    "input_token_count": prompt_lengths[index],
                     "max_new_tokens": max_new_tokens[index],
                 }
             )
@@ -603,6 +1051,11 @@ def main() -> None:
             json.dumps({"type": type(error).__name__, "message": str(error)}, indent=2),
             encoding="utf-8",
         )
+    finally:
+        progress.close()
+    raw_rows.sort(key=lambda row: row["index"])
+    parsed_rows.sort(key=lambda row: row["index"])
+    result_rows.sort(key=lambda row: row["index"])
     _write_jsonl(output_dir / "raw_outputs.jsonl", raw_rows)
     _write_jsonl(output_dir / "parsed_outputs.jsonl", parsed_rows)
     _write_jsonl(output_dir / "per_sample_results.jsonl", result_rows)
@@ -614,8 +1067,8 @@ def main() -> None:
     aggregate = {
         "protocol": run_info["protocol"],
         "sparse_method": config.sparse_method,
-        "status": "success" if len(successful) == len(rows) else "failed",
-        "num_samples": len(rows),
+        "status": "success" if len(successful) == dataset_rows else "failed",
+        "num_samples": dataset_rows,
         "num_success": len(successful),
         "overall_score": round(100.0 * float(np.mean([row["score"] for row in successful])), 2) if successful else None,
         "score_by_task": by_task,

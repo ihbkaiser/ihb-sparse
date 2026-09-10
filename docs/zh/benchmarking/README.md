@@ -220,6 +220,70 @@ vanilla 对比和逐长度 quality grade 时，使用下文的 regression harnes
 
 `benchmark/niah/test_niah.py` 是 needle-in-a-haystack utility runner。它可以在线生成 synthetic data，也可以使用 `--online_test=False` 加载 JSONL 文件。
 
+### Full RULER 32K/64K/128K artifact
+
+如果需要完整的 13-task RULER synthetic artifact，而不是上面的 RULER core，
+使用 `benchmark/kvpress_ruler/prepare_full_ruler.py`。它调用本地 NVIDIA RULER
+生成器，并按目标长度输出：
+
+```text
+ruler-32768.jsonl
+ruler-65536.jsonl
+ruler-131072.jsonl
+```
+
+每行保留 upstream 的预格式化 `prompt` 与独立的 `answer_prefix`，因此
+`quest`、`shadowkv` 和 `query_robust` 会使用完全相同的 tokenizer-visible
+输入。`source_index` 保留 upstream 值，`source_row_index` 才是每个 task
+内的唯一行序号，因为部分 NIAH task 会复用 upstream 的值。先准备 RULER
+的 essay/QA 数据，再运行 smoke：
+
+```bash
+RULER_REPO=/path/to/NVIDIA-RULER
+cd "$RULER_REPO/scripts/data/synthetic/json"
+python download_paulgraham_essay.py
+bash download_qa_dataset.sh
+
+MODEL_PATH=/path/to/model
+MODEL_TEMPLATE_TYPE=meta-llama3  # 按模型选择 RULER template.py 中的名称
+python benchmark/kvpress_ruler/prepare_full_ruler.py \
+  --model-path "$MODEL_PATH" \
+  --model-template-type "$MODEL_TEMPLATE_TYPE" \
+  --ruler-repo "$RULER_REPO" \
+  --work-dir /path/to/ruler-work \
+  --output-dir /path/to/ruler-artifacts/smoke \
+  --lengths 32768 \
+  --tasks niah_single_1 vt \
+  --num-samples 2
+```
+
+确认 smoke artifact 后，去掉 `--tasks`，设置 `--num-samples 500` 和
+`--lengths 32768,65536,131072`，并显式传入
+`--hf-repo-id <account>/<dataset>` 即可上传三个 JSONL。上传前使用
+`hf auth login`；不要把 token 放进命令行。
+
+评测时通过 `--dataset-repo-id` 和 `--data-dir` 选择同一个 artifact：
+
+```bash
+python benchmark/kvpress_ruler/evaluate.py \
+  --model-path "$MODEL_PATH" \
+  --sparse-method quest \
+  --dataset-repo-id <account>/<dataset> \
+  --dataset-revision <immutable-commit-or-tag> \
+  --data-dir 131072 \
+  --output-dir results/kvpress-ruler/quest-131072
+```
+
+将 `--sparse-method` 替换为 `shadowkv` 或 `query_robust` 即可复用同一份
+数据；`query_robust` 还需要 `--query-robust-vertices-path`。完整说明见
+[`docs/en/benchmarking/kvpress-ruler.md`](../../en/benchmarking/kvpress-ruler.md)。
+重复使用已有 `RULER_WORK` 时，只有 model path、template、seed、sample
+count、长度和 generator commit 全部匹配才会复用缓存；修改这些参数后请
+换新的 work directory。准备过程支持 resume：完整的
+`ruler-<length>.jsonl` 会先验证后直接跳过；中断时保留
+`ruler-<length>.jsonl.partial`，下次只从最后一个已验证的 row 继续，所有
+task 完成并通过 coverage 校验后才提升为最终 JSONL。
+
 ```bash
 python benchmark/niah/test_niah.py \
   --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \

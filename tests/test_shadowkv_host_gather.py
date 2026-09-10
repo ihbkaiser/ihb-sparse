@@ -3,9 +3,47 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sparsevllm.kernels.shadowkv_host_gather as shadowkv_host_gather
 from sparsevllm.engine.cache_manager.shadowkv import ShadowKVCacheManager
 from sparsevllm.utils.context import reset_context, set_context
-from sparsevllm.kernels.shadowkv_host_gather import load_shadowkv_host_gather
+from sparsevllm.kernels.shadowkv_host_gather import (
+    _cuda_include_paths,
+    load_shadowkv_host_gather,
+)
+
+
+def test_shadowkv_loader_finds_cuda_target_include_layout(tmp_path):
+    """Protect compilation on CUDA installs without a flat include symlink."""
+    cuda_home = tmp_path / "cuda"
+    target_include = cuda_home / "targets" / "x86_64-linux" / "include"
+    target_include.mkdir(parents=True)
+    (target_include / "cusparse.h").touch()
+
+    assert str(target_include) in _cuda_include_paths(cuda_home)
+
+
+def test_shadowkv_loader_passes_cuda_include_paths_to_extension_builder(monkeypatch):
+    expected_include_paths = ["/cuda/targets/x86_64-linux/include"]
+    captured = {}
+
+    def fake_load(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        shadowkv_host_gather,
+        "_cuda_include_paths",
+        lambda cuda_home: expected_include_paths,
+    )
+    monkeypatch.setattr("torch.utils.cpp_extension.load", fake_load)
+    shadowkv_host_gather.load_shadowkv_host_gather.cache_clear()
+    try:
+        shadowkv_host_gather.load_shadowkv_host_gather()
+    finally:
+        shadowkv_host_gather.load_shadowkv_host_gather.cache_clear()
+
+    assert captured["extra_include_paths"] == expected_include_paths
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
