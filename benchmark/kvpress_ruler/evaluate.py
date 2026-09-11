@@ -70,6 +70,11 @@ class EvalConfig:
     shadowkv_sparse_budget: int = 2048
     shadowkv_rank: int = 160
     shadowkv_chunk_size: int = 8
+    # ShadowKV paper convention: 4 local chunks at chunk_size=8 means
+    # 32 exact local tokens.  Keep both controls explicit for reproducible
+    # budget-matched evaluations.
+    shadowkv_local_chunks: int = 4
+    shadowkv_outlier_chunks: int | None = None
     shadowkv_recent_tokens: int = 512
     shadowkv_svd_batch_size: int = 4
     shadowkv_svd_method: str = "exact"
@@ -193,6 +198,18 @@ def _parse_args() -> EvalConfig:
     parser.add_argument("--shadowkv-sparse-budget", type=int, default=2048)
     parser.add_argument("--shadowkv-rank", type=int, default=160)
     parser.add_argument("--shadowkv-chunk-size", type=int, default=8)
+    parser.add_argument(
+        "--shadowkv-local-chunks",
+        type=int,
+        default=4,
+        help="Exact local tail in chunks; 4 chunks equals 32 tokens with chunk_size=8.",
+    )
+    parser.add_argument(
+        "--shadowkv-outlier-chunks",
+        type=int,
+        default=None,
+        help="Explicit per-KV-head outlier chunk count; otherwise derive from budget.",
+    )
     parser.add_argument("--shadowkv-recent-tokens", type=int, default=512)
     parser.add_argument("--shadowkv-svd-batch-size", type=int, default=4)
     parser.add_argument(
@@ -761,6 +778,8 @@ def _build_infer_config(
                 "shadowkv_sparse_budget": config.shadowkv_sparse_budget,
                 "shadowkv_rank": config.shadowkv_rank,
                 "shadowkv_chunk_size": config.shadowkv_chunk_size,
+                "shadowkv_local_chunks": config.shadowkv_local_chunks,
+                "shadowkv_outlier_chunks": config.shadowkv_outlier_chunks,
                 "shadowkv_recent_tokens": config.shadowkv_recent_tokens,
                 "shadowkv_svd_batch_size": config.shadowkv_svd_batch_size,
                 "shadowkv_svd_method": config.shadowkv_svd_method,
@@ -885,7 +904,8 @@ def main() -> None:
         from sparsevllm.configs.sparse import resolve_shadowkv_outlier_chunks
 
         derived_config["shadowkv_outlier_chunks"] = resolve_shadowkv_outlier_chunks(
-            config.shadowkv_sparse_budget
+            config.shadowkv_sparse_budget,
+            config.shadowkv_outlier_chunks,
         )
     else:
         derived_config["query_robust_effective_token_budget"] = (

@@ -105,6 +105,42 @@ def test_kvpress_parser_accepts_query_robust_full_ruler_configuration(monkeypatc
     )
 
 
+def test_kvpress_parser_propagates_shadowkv_outlier_and_local_chunks(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate.py",
+            "--model-path",
+            "/models/llama",
+            "--output-dir",
+            "/results/shadowkv",
+            "--sparse-method",
+            "shadowkv",
+            "--shadowkv-sparse-budget",
+            "512",
+            "--shadowkv-chunk-size",
+            "8",
+            "--shadowkv-rank",
+            "160",
+            "--shadowkv-outlier-chunks",
+            "48",
+            "--shadowkv-local-chunks",
+            "4",
+            "--shadowkv-storage",
+            "cpu",
+        ],
+    )
+
+    config = _parse_args()
+    infer_config = _build_infer_config(config, resolved_max_model_len=32768)
+
+    assert config.shadowkv_outlier_chunks == 48
+    assert config.shadowkv_local_chunks == 4
+    assert infer_config["shadowkv_outlier_chunks"] == 48
+    assert infer_config["shadowkv_local_chunks"] == 4
+
+
 def test_kvpress_builds_native_query_robust_runtime_config():
     config = EvalConfig(
         model_path="/models/llama",
