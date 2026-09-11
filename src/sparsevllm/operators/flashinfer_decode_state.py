@@ -551,6 +551,14 @@ class FlashInferShadowKVPerHeadState:
         self.planned_rows = 0
         self.planned_page_counts: tuple[int, ...] = ()
         self.run_seq_lens: torch.Tensor | None = None
+        self._output_requires_zero = False
+
+    def _refresh_output_initialization_requirement(self) -> None:
+        reduction = getattr(self.wrapper, "_reduction", None)
+        if reduction is None:
+            cute_wrapper = getattr(self.wrapper, "_cute_dsl_wrapper", None)
+            reduction = getattr(cute_wrapper, "_reduction", None)
+        self._output_requires_zero = reduction == "atomic"
 
     def prepare_plan(
         self,
@@ -605,6 +613,7 @@ class FlashInferShadowKVPerHeadState:
         self.run_indices = self.wrapper._paged_kv_indices_buf
         self.run_last_page_len = self.wrapper._paged_kv_last_page_len_buf
         self.run_seq_lens = getattr(self.wrapper, "_kv_lens_buffer", None)
+        self._refresh_output_initialization_requirement()
         self.planned = True
         self.planned_rows = rows
         self.planned_page_counts = (self.page_capacity,) * rows
@@ -675,6 +684,7 @@ class FlashInferShadowKVPerHeadState:
             self.run_indices = self.wrapper._paged_kv_indices_buf
             self.run_last_page_len = self.wrapper._paged_kv_last_page_len_buf
             self.run_seq_lens = getattr(self.wrapper, "_kv_lens_buffer", None)
+            self._refresh_output_initialization_requirement()
             self.planned_page_counts = page_key
 
     def keepalive_tensors(self) -> list[torch.Tensor]:

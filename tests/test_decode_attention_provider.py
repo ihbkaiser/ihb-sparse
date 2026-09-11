@@ -658,6 +658,82 @@ def test_shadowkv_flashinfer_per_head_eager_matches_attention_oracle():
         provider.close()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shadowkv_flashinfer_atomic_decode_zeroes_reused_output(monkeypatch):
+    """Atomic CuTe reduction must not accumulate into stale provider output."""
+
+    class FakeWrapper:
+        def __init__(
+            self,
+            workspace,
+            *,
+            use_cuda_graph,
+            paged_kv_indptr_buffer,
+            paged_kv_indices_buffer,
+            paged_kv_last_page_len_buffer,
+            backend,
+        ):
+            del workspace, use_cuda_graph, backend
+            self._paged_kv_indptr_buf = paged_kv_indptr_buffer
+            self._paged_kv_indices_buf = paged_kv_indices_buffer
+            self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+            self._kv_lens_buffer = torch.empty(128, dtype=torch.int32, device="cuda")
+            self._cute_dsl_wrapper = SimpleNamespace(_reduction="atomic")
+
+        def plan(self, indptr, indices, last_page_len, **kwargs):
+            del indptr, indices, last_page_len, kwargs
+
+        def run(self, q, paged_kv_cache, *, out, return_lse):
+            del q, paged_kv_cache, return_lse
+            if torch.count_nonzero(out).item() != 0:
+                raise AssertionError("atomic output buffer was not zeroed")
+            out.fill_(1)
+            return out
+
+    monkeypatch.setattr(
+        "sparsevllm.operators.flashinfer_decode_state.make_flashinfer_paged_decode_wrapper",
+        FakeWrapper,
+    )
+    spec = _spec(
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        max_batch_size=8,
+        sparse_method="shadowkv",
+        shadowkv_compact_width=64,
+        cuda_graph=False,
+    )
+    state = _FlashInferShadowKVPerHeadState(
+        spec,
+        batch_capacity=8,
+        payload_width=64,
+        device=torch.device("cuda"),
+        use_cuda_graph=False,
+        workspace_bytes=1,
+    )
+    state.prepare_plan(spec, batch_size=8)
+    state.output.fill_(7)
+
+    provider = FlashInferShadowKVPerHeadDecodeAttentionProvider()
+    provider._spec = spec
+    provider._state = state
+    q = torch.randn(8, 32, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(8, 8, 64, 128, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    head_lens = torch.full((8, 8), 64, dtype=torch.int32, device="cuda")
+    view = SimpleNamespace(
+        payload=SimpleNamespace(
+            backend="shadowkv_per_head",
+            metadata={"head_context_lens": head_lens},
+            k_cache=k,
+            v_cache=v,
+        )
+    )
+
+    provider.run(spec, q, view)
+    provider.run(spec, q, view)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability()[0] < 10,

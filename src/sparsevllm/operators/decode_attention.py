@@ -1052,6 +1052,11 @@ class FlashInferShadowKVPerHeadDecodeAttentionProvider(DecodeAttentionProvider):
         )
         v_pages = payload.v_cache.view_as(k_pages)
         output_flat = state.output[: batch_size * spec.num_kv_heads]
+        if state._output_requires_zero:
+            # CuTe split-K atomic reduction accumulates with atomic_add into
+            # the caller-provided output buffer, so every decode must start
+            # from zero even when the state buffer is reused.
+            output_flat.zero_()
         trace = os.environ.get("SPARSEVLLM_SHADOWKV_TRACE", "0") == "1"
         if trace:
             logger.info(
