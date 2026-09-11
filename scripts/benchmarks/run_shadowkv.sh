@@ -17,8 +17,6 @@ python benchmark/kvpress_ruler/evaluate.py \
   --dataset-path "$DATASET_PATH" \
   --data-dir 32768 \
   --sparse-method shadowkv \
-  --max-context-length 32768 \
-  --max-model-len 32778 \
   --fraction 1.0 \
   --seed 42 \
   --gpu-memory-utilization 0.85 \
