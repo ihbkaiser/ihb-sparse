@@ -1,0 +1,18 @@
+{
+  "status": "passed",
+  "samples_per_layer_kv_head": 12000,
+  "samples_per_bucket_per_layer_kv_head": {
+    "8k": 3000,
+    "16k": 3000,
+    "24k": 3000,
+    "32k": 3000
+  },
+  "asset_shape": [
+    32,
+    8,
+    32,
+    128
+  ],
+  "asset_dtype": "torch.bfloat16",
+  "valid_vertices": 32
+}

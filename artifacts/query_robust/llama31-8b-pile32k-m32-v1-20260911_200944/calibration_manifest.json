@@ -1,0 +1,98 @@
+{
+  "artifact": {
+    "M": 32,
+    "chunk_size": 16,
+    "model_id": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+    "model_snapshot": "d10aef7999a2b5ba950ab3974312feeedbfe0b77",
+    "path": "/mnt/results/query_robust/final/llama31-8b-pile32k-m32-v1-20260911_200944/artifact/qr_vertices_m32.pt",
+    "sha256": "fe325670bb2f815fb07dfde1cbce4be60bd8d8bf95bb4f15f35d4cf72c11329b",
+    "solver": {
+      "iterations": 24,
+      "lr": 0.25,
+      "score_alpha": 1.0
+    }
+  },
+  "artifact_scope": "Query-Robust M32 calibration only; no RULER quality claim is made here.",
+  "artifact_status": "frozen_calibration_final",
+  "calibration": {
+    "bucket_counts": {
+      "16k": 750,
+      "24k": 750,
+      "32k": 750,
+      "8k": 750
+    },
+    "capture_path": "/mnt/results/query_robust/final/llama31-8b-pile32k-m32-v1-20260911_200944/artifact/pile32k_q_capture.pt",
+    "dataset_revision": "3be90335b66f24456a5d6659d9c8d208c0357119",
+    "query_shape": [
+      3000,
+      32,
+      32,
+      128
+    ]
+  },
+  "created_at_utc": "2026-09-11T20:11:16Z",
+  "environment": {
+    "calibration": {
+      "dataset": "monology/pile-uncopyrighted",
+      "packed_context_tokens": 32768,
+      "position_windows": {
+        "16k": [
+          14336,
+          16384
+        ],
+        "24k": [
+          22528,
+          24576
+        ],
+        "32k": [
+          30720,
+          32768
+        ],
+        "8k": [
+          6144,
+          8192
+        ]
+      },
+      "samples_per_query_head": 3000,
+      "sequences": 20,
+      "vertices": 32
+    },
+    "compute_capability": [
+      10,
+      0
+    ],
+    "gpu_name": "NVIDIA B200",
+    "leakage_controls": {
+      "metric_or_test_feedback_used": false,
+      "ruler_data_mounted": false,
+      "ruler_data_read": false
+    },
+    "model_id": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+    "model_snapshot": "d10aef7999a2b5ba950ab3974312feeedbfe0b77",
+    "source_commit": "e016effb1874cce921316cfe19f8ef28e1a24591",
+    "torch_cuda": "13.0",
+    "torch_version": "2.11.0+cu130"
+  },
+  "source_files": {
+    "final_calibration.py": "13932c739761cb06091375691d05ccb767b637c6852323b7fdbf9672cfee3f76",
+    "modal_b200_qr_final_vertices.py": "8cf6961601cec6f9de5de4236f513fb752fa28571e420ee2e7c33e673587ad02"
+  },
+  "validation": {
+    "asset_dtype": "torch.bfloat16",
+    "asset_shape": [
+      32,
+      8,
+      32,
+      128
+    ],
+    "samples_per_bucket_per_layer_kv_head": {
+      "16k": 3000,
+      "24k": 3000,
+      "32k": 3000,
+      "8k": 3000
+    },
+    "samples_per_layer_kv_head": 12000,
+    "status": "passed",
+    "valid_vertices": 32
+  }
+}

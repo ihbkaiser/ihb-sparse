@@ -97,6 +97,7 @@ class EvalConfig:
     query_robust_solver_lr: float = 0.25
     query_robust_score_alpha: float = 0.5
     query_robust_skip_layers: int = 0
+    query_robust_model_fingerprint: str | None = None
     query_robust_uniform_p: bool = False
 
 
@@ -269,6 +270,7 @@ def _parse_args() -> EvalConfig:
     parser.add_argument("--query-robust-solver-lr", type=float, default=0.25)
     parser.add_argument("--query-robust-score-alpha", type=float, default=0.5)
     parser.add_argument("--query-robust-skip-layers", type=int, default=0)
+    parser.add_argument("--query-robust-model-fingerprint", default=None)
     parser.add_argument(
         "--query-robust-uniform-p",
         action=argparse.BooleanOptionalAction,
@@ -805,6 +807,7 @@ def _build_infer_config(
                 "query_robust_solver_lr": config.query_robust_solver_lr,
                 "query_robust_score_alpha": config.query_robust_score_alpha,
                 "query_robust_skip_layers": config.query_robust_skip_layers,
+                "query_robust_model_fingerprint": config.query_robust_model_fingerprint,
                 "query_robust_uniform_p": config.query_robust_uniform_p,
                 "sink_keep_tokens": config.sink_keep_tokens,
                 "decode_keep_tokens": config.decode_keep_tokens,
