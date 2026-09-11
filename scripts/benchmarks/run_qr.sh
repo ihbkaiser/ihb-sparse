@@ -5,7 +5,7 @@ cd /workspace/Sparse-vLLM
 
 MODEL_PATH="/workspace/storage-shared/models/Llama-3.1-8B-Instruct"
 DATASET_PATH="/workspace/storage-shared/nlp/tungdd11/tungsparse/ruler-data/ruler-32768.jsonl"
-QR_VERTICES="/workspace/Sparse-vLLM/artifacts/query_robust/llama31-8b-pile32k-m32-v1-20260911_200944/qr_vertices_m32.pt"
+QR_VERTICES="/workspace/Sparse-vLLM/scripts/benchmarks/qr_vertices_m32.pt"
 MODEL_FINGERPRINT="d10aef7999a2b5ba950ab3974312feeedbfe0b77"
 OUT_ROOT="/workspace/storage-shared/nlp/tungdd11/tungsparse/results/kvpress-ruler/full-ruler32k-budget1024-b2"
 GPU_ID=0
