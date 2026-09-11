@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import json
 import math
@@ -79,6 +80,59 @@ def _load_asset_payload(path: str | Path) -> dict[str, Any]:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         return torch.load(path, map_location="cpu")
+
+
+def _canonical_rope_config(value: Any) -> dict[str, Any]:
+    """Normalize equivalent HF RoPE metadata before comparing an asset."""
+
+    if isinstance(value, Mapping):
+        raw = dict(value)
+    elif isinstance(value, (tuple, list)):
+        try:
+            raw = dict(value)
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "Query-Robust RoPE metadata must be a mapping or key-value sequence."
+            ) from error
+    else:
+        raise TypeError(
+            "Query-Robust RoPE metadata must be a mapping or key-value sequence, "
+            f"got {type(value).__name__}."
+        )
+
+    nested = raw.get("rope_parameters")
+    if nested is None:
+        nested = raw.get("rope_scaling")
+    if nested is not None:
+        normalized_nested = _canonical_rope_config(nested)
+        for name, nested_value in raw.items():
+            if name not in {"rope_parameters", "rope_scaling"}:
+                normalized_nested.setdefault(name, nested_value)
+        return _canonical_rope_config(normalized_nested)
+
+    if "type" in raw and "rope_type" not in raw:
+        raw["rope_type"] = raw["type"]
+    raw.pop("type", None)
+    if "rope_type" in raw:
+        raw["rope_type"] = str(raw["rope_type"]).lower()
+    for name in (
+        "factor",
+        "low_freq_factor",
+        "high_freq_factor",
+        "beta_fast",
+        "beta_slow",
+        "attention_factor",
+        "mscale",
+        "mscale_all_dim",
+        "rope_theta",
+    ):
+        if name in raw and raw[name] is not None:
+            raw[name] = float(raw[name])
+    if "original_max_position_embeddings" in raw:
+        raw["original_max_position_embeddings"] = int(
+            raw["original_max_position_embeddings"]
+        )
+    return raw
 
 
 def load_query_robust_asset(
@@ -200,10 +254,14 @@ def load_query_robust_asset(
             "Query-Robust asset metadata must declare rope_config for runtime validation."
         )
     if asset_rope is not None and expected_rope_config is not None:
-        if json.dumps(asset_rope, sort_keys=True, default=str) != json.dumps(
-            expected_rope_config, sort_keys=True, default=str
-        ):
-            raise ValueError("Query-Robust asset RoPE configuration does not match runtime.")
+        normalized_asset_rope = _canonical_rope_config(asset_rope)
+        normalized_expected_rope = _canonical_rope_config(expected_rope_config)
+        if normalized_asset_rope != normalized_expected_rope:
+            raise ValueError(
+                "Query-Robust asset RoPE configuration does not match runtime: "
+                f"asset={normalized_asset_rope!r} "
+                f"runtime={normalized_expected_rope!r}."
+            )
     for meta_name, actual_value in (
         ("num_layers", actual_layers),
         ("num_kv_heads", actual_global_heads),
@@ -498,7 +556,11 @@ class QueryRobustCacheManager(QuestCacheManager):
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
         global_heads = int(getattr(self.hf_config, "num_key_value_heads", 0))
-        expected_model_id = str(getattr(config, "model", "")).rstrip("/").split("/")[-1]
+        # ``config.model`` is often a local alias such as
+        # ``Llama-3.1-8B-Instruct`` rather than the original Hub identifier.
+        # Its basename is not a reliable model identity.  When an exact
+        # checkpoint fingerprint is supplied, that is the authoritative
+        # identity check; keep model_id as descriptive asset metadata only.
         asset = load_query_robust_asset(
             config.query_robust_vertices_path,
             num_layers=int(self.num_layers),
@@ -507,7 +569,7 @@ class QueryRobustCacheManager(QuestCacheManager):
             num_vertices=int(config.query_robust_num_vertices),
             tensor_parallel_rank=int(self.tp_rank),
             tensor_parallel_size=int(self.tp_size),
-            expected_model_id=expected_model_id or None,
+            expected_model_id=None,
             expected_model_fingerprint=getattr(config, "query_robust_model_fingerprint", None),
             expected_rope_config=getattr(config, "query_robust_rope_config", None),
             device=self.device,

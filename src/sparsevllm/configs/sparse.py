@@ -18,6 +18,7 @@ from sparsevllm.method_registry import (
     resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
 )
+from sparsevllm.models.rope import resolve_rope_theta
 from sparsevllm.utils.log import logger, log_once
 
 
@@ -245,11 +246,12 @@ def _normalize_query_robust(config) -> None:
     )
     if config.query_robust_rope_config is None:
         hf_config = getattr(config, "hf_config", None)
-        config.query_robust_rope_config = getattr(
-            hf_config,
-            "rope_parameters",
-            getattr(hf_config, "rope_scaling", None),
-        )
+        rope_config = getattr(hf_config, "rope_parameters", None)
+        if rope_config is None:
+            rope_config = getattr(hf_config, "rope_scaling", None)
+        if rope_config is not None:
+            config.query_robust_rope_config = dict(rope_config)
+            config.query_robust_rope_config["rope_theta"] = resolve_rope_theta(hf_config)
     if config.query_robust_model_fingerprint is not None:
         config.query_robust_model_fingerprint = str(
             config.query_robust_model_fingerprint
