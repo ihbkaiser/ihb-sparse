@@ -6,6 +6,13 @@ Sparse-vLLM engine for QuEST, ShadowKV, and Query-Robust. It uses the same `data
 greedy decoding, `answer_prefix`, and task scorer. The script requires an
 explicit model path so local checkpoints are reproducible and never hardcoded.
 
+The aggregate's `elapsed_seconds` and throughput metrics measure warm serving:
+the interval begins after engine construction returns, which is after model
+loading, startup profiling, CUDA Graph capture, and warmup (`Startup completed`).
+`startup_seconds` reports that excluded interval, while
+`total_elapsed_seconds` preserves the full benchmark timing for cold-start
+accounting.
+
 The local Llama 3.1 checkpoint can be evaluated as follows:
 
 ```bash
@@ -27,10 +34,11 @@ python benchmark/kvpress_ruler/evaluate.py \
   --output-dir results/kvpress-ruler/shadowkv-4096
 ```
 
-The evaluator defaults to ShadowKV's paper-like CPU-shadow profile
-(`shadowkv_storage=cpu`). Use `--shadowkv-storage gpu_cache` explicitly for
-the separate throughput overlay; it derives `shadowkv_gpu_cache_tokens` from
-`max_model_len` when the capacity flag is omitted.
+The evaluator defaults to ShadowKV's fast GPU-cache profile
+(`shadowkv_storage=gpu_cache`). Use `--shadowkv-storage cpu` explicitly for the
+paper-like CPU-shadow ablation. GPU-cache mode derives
+`shadowkv_gpu_cache_tokens` from `max_model_len` when the capacity flag is
+omitted.
 
 `--batch-size` is the maximum concurrent decode batch and is passed to the
 engine as `max_num_seqs_in_batch`, `max_decoding_seqs`, and
@@ -50,8 +58,9 @@ experiment manifest; this is useful for high-batch graph capture on smaller
 GPUs, where the default `0.90` may leave insufficient room for the requested
 KV/runtime workspace.
 
-For the separate GPU-cache throughput overlay, pass
-`--shadowkv-storage gpu_cache`. It keeps the full configured prompt-capacity
+For the default GPU-cache throughput profile, pass
+`--shadowkv-storage gpu_cache` (the flag is optional because it is the
+default). It keeps the full configured prompt-capacity
 K/V payload for each active layer on the GPU and derives
 `--shadowkv-gpu-cache-tokens` from `max-model-len` when the flag is omitted.
 ShadowKV selection is retained, while mapped host reads and decode-time
@@ -61,7 +70,7 @@ low-rank SVD. This avoids turning long-context metadata construction into a CPU
 TTFT bottleneck. `--shadowkv-kernel-backend cutlass` uses the
 CUTLASS strided-batched GEMM backend and requires `--shadowkv-cutlass-root`
 (or `SPARSEVLLM_CUTLASS_ROOT`) pointing to the pinned CUTLASS source tree.
-The paper-like CPU-shadow run remains the default.
+The paper-like CPU-shadow run is available with `--shadowkv-storage cpu`.
 For eager CPU-shadow ablations, `--no-shadowkv-multistream-gather` disables
 copy-stream overlap and `--no-shadowkv-gather-copy-with-offsets` disables
 selected-value chunk reuse; both are enabled by default and are recorded in

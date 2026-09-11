@@ -13,13 +13,17 @@ positions and effective length.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
 from sparsevllm.config import Config
-from sparsevllm.configs.sparse import resolve_shadowkv_outlier_chunks
+from sparsevllm.configs.sparse import (
+    resolve_shadowkv_local_token_capacity,
+    resolve_shadowkv_outlier_chunks,
+)
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.cache_manager.base import (
     AttentionViewMeta,
@@ -81,21 +85,19 @@ class ShadowKVCacheManager(StandardCacheManager):
             parallel_context,
             allocation_budget_bytes=allocation_budget_bytes,
         )
-        # These are logical CPU-shadow slots.  They are deliberately separate
-        # from the tiny physical storage allocated during Standard init.
-        # The inherited scheduler/admission path consumes ``free_slots_stack``
-        # even though ShadowKV does not retain prompt KV in that device store.
-        # Replace the tiny compatibility accounting with a virtual token pool;
-        # the stack is only metadata and is negligible compared with the host
-        # shadow tensors, but it allows large prompt batches to be admitted.
-        self._shadow_virtual_capacity = int(self.max_buffer_rows) * int(self.max_model_len)
-        self.free_slots_stack = torch.arange(
-            self._shadow_virtual_capacity,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self._num_free_slots = self._shadow_virtual_capacity
-        self.config.num_kvcache_slots = self._shadow_virtual_capacity
+        if not self._shadow_gpu_cache_reuse_enabled:
+            # CPU-shadow mode keeps logical host-shadow slots separate from the
+            # tiny compatibility storage allocated during Standard init.  The
+            # inherited scheduler/admission path still consumes this metadata
+            # stack even though prompt KV is not retained in that device store.
+            self._shadow_virtual_capacity = int(self.max_buffer_rows) * int(self.max_model_len)
+            self.free_slots_stack = torch.arange(
+                self._shadow_virtual_capacity,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._num_free_slots = self._shadow_virtual_capacity
+            self.config.num_kvcache_slots = self._shadow_virtual_capacity
         self._shadow_rope = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -111,9 +113,14 @@ class ShadowKVCacheManager(StandardCacheManager):
         )
 
     def allocate_kv_cache(self) -> None:
-        """Allocate only a tiny compatibility cache; ShadowKV owns read state."""
+        """Allocate the ordinary cache for GPU reuse, or a tiny CPU fallback."""
 
         storage = self.attention_cache_storage
+        if self._shadow_gpu_cache_reuse_enabled:
+            # GPU-cache ShadowKV reads exact K/V through the standard physical
+            # cache.  This also makes the scheduler's physical slot mapping the
+            # single source of truth for both writes and sparse decode reads.
+            return super().allocate_kv_cache()
         # The current-token write path is intercepted by save_rope_kv_if_needed.
         # One slot per resident row keeps inherited diagnostics and storage
         # validation well-defined without allocating a full prompt KV cache.
@@ -126,7 +133,9 @@ class ShadowKVCacheManager(StandardCacheManager):
         self.kv_cache = getattr(storage, "kv_cache", None)
 
     def _validate_attention_slot_mapping(self, slot_mapping: torch.Tensor) -> None:
-        """ShadowKV uses virtual host-shadow coordinates, not physical storage slots."""
+        """Validate physical slots only when GPU-cache reuse is active."""
+        if self._shadow_gpu_cache_reuse_enabled:
+            return super()._validate_attention_slot_mapping(slot_mapping)
         del slot_mapping
 
     @property
@@ -139,7 +148,16 @@ class ShadowKVCacheManager(StandardCacheManager):
 
     @property
     def _shadow_gpu_cache_enabled(self) -> bool:
-        return str(getattr(self.config, "shadowkv_storage", "cpu")).lower() == "gpu_cache"
+        return str(getattr(self.config, "shadowkv_storage", "gpu_cache")).lower() == "gpu_cache"
+
+    @property
+    def _shadow_gpu_cache_reuse_enabled(self) -> bool:
+        """Whether GPU-cache mode can reuse StandardCacheManager storage."""
+        return bool(
+            self._shadow_gpu_cache_enabled
+            and getattr(self, "device", torch.device("cpu")).type == "cuda"
+            and hasattr(self, "attention_cache_storage")
+        )
 
     def _apply_shadow_rope(
         self,
@@ -364,6 +382,11 @@ class ShadowKVCacheManager(StandardCacheManager):
         # After the prefill factorization, only values need to be appended for
         # decode.  Avoid recreating the discarded raw-key shadow tensor.
         context = get_context()
+        if context.is_prefill and self._shadow_gpu_cache_reuse_enabled:
+            # Physical GPU-cache reuse keeps the exact K/V in the inherited
+            # paged cache.  GPU mode does not factorize raw keys, so retaining
+            # another host copy here is pure bandwidth and memory overhead.
+            return
         if not context.is_prefill:
             # GPU-cache mode receives the exact post-RoPE K/V through
             # save_rope_kv_if_needed below.  Keeping a second CPU copy of the
@@ -411,6 +434,11 @@ class ShadowKVCacheManager(StandardCacheManager):
         # keys and RoPE is applied after reconstruction at decode time.
         context = get_context()
         if not context.is_prefill and bool(getattr(self.config, "decode_graph", False)):
+            if self._shadow_gpu_cache_reuse_enabled:
+                # Keep the graph's physical write path in the same cache that
+                # the paged GPU gather reads. ``recent_*`` remains necessary
+                # for the graph's prompt-only source-length contract below.
+                super().save_rope_kv_if_needed(layer_idx, k_post_rope, v)
             workspace = self._workspace_for_layer(layer_idx)
             if workspace is None:
                 raise RuntimeError(
@@ -450,6 +478,21 @@ class ShadowKVCacheManager(StandardCacheManager):
             ).to(dtype=workspace["recent_v"].dtype)
             workspace["recent_k"][:batch_size].scatter_(1, index, k_value)
             workspace["recent_v"][:batch_size].scatter_(1, index, v_value)
+            return
+        if self._shadow_gpu_cache_reuse_enabled:
+            # The standard physical cache already owns exact post-RoPE K/V.
+            # Keep only coverage metadata needed by finalization and avoid a
+            # second contiguous CPU or GPU tensor for every request/layer.
+            super().save_rope_kv_if_needed(layer_idx, k_post_rope, v)
+            ranges = self._current_ranges(layer_idx, int(k_post_rope.shape[0]))
+            if context.is_prefill:
+                for row, _start, end, _source_start, _source_end in ranges:
+                    entry = self._entry(row, layer_idx)
+                    entry["filled"] = max(int(entry["filled"]), end)
+            else:
+                for row, _start, end, _source_start, _source_end in ranges:
+                    entry = self._entry(row, layer_idx)
+                    entry["filled"] = max(int(entry["filled"]), end)
             return
         if self._shadow_gpu_cache_enabled:
             ranges = self._current_ranges(layer_idx, int(k_post_rope.shape[0]))
@@ -513,6 +556,8 @@ class ShadowKVCacheManager(StandardCacheManager):
 
     @torch.no_grad()
     def _allocate(self, seq_id: int, size: int) -> torch.Tensor:
+        if self._shadow_gpu_cache_reuse_enabled:
+            return super()._allocate(seq_id, size)
         row_idx = self.seq_id_to_row.get(int(seq_id))
         if row_idx is None:
             row_idx = self._get_free_row(int(seq_id))
@@ -534,6 +579,8 @@ class ShadowKVCacheManager(StandardCacheManager):
 
     @torch.no_grad()
     def _allocate_batch(self, seq_ids: list[int], size: int) -> torch.Tensor:
+        if self._shadow_gpu_cache_reuse_enabled:
+            return super()._allocate_batch(seq_ids, size)
         if int(size) != 1:
             raise ValueError("ShadowKV decode allocation supports one token per sequence.")
         slots = []
@@ -554,6 +601,13 @@ class ShadowKVCacheManager(StandardCacheManager):
         return torch.stack(slots)
 
     def free_seq(self, seq_id: int):
+        if self._shadow_gpu_cache_reuse_enabled:
+            row_idx = self.seq_id_to_row.get(int(seq_id))
+            super().free_seq(seq_id)
+            if row_idx is not None:
+                for key in [key for key in self._shadow_entries if key[0] == row_idx]:
+                    self._shadow_entries.pop(key, None)
+            return
         row_idx = self.seq_id_to_row.pop(int(seq_id), None)
         if row_idx is None:
             raise ValueError(f"Unknown ShadowKV sequence id={seq_id}.")
@@ -575,6 +629,30 @@ class ShadowKVCacheManager(StandardCacheManager):
         return result
 
     @torch.no_grad()
+    def _gpu_cache_prompt_keys(
+        self,
+        row_idx: int,
+        layer_idx: int,
+        prompt_len: int,
+    ) -> torch.Tensor:
+        """Gather one prompt's keys from the shared physical KV cache."""
+        if not self._shadow_gpu_cache_reuse_enabled:
+            raise RuntimeError("Shared GPU KV-cache reuse is not active.")
+        if prompt_len <= 0 or prompt_len > int(self.max_model_len):
+            raise ValueError(
+                "ShadowKV physical-cache prompt length is outside max_model_len: "
+                f"prompt_len={prompt_len} max_model_len={self.max_model_len}."
+            )
+        k_cache, _ = self.get_layer_kv_cache(layer_idx)
+        slots = self.buffer_req_to_token_slots[int(row_idx), :prompt_len]
+        if slots.dtype != torch.int32 or slots.device != k_cache.device:
+            raise RuntimeError(
+                "ShadowKV physical-cache slot table is incompatible with the KV cache: "
+                f"slots={slots.dtype}/{slots.device} cache={k_cache.dtype}/{k_cache.device}."
+            )
+        return k_cache.index_select(0, slots.to(dtype=torch.long))
+
+    @torch.no_grad()
     def _finalize_entry(
         self,
         row_idx: int,
@@ -586,53 +664,77 @@ class ShadowKVCacheManager(StandardCacheManager):
         entry = self._entry(row_idx, layer_idx)
         if entry.get("shadow", False) and int(entry.get("prompt_len", 0)) == int(prompt_len):
             return
-        if int(entry["filled"]) < int(prompt_len):
-            raise RuntimeError(
-                "ShadowKV prefill did not populate the complete CPU shadow: "
-                f"row={row_idx} layer={layer_idx} filled={entry['filled']} prompt={prompt_len}."
-            )
-        rope = entry["rope_k"][:prompt_len]
-        raw = entry["raw_k"][:prompt_len]
+        gpu_cache_fast_path = (
+            self._shadow_gpu_cache_enabled and self.device.type == "cuda"
+        )
+        if self._shadow_gpu_cache_reuse_enabled:
+            if int(self.row_seq_lens[row_idx]) < int(prompt_len):
+                raise RuntimeError(
+                    "ShadowKV physical GPU cache did not populate the complete prompt: "
+                    f"row={row_idx} filled={int(self.row_seq_lens[row_idx])} "
+                    f"prompt={prompt_len}."
+                )
+            rope = None
+            raw = None
+        else:
+            if int(entry["filled"]) < int(prompt_len):
+                raise RuntimeError(
+                    "ShadowKV prefill did not populate the complete CPU shadow: "
+                    f"row={row_idx} layer={layer_idx} filled={entry['filled']} prompt={prompt_len}."
+                )
+            rope = entry["rope_k"][:prompt_len]
+            raw = entry["raw_k"][:prompt_len]
         chunk_size = int(self.config.shadowkv_chunk_size)
         local_chunks = int(self.config.shadowkv_local_chunks)
         budget = int(self.config.shadowkv_sparse_budget)
         select_sets = budget // chunk_size
         chunks = max(0, prompt_len // chunk_size - local_chunks)
-        chunks -= chunks % 8
+        if not gpu_cache_fast_path:
+            # The CPU shadow/offset kernels use an eight-chunk alignment for
+            # their fixed host-side tiling.  GPU-cache mode follows the
+            # original ShadowKV GPU path and can keep the final partial tile
+            # in the direct tail without dropping its preceding full chunks.
+            chunks -= chunks % 8
         outlier_count = min(int(self.config.shadowkv_outlier_chunks), chunks)
 
         # GPU-cache mode already has to materialize the exact post-RoPE K/V on
         # the device.  Reuse that copy to compute the small selection metadata
         # on GPU as well; doing the landmark mean, cosine reduction, and
         # outlier top-k on CPU otherwise makes long-context TTFT CPU-bound.
-        gpu_cache_fast_path = (
-            self._shadow_gpu_cache_enabled and self.device.type == "cuda"
-        )
         gpu_k: torch.Tensor | None = None
         gpu_v: torch.Tensor | None = None
         if gpu_cache_fast_path:
-            gpu_capacity = int(self.config.shadowkv_gpu_cache_tokens)
-            if prompt_len > gpu_capacity:
-                raise RuntimeError(
-                    "ShadowKV GPU cache capacity is smaller than the prompt: "
-                    f"prompt_len={prompt_len} capacity={gpu_capacity}. Increase "
-                    "shadowkv_gpu_cache_tokens or use shadowkv_storage='cpu'."
-                )
-            gpu_k = entry.get("gpu_rope_k")
-            gpu_v = entry.get("gpu_v")
-            if gpu_k is None or gpu_v is None:
+            if self._shadow_gpu_cache_reuse_enabled:
+                gpu_k = self._gpu_cache_prompt_keys(row_idx, layer_idx, prompt_len)
+            else:
+                gpu_capacity = int(self.config.shadowkv_gpu_cache_tokens)
+                if prompt_len > gpu_capacity:
+                    raise RuntimeError(
+                        "ShadowKV GPU cache capacity is smaller than the prompt: "
+                        f"prompt_len={prompt_len} capacity={gpu_capacity}. Increase "
+                        "shadowkv_gpu_cache_tokens or use shadowkv_storage='cpu'."
+                    )
+                gpu_k = entry.get("gpu_rope_k")
+                gpu_v = entry.get("gpu_v")
+            if gpu_k is None or (
+                not self._shadow_gpu_cache_reuse_enabled and gpu_v is None
+            ):
+                if self._shadow_gpu_cache_reuse_enabled:
+                    raise RuntimeError(
+                        "ShadowKV physical GPU cache returned no prompt keys."
+                    )
                 gpu_k = torch.empty(
                     (gpu_capacity, self.num_kv_heads, self.head_dim),
                     dtype=self._shadow_dtype,
                     device=self.device,
                 )
                 gpu_v = torch.empty_like(gpu_k)
-            gpu_k[:prompt_len].copy_(rope, non_blocking=True)
-            gpu_v[:prompt_len].copy_(
-                entry["v"][:prompt_len], non_blocking=True
-            )
-            entry["gpu_rope_k"] = gpu_k
-            entry["gpu_v"] = gpu_v
+            if not self._shadow_gpu_cache_reuse_enabled:
+                assert rope is not None
+                gpu_k[:prompt_len].copy_(rope, non_blocking=True)
+                gpu_v[:prompt_len].copy_(entry["v"][:prompt_len], non_blocking=True)
+                entry["gpu_rope_k"] = gpu_k
+                entry["gpu_v"] = gpu_v
 
         if chunks > 0:
             context_source = gpu_k[: chunks * chunk_size] if gpu_cache_fast_path else rope
@@ -657,7 +759,7 @@ class ShadowKVCacheManager(StandardCacheManager):
         else:
             landmarks = torch.empty(
                 (self.num_kv_heads, 0, self.head_dim),
-                dtype=rope.dtype,
+                dtype=(gpu_k.dtype if gpu_cache_fast_path else rope.dtype),
                 device=self.device if gpu_cache_fast_path else rope.device,
             )
             outlier_chunks = torch.empty(
@@ -686,6 +788,7 @@ class ShadowKVCacheManager(StandardCacheManager):
             # destroys the shared low-rank representation and is especially
             # harmful for long contexts.
             if factorization is None:
+                assert raw is not None
                 matrix = raw.float().reshape(prompt_len, -1).to(self.device)
                 matrix_rows = int(matrix.shape[0])
                 matrix_cols = int(matrix.shape[1])
@@ -787,24 +890,33 @@ class ShadowKVCacheManager(StandardCacheManager):
         entry["shadow"] = True
         entry["raw_k"] = None
         if self._shadow_gpu_cache_enabled:
-            if gpu_k is None or gpu_v is None:
-                gpu_capacity = int(self.config.shadowkv_gpu_cache_tokens)
-                if prompt_len > gpu_capacity:
-                    raise RuntimeError(
-                        "ShadowKV GPU cache capacity is smaller than the prompt: "
-                        f"prompt_len={prompt_len} capacity={gpu_capacity}. Increase "
-                        "shadowkv_gpu_cache_tokens or use shadowkv_storage='cpu'."
+            if self._shadow_gpu_cache_reuse_enabled:
+                # The temporary index-select result used for landmark metadata
+                # must not become a persistent per-request cache copy.
+                entry["rope_k"] = None
+                entry["v"] = None
+                entry["v_chunks"] = None
+                entry["gpu_rope_k"] = None
+                entry["gpu_v"] = None
+            else:
+                if gpu_k is None or gpu_v is None:
+                    gpu_capacity = int(self.config.shadowkv_gpu_cache_tokens)
+                    if prompt_len > gpu_capacity:
+                        raise RuntimeError(
+                            "ShadowKV GPU cache capacity is smaller than the prompt: "
+                            f"prompt_len={prompt_len} capacity={gpu_capacity}. Increase "
+                            "shadowkv_gpu_cache_tokens or use shadowkv_storage='cpu'."
+                        )
+                    gpu_k = torch.empty(
+                        (gpu_capacity, self.num_kv_heads, self.head_dim),
+                        dtype=self._shadow_dtype,
+                        device=self.device,
                     )
-                gpu_k = torch.empty(
-                    (gpu_capacity, self.num_kv_heads, self.head_dim),
-                    dtype=self._shadow_dtype,
-                    device=self.device,
-                )
-                gpu_v = torch.empty_like(gpu_k)
-                gpu_k[:prompt_len].copy_(rope)
-                gpu_v[:prompt_len].copy_(entry["v"][:prompt_len])
-            entry["gpu_rope_k"] = gpu_k
-            entry["gpu_v"] = gpu_v
+                    gpu_v = torch.empty_like(gpu_k)
+                    gpu_k[:prompt_len].copy_(rope)
+                    gpu_v[:prompt_len].copy_(entry["v"][:prompt_len])
+                entry["gpu_rope_k"] = gpu_k
+                entry["gpu_v"] = gpu_v
         if matrix is not None:
             del matrix
         if not gpu_cache_fast_path:
@@ -953,9 +1065,10 @@ class ShadowKVCacheManager(StandardCacheManager):
             budget_tokens,
             getattr(self.config, "shadowkv_outlier_chunks", None),
         )
-        max_local_tokens = min(
+        max_local_tokens = resolve_shadowkv_local_token_capacity(
+            chunk_size,
+            int(self.config.shadowkv_local_chunks),
             context_capacity,
-            int(self.config.shadowkv_local_chunks) * chunk_size + chunk_size - 1,
         )
         max_recent_tokens = min(context_capacity, int(self.config.shadowkv_recent_tokens))
         query_heads = int(getattr(self.hf_config, "num_attention_heads", self.num_kv_heads))
@@ -1189,7 +1302,7 @@ class ShadowKVCacheManager(StandardCacheManager):
                     "offset_host_v_ptrs": (batch_size * self.num_kv_heads,),
                 }
             )
-        if self._shadow_gpu_cache_enabled:
+        if self._shadow_gpu_cache_enabled and not self._shadow_gpu_cache_reuse_enabled:
             expected.update(
                 {
                     # Each request/layer owns its GPU cache entry.  Keep only
@@ -1270,7 +1383,7 @@ class ShadowKVCacheManager(StandardCacheManager):
             workspace["offset_signals"].zero_()
             workspace["offset_v_cache"].zero_()
             workspace["offset_temp"].zero_()
-        if self._shadow_gpu_cache_enabled:
+        if self._shadow_gpu_cache_enabled and not self._shadow_gpu_cache_reuse_enabled:
             workspace["gpu_cache_k_ptrs"].zero_()
             workspace["gpu_cache_v_ptrs"].zero_()
         return workspace
@@ -1602,7 +1715,7 @@ class ShadowKVCacheManager(StandardCacheManager):
         workspace["head_v_cache"].zero_()
         workspace["recent_k"].zero_()
         workspace["recent_v"].zero_()
-        if self._shadow_gpu_cache_enabled:
+        if self._shadow_gpu_cache_enabled and not self._shadow_gpu_cache_reuse_enabled:
             workspace["gpu_cache_k_ptrs"].zero_()
             workspace["gpu_cache_v_ptrs"].zero_()
         for batch_idx, row_idx in enumerate(rows):
@@ -1684,7 +1797,7 @@ class ShadowKVCacheManager(StandardCacheManager):
             workspace["local_tokens"][batch_idx] = min(
                 int(entry.get("local_tokens", 0)), prompt_len
             )
-            if self._shadow_gpu_cache_enabled:
+            if self._shadow_gpu_cache_enabled and not self._shadow_gpu_cache_reuse_enabled:
                 gpu_k = entry.get("gpu_rope_k")
                 gpu_v = entry.get("gpu_v")
                 if gpu_k is None or gpu_v is None:
@@ -1739,6 +1852,62 @@ class ShadowKVCacheManager(StandardCacheManager):
         v_current: torch.Tensor,
         selection: SparseSelection,
     ) -> PrefillComputeView:
+        if self._shadow_gpu_cache_reuse_enabled:
+            # Reuse StandardCacheManager's GPU physical cache as the source
+            # for the required padded FlashInfer page view.  This keeps the
+            # B200 page contract while removing the old rope_k/v CPU shadow
+            # and its synchronous host-to-device copy for every layer.
+            view = self._build_sm100_dense_prefill_view(layer_idx, selection)
+            # Keep the logical max length exact.  The payload remains padded
+            # to the 16-token physical page contract, but FlashInfer's plan
+            # must see the same unpadded bound as the legacy ShadowKV view.
+            view = replace(
+                view,
+                meta=replace(
+                    view.meta,
+                    max_context_len=int(selection.context_lens.max().item()),
+                ),
+            )
+            # The current prefill chunk is already available as GPU
+            # activation K/V.  Overlay it into the packed view explicitly so
+            # the attention read cannot race a large physical-cache store;
+            # earlier chunks remain sourced from the shared physical cache.
+            context = get_context()
+            cu_seqlens_q = context.cu_seqlens_q
+            batch_size = int(selection.context_lens.numel())
+            if (
+                cu_seqlens_q is None
+                or int(cu_seqlens_q.numel()) != batch_size + 1
+                or k_current.ndim != 3
+                or v_current.shape != k_current.shape
+            ):
+                raise RuntimeError(
+                    "ShadowKV GPU prefill view requires current chunk metadata: "
+                    f"cu_seqlens_q={None if cu_seqlens_q is None else tuple(cu_seqlens_q.shape)} "
+                    f"k={tuple(k_current.shape)} v={tuple(v_current.shape)} "
+                    f"batch={batch_size}."
+                )
+            for batch_idx in range(batch_size):
+                q_start = int(cu_seqlens_q[batch_idx].item())
+                q_end = int(cu_seqlens_q[batch_idx + 1].item())
+                chunk_len = q_end - q_start
+                logical_end = int(selection.context_lens[batch_idx].item())
+                logical_start = logical_end - chunk_len
+                if logical_start < 0:
+                    raise RuntimeError(
+                        "ShadowKV GPU prefill current chunk starts before position zero: "
+                        f"batch={batch_idx} end={logical_end} chunk={chunk_len}."
+                    )
+                packed_start = int(view.meta.active_slots[batch_idx, 0].item())
+                payload_start = packed_start + logical_start
+                payload_end = payload_start + chunk_len
+                view.payload.k_cache[payload_start:payload_end].copy_(
+                    k_current[q_start:q_end]
+                )
+                view.payload.v_cache[payload_start:payload_end].copy_(
+                    v_current[q_start:q_end]
+                )
+            return view
         del k_current, v_current
         rows = list(self._shadow_active_rows)
         batch_size = int(selection.context_lens.numel())
@@ -1992,10 +2161,14 @@ class ShadowKVCacheManager(StandardCacheManager):
         return result
 
     def prepare_decode_graph_in(self, state: CacheDecodeGraphState) -> None:
-        # The base implementation publishes graph-stable physical reservations.
-        # ShadowKV's explicit view uses independent virtual slots, so no
-        # additional metadata kernel is needed here.
-        del state
+        # GPU-cache mode gathers both prompt and generated-token KV through
+        # StandardCacheManager's physical slot table.  The static decode
+        # reservation writes the new slot to the graph input, but the table
+        # itself is only updated by the base graph-in publisher.  CPU-shadow
+        # mode keeps its independent virtual-slot contract and does not need
+        # that publication.
+        if self._shadow_gpu_cache_reuse_enabled:
+            super().prepare_decode_graph_in(state)
 
     def decode_graph_state_keepalive_tensors(
         self,
@@ -2344,23 +2517,65 @@ class ShadowKVCacheManager(StandardCacheManager):
         if self._shadow_gpu_cache_enabled:
             gpu_cache_gather = self._load_shadowkv_gpu_cache_gather()
             positions = workspace["head_positions"][:batch_size]
-            fused_gpu_gather = getattr(
-                gpu_cache_gather, "gather_gpu_cache_per_head_kv_ptrs", None
-            )
-            if fused_gpu_gather is None:
-                raise RuntimeError(
-                    "ShadowKV GPU-cache gather extension is missing the pointer-table "
-                    "gather_gpu_cache_per_head_kv_ptrs entry point. Rebuild the CUDA extension."
+            if self._shadow_gpu_cache_reuse_enabled:
+                # Read the exact K/V already written by StandardCacheManager.
+                # The row table converts each logical position into its
+                # physical slot; no per-request prompt copy or pointer table is
+                # needed.
+                source_k, source_v = self.get_layer_kv_cache(layer_idx)
+                request_rows = selection.req_indices[:batch_size]
+                if not request_rows.is_contiguous():
+                    request_rows = request_rows.contiguous()
+                fused_gpu_gather = getattr(
+                    gpu_cache_gather, "gather_gpu_cache_per_head_kv_slots", None
                 )
-            fused_gpu_gather(
-                workspace["gpu_cache_k_ptrs"][:batch_size],
-                workspace["gpu_cache_v_ptrs"][:batch_size],
-                positions,
-                source_lens,
-                head_k_view,
-                head_v_view,
-                int(self.config.shadowkv_gpu_cache_tokens),
-            )
+                if fused_gpu_gather is None:
+                    raise RuntimeError(
+                        "ShadowKV GPU-cache gather extension is missing the paged "
+                        "gather_gpu_cache_per_head_kv_slots entry point. Rebuild the CUDA extension."
+                    )
+                fused_gpu_gather(
+                    source_k,
+                    source_v,
+                    self.buffer_req_to_token_slots,
+                    request_rows,
+                    positions,
+                    source_lens,
+                    head_k_view,
+                    head_v_view,
+                )
+            else:
+                # Legacy pointer-table path retained for CPU-backed test
+                # doubles and explicit compatibility configurations.
+                if not capturing:
+                    for batch_idx, row_idx in enumerate(rows):
+                        entry = self._entry(row_idx, layer_idx)
+                        gpu_k = entry.get("gpu_rope_k")
+                        gpu_v = entry.get("gpu_v")
+                        if gpu_k is None or gpu_v is None:
+                            raise RuntimeError(
+                                "ShadowKV GPU cache entry was not materialized before decode: "
+                                f"row={row_idx} layer={layer_idx}."
+                            )
+                        workspace["gpu_cache_k_ptrs"][batch_idx] = int(gpu_k.data_ptr())
+                        workspace["gpu_cache_v_ptrs"][batch_idx] = int(gpu_v.data_ptr())
+                fused_gpu_gather = getattr(
+                    gpu_cache_gather, "gather_gpu_cache_per_head_kv_ptrs", None
+                )
+                if fused_gpu_gather is None:
+                    raise RuntimeError(
+                        "ShadowKV GPU-cache gather extension is missing the pointer-table "
+                        "gather_gpu_cache_per_head_kv_ptrs entry point. Rebuild the CUDA extension."
+                    )
+                fused_gpu_gather(
+                    workspace["gpu_cache_k_ptrs"][:batch_size],
+                    workspace["gpu_cache_v_ptrs"][:batch_size],
+                    positions,
+                    source_lens,
+                    head_k_view,
+                    head_v_view,
+                    int(self.config.shadowkv_gpu_cache_tokens),
+                )
         else:
             self._shadow_host_gather.gather_host_per_head(
                 workspace["host_k_ptrs"],

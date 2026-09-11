@@ -8,6 +8,7 @@ from benchmark.kvpress_ruler.evaluate import (
     EvalConfig,
     _build_infer_config,
     _build_evaluation_groups,
+    _evaluation_timing,
     _load_rows,
     _parse_args,
     _resolve_max_new_tokens,
@@ -15,7 +16,20 @@ from benchmark.kvpress_ruler.evaluate import (
 )
 
 
-def test_kvpress_defaults_are_paper_aligned_for_sparse_comparisons(monkeypatch):
+def test_ruler_throughput_timing_starts_after_startup():
+    timing = _evaluation_timing(
+        started_at=10.0,
+        serving_started_at=40.0,
+        finished_at=70.0,
+    )
+
+    assert timing["startup_seconds"] == 30.0
+    assert timing["serving_elapsed_seconds"] == 30.0
+    assert timing["elapsed_seconds"] == 30.0
+    assert timing["total_elapsed_seconds"] == 60.0
+
+
+def test_kvpress_defaults_use_gpu_cache_shadowkv_profile(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
@@ -45,7 +59,7 @@ def test_kvpress_defaults_are_paper_aligned_for_sparse_comparisons(monkeypatch):
     assert config.shadowkv_sparse_budget == 2048
     assert config.shadowkv_rank == 160
     assert config.shadowkv_chunk_size == 8
-    assert config.shadowkv_storage == "cpu"
+    assert config.shadowkv_storage == "gpu_cache"
 
 
 def test_kvpress_parser_accepts_query_robust_full_ruler_configuration(monkeypatch):
@@ -113,6 +127,19 @@ def test_kvpress_builds_native_query_robust_runtime_config():
     assert infer_config["query_robust_vertices_path"] == "/data/qr_vertices.pt"
     assert infer_config["query_robust_solver_iters"] == 24
     assert infer_config["decode_keep_tokens"] == 2048
+
+
+def test_kvpress_propagates_explicit_max_batched_tokens():
+    config = EvalConfig(
+        model_path="/models/llama",
+        output_dir="/results/shadowkv",
+        sparse_method="shadowkv",
+        max_batched_tokens=131072,
+    )
+
+    infer_config = _build_infer_config(config, resolved_max_model_len=32784)
+
+    assert infer_config["max_num_batched_tokens"] == 131072
 
 
 def test_ruler_uses_each_row_max_new_tokens_by_default():

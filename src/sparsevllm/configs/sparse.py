@@ -43,6 +43,35 @@ def resolve_shadowkv_outlier_chunks(
     return value
 
 
+def resolve_shadowkv_local_token_capacity(
+    chunk_size: int,
+    local_chunks: int,
+    context_capacity: int,
+) -> int:
+    """Return the direct-tail capacity after ShadowKV chunk alignment."""
+
+    chunk_size = int(chunk_size)
+    local_chunks = int(local_chunks)
+    context_capacity = int(context_capacity)
+    if chunk_size <= 0 or local_chunks < 0 or context_capacity <= 0:
+        raise ValueError(
+            "ShadowKV tail capacity requires chunk_size > 0, local_chunks >= 0, "
+            f"context_capacity > 0; got chunk_size={chunk_size}, "
+            f"local_chunks={local_chunks}, context_capacity={context_capacity}."
+        )
+    # _finalize_entry aligns the sparse chunk count down to a multiple of
+    # eight, so the direct tail may contain seven additional full chunks plus
+    # one partial chunk.
+    aligned_chunk_groups = 8
+    return min(
+        context_capacity,
+        local_chunks * chunk_size
+        + (aligned_chunk_groups - 1) * chunk_size
+        + chunk_size
+        - 1,
+    )
+
+
 def normalize_sparse_method_name(config) -> None:
     config.sparse_method = normalize_sparse_method(config.sparse_method)
     if config.sparse_method not in SUPPORTED_SPARSE_METHODS:
@@ -315,7 +344,7 @@ def _normalize_shadowkv(config) -> None:
             f"got {config.shadowkv_flashinfer_backend!r}."
         )
     config.shadowkv_flashinfer_backend = flashinfer_backend
-    storage = str(getattr(config, "shadowkv_storage", "cpu")).strip().lower()
+    storage = str(getattr(config, "shadowkv_storage", "gpu_cache")).strip().lower()
     if storage not in {"cpu", "gpu_cache"}:
         raise ValueError(
             "shadowkv_storage must be 'cpu' or 'gpu_cache', "

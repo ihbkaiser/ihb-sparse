@@ -59,6 +59,7 @@ class EvalConfig:
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.90
     batch_size: int = 4
+    max_batched_tokens: int = 65536
     decode_graph: bool = False
     quest_chunk_size: int = 16
     decode_keep_tokens: int = 2048
@@ -78,9 +79,9 @@ class EvalConfig:
     shadowkv_cutlass_root: str | None = None
     shadowkv_decode_backend: str = "auto"
     shadowkv_flashinfer_backend: str = "auto"
-    # ShadowKV's paper protocol stores the value cache in the CPU shadow. Keep
-    # the GPU-cache throughput overlay explicit at the command line.
-    shadowkv_storage: str = "cpu"
+    # Prefer the fast GPU-cache profile for normal evaluation. The CPU-shadow
+    # implementation remains available as an explicit ablation via the CLI.
+    shadowkv_storage: str = "gpu_cache"
     shadowkv_gpu_cache_tokens: int = 0
     shadowkv_multistream_gather: bool = True
     shadowkv_gather_copy_with_offsets: bool = True
@@ -92,6 +93,48 @@ class EvalConfig:
     query_robust_score_alpha: float = 0.5
     query_robust_skip_layers: int = 0
     query_robust_uniform_p: bool = False
+
+
+def _evaluation_timing(
+    *,
+    started_at: float,
+    serving_started_at: float | None,
+    finished_at: float,
+) -> dict[str, float | None]:
+    """Return auditable cold-start and warm-serving timing intervals.
+
+    ``serving_started_at`` is recorded after engine construction returns,
+    which is after model loading, startup profiling, graph capture, and
+    warmup. Successful throughput metrics must use that interval instead of
+    the evaluation lifetime.
+    """
+    started_at = float(started_at)
+    finished_at = float(finished_at)
+    if finished_at < started_at:
+        raise ValueError("finished_at must be greater than or equal to started_at.")
+    total_elapsed = finished_at - started_at
+    if serving_started_at is None:
+        return {
+            "startup_seconds": None,
+            "serving_elapsed_seconds": None,
+            "elapsed_seconds": round(total_elapsed, 3),
+            "total_elapsed_seconds": round(total_elapsed, 3),
+        }
+
+    serving_started_at = float(serving_started_at)
+    if serving_started_at < started_at:
+        raise ValueError("serving_started_at must be greater than or equal to started_at.")
+    if finished_at < serving_started_at:
+        raise ValueError("finished_at must be greater than or equal to serving_started_at.")
+    startup_elapsed = serving_started_at - started_at
+    serving_elapsed = finished_at - serving_started_at
+    return {
+        "startup_seconds": round(startup_elapsed, 3),
+        "serving_elapsed_seconds": round(serving_elapsed, 3),
+        # Preserve the historical field name as the primary warm-serving interval.
+        "elapsed_seconds": round(serving_elapsed, 3),
+        "total_elapsed_seconds": round(total_elapsed, 3),
+    }
 
 
 def _parse_args() -> EvalConfig:
@@ -131,6 +174,12 @@ def _parse_args() -> EvalConfig:
         type=int,
         default=4,
         help="Maximum requests decoded concurrently in one engine batch.",
+    )
+    parser.add_argument(
+        "--max-batched-tokens",
+        type=int,
+        default=65536,
+        help="Maximum tokens scheduled in one prefill step.",
     )
     parser.add_argument(
         "--decode-graph",
@@ -173,7 +222,10 @@ def _parse_args() -> EvalConfig:
         ),
     )
     parser.add_argument(
-        "--shadowkv-storage", choices=("cpu", "gpu_cache"), default="cpu"
+        "--shadowkv-storage",
+        choices=("cpu", "gpu_cache"),
+        default="gpu_cache",
+        help="ShadowKV storage mode; gpu_cache is the default fast path, cpu is opt-in.",
     )
     parser.add_argument(
         "--shadowkv-gpu-cache-tokens",
@@ -232,6 +284,8 @@ def _parse_args() -> EvalConfig:
         raise ValueError("--max-model-len must be positive when set.")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
+    if args.max_batched_tokens <= 0:
+        raise ValueError("--max-batched-tokens must be positive.")
     if args.shadowkv_svd_batch_size <= 0:
         raise ValueError("--shadowkv-svd-batch-size must be positive.")
     if args.shadowkv_svd_oversample <= 0:
@@ -687,6 +741,7 @@ def _build_infer_config(
         "max_num_seqs_in_batch": config.batch_size,
         "max_decoding_seqs": config.batch_size,
         "max_num_seqs_in_gpu": config.batch_size,
+        "max_num_batched_tokens": config.max_batched_tokens,
         "decode_graph": config.decode_graph,
         "decode_graph_capture_sizes": [config.batch_size],
         "enable_prefix_caching": False,
@@ -875,12 +930,14 @@ def main() -> None:
     }
     (output_dir / "run_info.json").write_text(json.dumps(run_info, indent=2), encoding="utf-8")
 
-    started = time.time()
+    started = time.perf_counter()
+    serving_started: float | None = None
+    evaluation_finished: float | None = None
     raw_rows: list[dict[str, Any]] = []
     parsed_rows: list[dict[str, Any]] = []
     result_rows: list[dict[str, Any]] = []
     processed_indices: set[int] = set()
-    progress = _make_evaluation_progress(dataset_rows)
+    progress = None
     try:
         if config.device.startswith("cuda"):
             if not torch.cuda.is_available():
@@ -891,6 +948,11 @@ def main() -> None:
             infer_config,
             sparse_method=config.sparse_method,
         )
+        # LLM construction returns after model loading, startup profiling,
+        # graph capture, and warmup, immediately after the engine logs
+        # "Startup completed". Exclude that cold-start interval from rates.
+        serving_started = time.perf_counter()
+        progress = _make_evaluation_progress(dataset_rows)
         llm = getattr(generate, "_sparsevllm_llm", None)
         from sparsevllm.operators.registry import operator_binding_reports
 
@@ -1015,6 +1077,7 @@ def main() -> None:
                         }
                     )
                 progress.update(len(batch_pairs))
+        evaluation_finished = time.perf_counter()
         runtime_diagnostics: dict[str, Any] = {
             "operator_bindings": operator_binding_reports(),
             "cuda": {
@@ -1052,7 +1115,8 @@ def main() -> None:
             encoding="utf-8",
         )
     finally:
-        progress.close()
+        if progress is not None:
+            progress.close()
     raw_rows.sort(key=lambda row: row["index"])
     parsed_rows.sort(key=lambda row: row["index"])
     result_rows.sort(key=lambda row: row["index"])
@@ -1064,6 +1128,15 @@ def main() -> None:
     for task in sorted({str(row["task"]) for row in result_rows}):
         values = [float(row["score"]) for row in successful if row["task"] == task]
         by_task[task] = round(100.0 * float(np.mean(values)), 2) if values else None
+    timing = _evaluation_timing(
+        started_at=started,
+        serving_started_at=serving_started,
+        finished_at=(
+            evaluation_finished
+            if evaluation_finished is not None
+            else time.perf_counter()
+        ),
+    )
     aggregate = {
         "protocol": run_info["protocol"],
         "sparse_method": config.sparse_method,
@@ -1072,7 +1145,7 @@ def main() -> None:
         "num_success": len(successful),
         "overall_score": round(100.0 * float(np.mean([row["score"] for row in successful])), 2) if successful else None,
         "score_by_task": by_task,
-        "elapsed_seconds": round(time.time() - started, 3),
+        **timing,
     }
     aggregate["input_tokens"] = sum(
         int(row["input_token_count"]) for row in successful
@@ -1083,15 +1156,16 @@ def main() -> None:
     aggregate["generated_output_tokens"] = sum(
         int(row["output_token_count"]) for row in successful
     )
-    if aggregate["elapsed_seconds"] > 0:
+    serving_elapsed = aggregate["serving_elapsed_seconds"]
+    if serving_elapsed is not None and serving_elapsed > 0:
         aggregate["samples_per_second"] = round(
-            len(successful) / aggregate["elapsed_seconds"], 4
+            len(successful) / serving_elapsed, 4
         )
         aggregate["generated_output_tokens_per_second"] = round(
-            aggregate["generated_output_tokens"] / aggregate["elapsed_seconds"], 4
+            aggregate["generated_output_tokens"] / serving_elapsed, 4
         )
         aggregate["requested_output_tokens_per_second"] = round(
-            aggregate["requested_output_tokens"] / aggregate["elapsed_seconds"], 4
+            aggregate["requested_output_tokens"] / serving_elapsed, 4
         )
     (output_dir / "aggregate_metrics.json").write_text(json.dumps(aggregate, indent=2, allow_nan=False), encoding="utf-8")
     print(json.dumps(aggregate, indent=2))

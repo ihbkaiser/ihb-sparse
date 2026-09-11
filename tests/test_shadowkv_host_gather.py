@@ -421,6 +421,73 @@ def test_shadowkv_gpu_cache_per_head_gather_matches_oracle_and_graph_replay():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shadowkv_paged_gpu_cache_gather_matches_physical_slot_oracle():
+    """Protect logical-position to shared-physical-slot lookup semantics."""
+    torch.manual_seed(20260910)
+    batch, rows, max_model_len, source_slots = 2, 4, 11, 23
+    heads, width, head_dim = 3, 7, 8
+    source_k = torch.randn(
+        source_slots, heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    source_v = source_k + 17
+    slot_mapping = torch.tensor(
+        [
+            [8, 3, 17, 1, 12, 20, 6, 15, 2, 10, 19],
+            [4, 16, 7, 21, 0, 13, 5, 18, 9, 22, 11],
+            [1, 2, -1, 4, 5, 6, 7, 8, 9, 10, 11],
+            [22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    request_rows = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
+    positions = torch.tensor(
+        [
+            [[0, 3, -1, 7, 10, 2, 5], [2, 4, 6, -1, 8, 9, 1], [1, 5, 7, 3, -1, 10, 0]],
+            [[3, 5, 7, 9, -1, 2, 4], [0, 1, 2, 3, 4, -1, 6], [8, 10, 12, -1, 9, 6, 18]],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    lengths = torch.tensor([9, 10], dtype=torch.int32, device="cuda")
+    output_k = torch.empty(
+        batch, heads, width, head_dim, dtype=source_k.dtype, device="cuda"
+    )
+    output_v = torch.empty_like(output_k)
+    kernel = load_shadowkv_host_gather()
+    kernel.gather_gpu_cache_per_head_kv_slots(
+        source_k,
+        source_v,
+        slot_mapping,
+        request_rows,
+        positions,
+        lengths,
+        output_k,
+        output_v,
+    )
+    torch.cuda.synchronize()
+
+    expected_k = torch.zeros_like(output_k)
+    expected_v = torch.zeros_like(output_v)
+    slot_mapping_cpu = slot_mapping.cpu()
+    for batch_idx in range(batch):
+        row_idx = int(request_rows[batch_idx].item())
+        for head_idx in range(heads):
+            for token_idx, position in enumerate(positions[batch_idx, head_idx].cpu().tolist()):
+                if 0 <= position < int(lengths[batch_idx].item()):
+                    slot = int(slot_mapping_cpu[row_idx, position].item())
+                    if 0 <= slot < source_slots:
+                        expected_k[batch_idx, head_idx, token_idx].copy_(
+                            source_k[slot, head_idx]
+                        )
+                        expected_v[batch_idx, head_idx, token_idx].copy_(
+                            source_v[slot, head_idx]
+                        )
+    torch.testing.assert_close(output_k, expected_k)
+    torch.testing.assert_close(output_v, expected_v)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_shadowkv_offset_copy_reuses_device_chunks_and_handles_host_misses():
     """Protect the ShadowKV-origin hit/miss compaction contract.
 

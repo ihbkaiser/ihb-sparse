@@ -218,7 +218,7 @@ def test_shadowkv_decode_spec_derives_omitted_outlier_capacity():
         runtime_config=runtime_config,
     )
 
-    expected_raw_width = 48 * 8 + 2048 + 39 + 512
+    expected_raw_width = 48 * 8 + 2048 + 95 + 512
     expected_width = ((expected_raw_width + 15) // 16) * 16
     assert spec.shadowkv_compact_width == expected_width
 

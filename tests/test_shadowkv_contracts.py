@@ -5,6 +5,12 @@ import torch
 import torch.nn.functional as F
 
 from benchmark.kvpress_ruler.evaluate import _score
+from sparsevllm.engine.cache_manager.base import (
+    AttentionViewMeta,
+    ExplicitKVPayload,
+    PrefillComputeView,
+)
+from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.shadowkv import ShadowKVCacheManager
 from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.context import reset_context, set_context
@@ -25,6 +31,7 @@ def test_shadowkv_factorizes_flattened_keys_with_independent_shape_oracle():
         shadowkv_sparse_budget=16,
         shadowkv_outlier_chunks=1,
         shadowkv_rank=4,
+        shadowkv_storage="cpu",
     )
     manager.num_kv_heads = 2
     manager.head_dim = 4
@@ -54,6 +61,7 @@ def test_shadowkv_zero_outlier_configuration_keeps_per_head_metadata_ranked():
         shadowkv_sparse_budget=8,
         shadowkv_outlier_chunks=0,
         shadowkv_rank=4,
+        shadowkv_storage="cpu",
     )
     manager.num_kv_heads = 2
     manager.head_dim = 4
@@ -79,6 +87,7 @@ def test_shadowkv_factorizes_pre_rope_keys_not_post_rope_keys():
         shadowkv_sparse_budget=8,
         shadowkv_outlier_chunks=1,
         shadowkv_rank=8,
+        shadowkv_storage="cpu",
     )
     manager.num_kv_heads = 2
     manager.head_dim = 4
@@ -113,6 +122,7 @@ def test_shadowkv_batched_factorization_preserves_exact_reconstruction():
         shadowkv_sparse_budget=8,
         shadowkv_outlier_chunks=1,
         shadowkv_rank=8,
+        shadowkv_storage="cpu",
     )
     manager.num_kv_heads = 2
     manager.head_dim = 4
@@ -146,6 +156,7 @@ def test_shadowkv_decode_workspace_uses_row_local_slots():
         shadowkv_local_chunks=1,
         shadowkv_recent_tokens=8,
         shadowkv_rank=4,
+        shadowkv_storage="cpu",
         decode_graph=False,
     )
     manager.num_kv_heads = 2
@@ -164,6 +175,36 @@ def test_shadowkv_decode_workspace_uses_row_local_slots():
     )
 
 
+def test_shadowkv_workspace_preserves_tail_after_chunk_alignment():
+    """The aligned chunk grid must not truncate the prompt's answer prefix."""
+    manager = object.__new__(ShadowKVCacheManager)
+    manager.config = SimpleNamespace(
+        shadowkv_chunk_size=8,
+        shadowkv_sparse_budget=2048,
+        shadowkv_outlier_chunks=48,
+        shadowkv_local_chunks=4,
+        shadowkv_recent_tokens=512,
+        shadowkv_rank=4,
+        shadowkv_storage="gpu_cache",
+        shadowkv_gpu_cache_tokens=32781,
+        shadowkv_decode_page_size=16,
+        shadowkv_kernel_backend="torch",
+        shadowkv_gather_copy_with_offsets=True,
+        decode_graph=False,
+    )
+    manager.num_kv_heads = 2
+    manager.head_dim = 4
+    manager.device = torch.device("cpu")
+    manager.hf_config = SimpleNamespace(dtype=torch.float32, num_attention_heads=4)
+    manager._shadow_decode_workspaces = {}
+
+    workspace = manager._ensure_decode_workspace(0, batch_size=1, context_capacity=32781)
+
+    # 32634 // 8 - 4 aligns down from 4075 to 4072 chunks, leaving 58
+    # prompt tokens in the direct tail.  A 39-token workspace would drop 19.
+    assert workspace["local_token_offsets"].numel() >= 58
+
+
 def test_shadowkv_decode_graph_does_not_force_short_batches_eager():
     """Protect the single graph topology used by both short and long requests."""
     manager = object.__new__(ShadowKVCacheManager)
@@ -173,6 +214,31 @@ def test_shadowkv_decode_graph_does_not_force_short_batches_eager():
     assert (
         manager.decode_graph_force_eager_for_batch([], is_long_text=True) is False
     )
+
+
+def test_shadowkv_gpu_reuse_publishes_static_decode_slots():
+    """Physical reuse must expose each static decode reservation to the row table."""
+    manager = object.__new__(ShadowKVCacheManager)
+    manager.config = SimpleNamespace(shadowkv_storage="gpu_cache")
+    # Keep the state-transition test CPU-only while selecting the CUDA physical
+    # reuse branch through the same manager capability predicate.
+    manager.device = torch.device("cuda")
+    manager.attention_cache_storage = object()
+    manager.buffer_req_to_token_slots = torch.zeros(
+        (2, 8), dtype=torch.int32
+    )
+    state = SimpleNamespace(
+        inputs=SimpleNamespace(
+            request_indices=torch.tensor([1], dtype=torch.int32),
+            context_lens=torch.tensor([4], dtype=torch.int32),
+            write_slot_mapping=torch.tensor([23], dtype=torch.int32),
+            active_mask=torch.tensor([True]),
+        )
+    )
+
+    manager.prepare_decode_graph_in(state)
+
+    assert manager.buffer_req_to_token_slots[1, 3].item() == 23
 
 
 def test_shadowkv_gpu_cache_materializes_exact_prompt_payload():
@@ -246,13 +312,15 @@ def test_shadowkv_gpu_cache_does_not_factorize_unused_payload(monkeypatch):
     assert entry["u"] is None
     assert entry["sv"] is None
     assert entry["sv_column_major"] is None
-    assert entry["landmarks"].shape == (2, 7, 4)
+    # GPU-cache mode follows the direct GPU protocol and retains the final
+    # full chunks; only the configured outlier chunk is removed.
+    assert entry["landmarks"].shape == (2, 14, 4)
     torch.testing.assert_close(entry["gpu_rope_k"][:128].cpu(), rope_k)
     torch.testing.assert_close(entry["gpu_v"][:128].cpu(), values)
 
     # The GPU metadata path must preserve the CPU reference's per-head
     # landmark/outlier semantics even though it avoids the unused SVD.
-    chunks = 8
+    chunks = 15
     context = (
         rope_k[: chunks * 8]
         .view(chunks, 8, manager.num_kv_heads, manager.head_dim)
@@ -319,3 +387,116 @@ def test_shadowkv_gpu_cache_stages_chunked_prefill_before_factorization():
         )
     finally:
         reset_context()
+
+
+def test_shadowkv_gpu_reuse_prefill_uses_physical_cache_view(monkeypatch):
+    """GPU-cache reuse must not stage a duplicate CPU-shadow prefill view."""
+    manager = object.__new__(ShadowKVCacheManager)
+    manager.config = SimpleNamespace(shadowkv_storage="gpu_cache")
+    manager.device = torch.device("cuda")
+    manager.attention_cache_storage = object()
+    selection = SimpleNamespace(
+        context_lens=torch.tensor([7], dtype=torch.int32),
+    )
+    view = PrefillComputeView(
+        meta=AttentionViewMeta(
+            active_slots=torch.arange(16, dtype=torch.int32).view(1, 16),
+            req_indices=torch.zeros(1, dtype=torch.int32),
+            context_lens=selection.context_lens,
+            max_context_len=99,
+        ),
+        payload=ExplicitKVPayload(
+            k_cache=torch.zeros((16, 2, 4)),
+            v_cache=torch.zeros((16, 2, 4)),
+        ),
+    )
+    current_k = torch.full((2, 2, 4), 3.0)
+    current_v = torch.full((2, 2, 4), 5.0)
+
+    def build_physical_view(self, layer_idx, selection):
+        assert layer_idx == 3
+        assert selection is not None
+        return view
+
+    monkeypatch.setattr(
+        ShadowKVCacheManager,
+        "_build_sm100_dense_prefill_view",
+        build_physical_view,
+    )
+
+    try:
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+        )
+        result = manager.build_prefill_compute_view(
+            3, current_k, current_v, selection
+        )
+    finally:
+        reset_context()
+
+    assert result.payload is view.payload
+    assert result.meta.max_context_len == 7
+    torch.testing.assert_close(result.payload.k_cache[5:7], current_k)
+    torch.testing.assert_close(result.payload.v_cache[5:7], current_v)
+
+
+def test_shadowkv_gpu_reuse_skips_raw_cpu_shadow_write(monkeypatch):
+    """Physical GPU-cache reuse has no reason to retain pre-RoPE CPU keys."""
+    manager = object.__new__(ShadowKVCacheManager)
+    manager.config = SimpleNamespace(shadowkv_storage="gpu_cache")
+    manager.device = torch.device("cuda")
+    manager.attention_cache_storage = object()
+
+    def fail_write(*args, **kwargs):
+        raise AssertionError("GPU-cache reuse wrote a raw CPU shadow")
+
+    monkeypatch.setattr(manager, "_write_shadow", fail_write)
+    try:
+        set_context(is_prefill=True)
+        manager.save_raw_kv_if_needed(
+            0,
+            torch.empty((2, 2, 4)),
+            torch.empty((2, 2, 4)),
+        )
+    finally:
+        reset_context()
+
+
+def test_shadowkv_gpu_reuse_marks_prefill_without_rope_cpu_shadow(monkeypatch):
+    """GPU-cache reuse records coverage metadata without copying K/V to host."""
+    manager = object.__new__(ShadowKVCacheManager)
+    manager.config = SimpleNamespace(shadowkv_storage="gpu_cache")
+    manager.device = torch.device("cuda")
+    manager.attention_cache_storage = object()
+    manager._shadow_entries = {}
+
+    monkeypatch.setattr(
+        ShadowKVCacheManager,
+        "_current_ranges",
+        lambda self, layer_idx, token_count: [(0, 0, token_count, 0, token_count)],
+    )
+    monkeypatch.setattr(
+        StandardCacheManager,
+        "save_rope_kv_if_needed",
+        lambda self, layer_idx, k, v: None,
+    )
+
+    def fail_write(*args, **kwargs):
+        raise AssertionError("GPU-cache reuse wrote a rope CPU shadow")
+
+    monkeypatch.setattr(manager, "_write_shadow", fail_write)
+    try:
+        set_context(is_prefill=True)
+        manager.save_rope_kv_if_needed(
+            0,
+            torch.empty((2, 2, 4)),
+            torch.empty((2, 2, 4)),
+        )
+    finally:
+        reset_context()
+
+    entry = manager._entry(0, 0)
+    assert entry["filled"] == 2
+    assert entry["rope_k"] is None
+    assert entry["v"] is None

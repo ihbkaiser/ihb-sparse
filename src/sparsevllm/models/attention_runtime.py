@@ -4,7 +4,10 @@ import torch
 from torch import nn
 
 import sparsevllm.platforms as platforms
-from sparsevllm.configs.sparse import resolve_shadowkv_outlier_chunks
+from sparsevllm.configs.sparse import (
+    resolve_shadowkv_local_token_capacity,
+    resolve_shadowkv_outlier_chunks,
+)
 from sparsevllm.method_registry import (
     is_paged_sparse_method,
     normalize_sparse_method,
@@ -264,7 +267,11 @@ def build_mha_decode_attention_spec(
         raw_compact_width = (
             outlier_chunks * chunk_size
             + sparse_budget
-            + min(context_capacity, local_chunks * chunk_size + chunk_size - 1)
+            + resolve_shadowkv_local_token_capacity(
+                chunk_size,
+                local_chunks,
+                context_capacity,
+            )
             + min(context_capacity, recent_tokens)
         )
         shadowkv_compact_width = (
