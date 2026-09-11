@@ -8,6 +8,10 @@ from functools import lru_cache
 from pathlib import Path
 
 
+_CUDA_DEVELOPMENT_HEADERS = ("cusparse.h", "cusolverDn.h")
+_NVIDIA_CUDA_PACKAGES = ("nvidia.cusparse", "nvidia.cusolver", "nvidia.cu13")
+
+
 def _cuda_include_paths(cuda_home: str | None) -> list[str]:
     """Find CUDA development headers used by PyTorch CUDA extensions."""
     candidates: list[Path] = []
@@ -20,16 +24,17 @@ def _cuda_include_paths(cuda_home: str | None) -> list[str]:
             ]
         )
 
-    spec = importlib.util.find_spec("nvidia.cusparse")
-    if spec and spec.submodule_search_locations:
-        candidates.extend(
-            Path(location) / "include"
-            for location in spec.submodule_search_locations
-        )
+    for package_name in _NVIDIA_CUDA_PACKAGES:
+        spec = importlib.util.find_spec(package_name)
+        if spec and spec.submodule_search_locations:
+            candidates.extend(
+                Path(location) / "include"
+                for location in spec.submodule_search_locations
+            )
 
     include_paths: list[str] = []
     for candidate in candidates:
-        if (candidate / "cusparse.h").is_file():
+        if any((candidate / header).is_file() for header in _CUDA_DEVELOPMENT_HEADERS):
             resolved = str(candidate.resolve())
             if resolved not in include_paths:
                 include_paths.append(resolved)
@@ -48,11 +53,16 @@ def load_shadowkv_host_gather():
     if not source.is_file():
         raise FileNotFoundError(f"ShadowKV CUDA source is missing: {source}")
     cuda_include_paths = _cuda_include_paths(CUDA_HOME)
-    if not cuda_include_paths:
+    missing_headers = [
+        header
+        for header in _CUDA_DEVELOPMENT_HEADERS
+        if not any((Path(path) / header).is_file() for path in cuda_include_paths)
+    ]
+    if missing_headers:
         raise RuntimeError(
-            "ShadowKV host gather requires the CUDA cuSPARSE development header "
-            "cusparse.h. Install a CUDA development toolkit or the matching "
-            "nvidia-cusparse package, then retry."
+            "ShadowKV host gather requires CUDA development headers "
+            f"{', '.join(missing_headers)}. Install a CUDA development toolkit "
+            "or the matching nvidia-cusparse/nvidia-cusolver packages, then retry."
         )
     return load(
         name="sparsevllm_shadowkv_host_gather_v5",

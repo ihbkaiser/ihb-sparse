@@ -22,8 +22,34 @@ def test_shadowkv_loader_finds_cuda_target_include_layout(tmp_path):
     assert str(target_include) in _cuda_include_paths(cuda_home)
 
 
-def test_shadowkv_loader_passes_cuda_include_paths_to_extension_builder(monkeypatch):
-    expected_include_paths = ["/cuda/targets/x86_64-linux/include"]
+def test_shadowkv_loader_finds_cuda13_shared_include_layout(tmp_path, monkeypatch):
+    package_root = tmp_path / "site-packages" / "nvidia"
+    cuda13_include = package_root / "cu13" / "include"
+    cuda13_include.mkdir(parents=True)
+    (cuda13_include / "cusolverDn.h").touch()
+
+    def fake_find_spec(name):
+        if name == "nvidia.cu13":
+            return SimpleNamespace(
+                submodule_search_locations=[str(package_root / "cu13")]
+            )
+        return None
+
+    monkeypatch.setattr(
+        shadowkv_host_gather.importlib.util, "find_spec", fake_find_spec
+    )
+
+    assert str(cuda13_include) in _cuda_include_paths(None)
+
+
+def test_shadowkv_loader_passes_cuda_include_paths_to_extension_builder(
+    tmp_path, monkeypatch
+):
+    target_include = tmp_path / "cuda" / "include"
+    target_include.mkdir(parents=True)
+    (target_include / "cusparse.h").touch()
+    (target_include / "cusolverDn.h").touch()
+    expected_include_paths = [str(target_include)]
     captured = {}
 
     def fake_load(**kwargs):
@@ -44,6 +70,25 @@ def test_shadowkv_loader_passes_cuda_include_paths_to_extension_builder(monkeypa
         shadowkv_host_gather.load_shadowkv_host_gather.cache_clear()
 
     assert captured["extra_include_paths"] == expected_include_paths
+
+
+def test_shadowkv_loader_reports_missing_cuda_development_header(tmp_path, monkeypatch):
+    target_include = tmp_path / "cuda" / "include"
+    target_include.mkdir(parents=True)
+    (target_include / "cusparse.h").touch()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        shadowkv_host_gather,
+        "_cuda_include_paths",
+        lambda cuda_home: [str(target_include)],
+    )
+    shadowkv_host_gather.load_shadowkv_host_gather.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="cusolverDn.h"):
+            shadowkv_host_gather.load_shadowkv_host_gather()
+    finally:
+        shadowkv_host_gather.load_shadowkv_host_gather.cache_clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
