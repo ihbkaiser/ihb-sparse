@@ -236,6 +236,31 @@ def test_query_robust_vertex_selector_repeats_real_support_points():
     assert set(map(tuple, vertices.tolist())) == {(1.0, 0.0), (-1.0, 0.0)}
 
 
+def test_query_robust_selector_uses_gqa_qfilter_support_extrema():
+    selector = _load_selector_module()
+    queries = torch.tensor(
+        [
+            [5.0, 0.0],
+            [4.0, 1.0],
+            [-4.0, 0.0],
+            [-3.0, -1.0],
+            [6.0, 1.0],
+            [5.0, -1.0],
+            [-5.0, 1.0],
+            [-4.0, -1.0],
+        ]
+    )
+    q_head_ids = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+    vertices, valid_count = selector.select_group(
+        queries,
+        num_vertices=3,
+        q_head_ids=q_head_ids,
+    )
+    assert valid_count == 3
+    assert float(vertices[:, 0].max()) >= 6.0
+    assert float(vertices[:, 0].min()) <= -5.0
+
+
 def test_query_robust_method_is_registered_as_paged_runtime_contract():
     assert normalize_sparse_method("qr") == "query_robust"
     assert is_paged_sparse_method("query_robust")
