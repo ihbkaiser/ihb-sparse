@@ -9,11 +9,16 @@ from benchmark.kvpress_ruler.evaluate import (
     _build_infer_config,
     _build_evaluation_groups,
     _evaluation_timing,
+    _infer_max_model_len,
     _load_rows,
     _parse_args,
     _resolve_max_new_tokens,
     _row_prompt,
 )
+
+
+def test_inferred_max_model_len_is_exact_prompt_generation_budget():
+    assert _infer_max_model_len([130_944, 130_000], [128, 32]) == 131_072
 
 
 def test_ruler_throughput_timing_starts_after_startup():

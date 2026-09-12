@@ -25,7 +25,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from itertools import islice
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 import torch
@@ -732,6 +732,24 @@ def _row_prompt(tokenizer, row: dict[str, Any], *, max_context_length: int) -> l
     )
 
 
+def _infer_max_model_len(
+    prompt_lengths: Sequence[int], max_new_tokens: Sequence[int]
+) -> int:
+    """Return the exact maximum prompt-plus-generation budget.
+
+    ``max_model_len`` is a hard model-context limit, so adding a safety margin
+    here can make a valid sample set impossible to run at the model boundary.
+    """
+    if not prompt_lengths or len(prompt_lengths) != len(max_new_tokens):
+        raise ValueError(
+            "prompt_lengths and max_new_tokens must be non-empty and have equal lengths."
+        )
+    return max(
+        int(prompt_length) + int(tokens)
+        for prompt_length, tokens in zip(prompt_lengths, max_new_tokens)
+    )
+
+
 def _score(task: str, prediction: str, references: list[str]) -> float:
     normalized = re.sub(r"[\x00-\x1f]", "", prediction.strip()).lower()
     if not references:
@@ -895,10 +913,7 @@ def main() -> None:
     if not dataset_rows or prompt_schema is None:
         raise ValueError("RULER dataset is empty after applying selection.")
     evaluation_groups = _build_evaluation_groups(task_names, max_new_tokens)
-    inferred_max_model_len = max(
-        prompt_length + tokens
-        for prompt_length, tokens in zip(prompt_lengths, max_new_tokens)
-    ) + 16
+    inferred_max_model_len = _infer_max_model_len(prompt_lengths, max_new_tokens)
     _phase_log(
         "Tokenization pass 1 complete: "
         f"rows={dataset_rows} max_prompt_tokens={max(prompt_lengths)} "
