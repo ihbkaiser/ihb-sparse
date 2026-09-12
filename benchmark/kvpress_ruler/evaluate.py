@@ -101,6 +101,12 @@ class EvalConfig:
     query_robust_uniform_p: bool = False
 
 
+def _phase_log(message: str) -> None:
+    """Print a flushed phase marker before long preprocessing/runtime steps."""
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[RULER {timestamp}] {message}", flush=True)
+
+
 def _evaluation_timing(
     *,
     started_at: float,
@@ -823,6 +829,12 @@ def main() -> None:
     config = _parse_args()
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    _phase_log(
+        "Loading dataset metadata: "
+        f"source={config.dataset_path or config.dataset_repo_id or config.dataset_name} "
+        f"data_dir={config.data_dir} fraction={config.fraction} "
+        f"max_samples={config.max_samples}"
+    )
     row_factory, dataset_source = _dataset_row_factory(config)
     selected_factory = _selected_row_factory(row_factory, config)
     random.seed(config.seed)
@@ -834,7 +846,14 @@ def main() -> None:
     from transformers import AutoTokenizer
     from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 
+    tokenizer_started = time.perf_counter()
+    _phase_log(f"Loading tokenizer from {config.model_path!r}...")
     tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=False)
+    _phase_log(
+        "Tokenizer ready: "
+        f"model_max_length={tokenizer.model_max_length} "
+        f"elapsed={time.perf_counter() - tokenizer_started:.2f}s"
+    )
     max_new_tokens: list[int] = []
     prompt_schema: str | None = None
     max_context_length = config.max_context_length
@@ -845,22 +864,33 @@ def main() -> None:
     # multiple gigabytes before inference starts.
     prompt_lengths: list[int] = []
     task_names: list[str] = []
-    for row in selected_factory():
-        if prompt_schema is None:
-            prompt_schema = "prompt" if "prompt" in row else "context_question"
-        task_names.append(str(row["task"]))
-        max_new_tokens.append(
-            _resolve_max_new_tokens([row], override=config.max_new_tokens)[0]
-        )
-        prompt_lengths.append(
-            len(
-                _row_prompt(
-                    tokenizer,
-                    row,
-                    max_context_length=max_context_length,
+    first_tokenize_started = time.perf_counter()
+    _phase_log(
+        "Tokenizing prompts (pass 1/2) to infer prompt lengths and max_model_len..."
+    )
+    with tqdm(
+        selected_factory(),
+        total=config.max_samples,
+        desc="Tokenizing prompts (pass 1/2)",
+        unit="sample",
+        dynamic_ncols=True,
+    ) as token_progress:
+        for row in token_progress:
+            if prompt_schema is None:
+                prompt_schema = "prompt" if "prompt" in row else "context_question"
+            task_names.append(str(row["task"]))
+            max_new_tokens.append(
+                _resolve_max_new_tokens([row], override=config.max_new_tokens)[0]
+            )
+            prompt_lengths.append(
+                len(
+                    _row_prompt(
+                        tokenizer,
+                        row,
+                        max_context_length=max_context_length,
+                    )
                 )
             )
-        )
     dataset_rows = len(prompt_lengths)
     if not dataset_rows or prompt_schema is None:
         raise ValueError("RULER dataset is empty after applying selection.")
@@ -869,6 +899,11 @@ def main() -> None:
         prompt_length + tokens
         for prompt_length, tokens in zip(prompt_lengths, max_new_tokens)
     ) + 16
+    _phase_log(
+        "Tokenization pass 1 complete: "
+        f"rows={dataset_rows} max_prompt_tokens={max(prompt_lengths)} "
+        f"elapsed={time.perf_counter() - first_tokenize_started:.2f}s"
+    )
     if config.max_model_len is not None and config.max_model_len < inferred_max_model_len:
         raise ValueError(
             f"--max-model-len={config.max_model_len} is smaller than the evaluated prompt budget "
@@ -966,6 +1001,11 @@ def main() -> None:
             if not torch.cuda.is_available():
                 raise RuntimeError(f"Requested {config.device}, but CUDA is unavailable.")
             torch.cuda.set_device(torch.device(config.device))
+        engine_started = time.perf_counter()
+        _phase_log(
+            "Initializing Sparse-vLLM engine: model loading, KV allocation, "
+            "startup profiling, and warmup..."
+        )
         generate = get_sparsevllm_generate_api(
             config.model_path,
             infer_config,
@@ -975,6 +1015,11 @@ def main() -> None:
         # graph capture, and warmup, immediately after the engine logs
         # "Startup completed". Exclude that cold-start interval from rates.
         serving_started = time.perf_counter()
+        _phase_log(
+            "Engine ready; entering generation/evaluation: "
+            f"startup_elapsed={serving_started - engine_started:.2f}s "
+            f"rows={dataset_rows} batch_size={config.batch_size}"
+        )
         progress = _make_evaluation_progress(dataset_rows)
         llm = getattr(generate, "_sparsevllm_llm", None)
         from sparsevllm.operators.registry import operator_binding_reports
@@ -986,11 +1031,15 @@ def main() -> None:
         (output_dir / "runtime_bindings.json").write_text(
             json.dumps(runtime_start, indent=2, default=str), encoding="utf-8"
         )
-        for group in evaluation_groups:
+        for group_index, group in enumerate(evaluation_groups, start=1):
             group_indices = group["indices"]
             group_budget = int(group["max_new_tokens"])
             grouped_rows = iter(_iter_rows_at_indices(selected_factory, group_indices))
+            total_group_batches = (
+                len(group_indices) + config.batch_size - 1
+            ) // config.batch_size
             for batch_start in range(0, len(group_indices), config.batch_size):
+                batch_number = batch_start // config.batch_size + 1
                 batch_indices = group_indices[
                     batch_start : batch_start + config.batch_size
                 ]
@@ -1014,6 +1063,13 @@ def main() -> None:
                             f"max_new_tokens={replayed_budget}, expected "
                             f"task={group['task']!r}, max_new_tokens={group_budget}."
                         )
+                batch_tokenize_started = time.perf_counter()
+                _phase_log(
+                    f"Tokenizing batch (pass 2/2): group={group_index}/"
+                    f"{len(evaluation_groups)} batch={batch_number}/"
+                    f"{total_group_batches} rows={batch_indices[0]}-"
+                    f"{batch_indices[-1]}"
+                )
                 batch_prompts = [
                     _row_prompt(
                         tokenizer,
@@ -1022,6 +1078,13 @@ def main() -> None:
                     )
                     for row in batch_rows
                 ]
+                _phase_log(
+                    "Batch tokenization complete: "
+                    f"tokens={sum(len(prompt) for prompt in batch_prompts)} "
+                    f"elapsed={time.perf_counter() - batch_tokenize_started:.2f}s; "
+                    "generating..."
+                )
+                generation_started = time.perf_counter()
                 outputs = generate(
                     batch_prompts,
                     max_new_tokens=[group_budget] * len(batch_rows),
@@ -1099,6 +1162,11 @@ def main() -> None:
                             "output_token_count": output_token_count,
                         }
                     )
+                _phase_log(
+                    "Batch generation complete: "
+                    f"rows={batch_indices[0]}-{batch_indices[-1]} "
+                    f"elapsed={time.perf_counter() - generation_started:.2f}s"
+                )
                 progress.update(len(batch_pairs))
         evaluation_finished = time.perf_counter()
         runtime_diagnostics: dict[str, Any] = {
@@ -1117,6 +1185,10 @@ def main() -> None:
             json.dumps(runtime_diagnostics, indent=2, default=str), encoding="utf-8"
         )
     except Exception as error:
+        _phase_log(
+            f"Evaluation failed after {len(processed_indices)}/{dataset_rows} "
+            f"processed samples: {type(error).__name__}: {error}"
+        )
         # Preserve an explicit terminal status for every evaluated sample.
         for index, row in enumerate(selected_factory()):
             if index in processed_indices:
@@ -1191,6 +1263,11 @@ def main() -> None:
             aggregate["requested_output_tokens"] / serving_elapsed, 4
         )
     (output_dir / "aggregate_metrics.json").write_text(json.dumps(aggregate, indent=2, allow_nan=False), encoding="utf-8")
+    _phase_log(
+        "Evaluation finished: "
+        f"status={aggregate['status']} samples={aggregate['num_success']}/{aggregate['num_samples']} "
+        f"total_elapsed={timing['total_elapsed_seconds']}s"
+    )
     print(json.dumps(aggregate, indent=2))
     if aggregate["status"] != "success":
         raise RuntimeError("RULER evaluation failed; inspect per_sample_results.jsonl and error.json.")
