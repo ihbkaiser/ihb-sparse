@@ -1,0 +1,72 @@
+{
+  "gpu_name": "NVIDIA B200",
+  "compute_capability": [
+    10,
+    0
+  ],
+  "torch_version": "2.11.0+cu130",
+  "torch_cuda": "13.0",
+  "model_id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+  "model_revision": "6a6f4aa4197940add57724a7707d069478df56b1",
+  "source_commit": "c1497b59d0b168791d0d4786bc0c44a31cac9d2e",
+  "model_config": {
+    "model_type": "llama",
+    "architectures": [
+      "LlamaForCausalLM"
+    ],
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "hidden_size": 4096,
+    "head_dim": 128,
+    "max_position_embeddings": 131072,
+    "rope_theta": 500000.0
+  },
+  "calibration_dataset": "monology/pile-uncopyrighted",
+  "calibration_dataset_revision": "3be90335b66f24456a5d6659d9c8d208c0357119",
+  "calibration": {
+    "sequences": 20,
+    "sequence_length": 131072,
+    "samples_per_query_head": 3000,
+    "position_windows": {
+      "16k": [
+        14336,
+        16384
+      ],
+      "32k": [
+        30720,
+        32768
+      ],
+      "48k": [
+        47104,
+        49152
+      ],
+      "64k": [
+        63488,
+        65536
+      ],
+      "80k": [
+        79872,
+        81920
+      ],
+      "96k": [
+        96256,
+        98304
+      ],
+      "112k": [
+        112640,
+        114688
+      ],
+      "128k": [
+        129024,
+        131072
+      ]
+    },
+    "vertices": 32
+  },
+  "leakage_controls": {
+    "ruler_data_mounted": false,
+    "ruler_data_read": false,
+    "metric_or_test_feedback_used": false
+  }
+}
