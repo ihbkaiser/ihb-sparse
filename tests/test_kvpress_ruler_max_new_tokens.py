@@ -1,3 +1,4 @@
+import argparse
 import sys
 from pathlib import Path
 
@@ -12,8 +13,10 @@ from benchmark.kvpress_ruler.evaluate import (
     _infer_max_model_len,
     _load_rows,
     _parse_args,
+    _parse_gpu_ids,
     _resolve_max_new_tokens,
     _row_prompt,
+    _sharded_row_factory,
 )
 
 
@@ -108,6 +111,34 @@ def test_kvpress_parser_accepts_query_robust_full_ruler_configuration(monkeypatc
         + config.recent_keep_tokens
         == 2048
     )
+
+
+def test_gpu_ids_parse_as_unique_nonnegative_physical_ids():
+    assert _parse_gpu_ids("0, 2,3") == (0, 2, 3)
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_gpu_ids("1,1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_gpu_ids("-1")
+
+
+def test_multi_gpu_sharding_preserves_global_selected_ordinals():
+    rows = [{"task": f"task_{index}"} for index in range(7)]
+    factory = lambda: iter(rows)
+
+    shards = [
+        list(
+            _sharded_row_factory(
+                factory,
+                shard_index=shard_index,
+                shard_count=3,
+            )()
+        )
+        for shard_index in range(3)
+    ]
+
+    assert [row["_sparsevllm_global_index"] for row in shards[0]] == [0, 3, 6]
+    assert [row["_sparsevllm_global_index"] for row in shards[1]] == [1, 4]
+    assert [row["_sparsevllm_global_index"] for row in shards[2]] == [2, 5]
 
 
 def test_kvpress_parser_propagates_shadowkv_outlier_and_local_chunks(monkeypatch):

@@ -8,13 +8,14 @@ DATASET_PATH="/workspace/storage-shared/nlp/tungdd11/tungsparse/ruler-data/ruler
 QR_VERTICES="/workspace/Sparse-vLLM/scripts/benchmarks/qr_vertices_m32_128k.pt"
 MODEL_FINGERPRINT="d10aef7999a2b5ba950ab3974312feeedbfe0b77"
 OUT_ROOT="/workspace/storage-shared/nlp/tungdd11/tungsparse/results/kvpress-ruler-new/full-ruler128k-budget4096-b4"
-GPU_ID=0
+# Physical GPU IDs.  A comma-separated list launches one independent TP1
+# evaluator per GPU and merges the per-sample artifacts at OUT_ROOT.
+GPU_IDS="${GPU_IDS:-0}"
 
 export SPARSEVLLM_MASTER_PORT=24339
 
 mkdir -p "$OUT_ROOT"
 
-CUDA_VISIBLE_DEVICES="$GPU_ID" \
 PYTHONPATH="$PWD:$PWD/src" \
 python benchmark/kvpress_ruler/evaluate.py \
   --model-path "$MODEL_PATH" \
@@ -23,6 +24,7 @@ python benchmark/kvpress_ruler/evaluate.py \
   --sparse-method query_robust \
   --fraction 1.0 \
   --seed 42 \
+  --gpu-ids "$GPU_IDS" \
   --gpu-memory-utilization 0.90 \
   --batch-size 4 \
   --max-batched-tokens 65536 \

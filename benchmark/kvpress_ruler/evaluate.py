@@ -20,6 +20,9 @@ import json
 import os
 import random
 import re
+import shlex
+import socket
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, replace
@@ -56,6 +59,12 @@ class EvalConfig:
     max_new_tokens: int | None = None
     seed: int = 42
     device: str = "cuda:0"
+    gpu_ids: tuple[int, ...] | None = None
+    # Internal worker controls used by --gpu-ids orchestration.  A worker
+    # receives the globally selected rows whose ordinal satisfies
+    # ordinal % shard_count == shard_index.
+    shard_index: int = 0
+    shard_count: int = 1
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.90
     batch_size: int = 4
@@ -149,6 +158,28 @@ def _evaluation_timing(
     }
 
 
+def _parse_gpu_ids(value: str) -> tuple[int, ...]:
+    """Parse physical CUDA IDs supplied to the multi-worker launcher."""
+    values = [part.strip() for part in str(value).split(",") if part.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError(
+            "--gpu-ids must be a comma-separated list such as 0 or 0,1."
+        )
+    try:
+        gpu_ids = tuple(int(part) for part in values)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "--gpu-ids must contain only non-negative integer IDs."
+        ) from error
+    if any(gpu_id < 0 for gpu_id in gpu_ids):
+        raise argparse.ArgumentTypeError(
+            "--gpu-ids must contain only non-negative integer IDs."
+        )
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise argparse.ArgumentTypeError("--gpu-ids must not contain duplicates.")
+    return gpu_ids
+
+
 def _parse_args() -> EvalConfig:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
@@ -165,7 +196,7 @@ def _parse_args() -> EvalConfig:
     )
     parser.add_argument(
         "--sparse-method",
-        choices=("quest", "shadowkv", "query_robust"),
+        choices=("vanilla", "quest", "shadowkv", "query_robust"),
         required=True,
     )
     parser.add_argument("--fraction", type=float, default=1.0)
@@ -174,6 +205,17 @@ def _parse_args() -> EvalConfig:
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--gpu-ids",
+        type=_parse_gpu_ids,
+        default=None,
+        help=(
+            "Run independent TP1 workers on these physical GPUs. For example, "
+            "--gpu-ids 0,1 shards the selected RULER rows across two workers."
+        ),
+    )
+    parser.add_argument("--shard-index", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--shard-count", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument(
         "--gpu-memory-utilization",
@@ -307,6 +349,13 @@ def _parse_args() -> EvalConfig:
         raise ValueError("--max-new-tokens must be positive when set.")
     if args.max_model_len is not None and args.max_model_len <= 0:
         raise ValueError("--max-model-len must be positive when set.")
+    if args.shard_count <= 0:
+        raise ValueError("--shard-count must be positive.")
+    if not 0 <= args.shard_index < args.shard_count:
+        raise ValueError(
+            "--shard-index must be in [0, --shard-count): "
+            f"got index={args.shard_index} count={args.shard_count}."
+        )
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
     if args.max_batched_tokens <= 0:
@@ -573,10 +622,55 @@ def _selected_row_factory(
     return factory
 
 
+def _sharded_row_factory(
+    selected_factory: Callable[[], Iterator[dict[str, Any]]],
+    *,
+    shard_index: int,
+    shard_count: int,
+) -> Callable[[], Iterator[dict[str, Any]]]:
+    """Select one deterministic shard after global fraction/max-sample selection.
+
+    The hidden ordinal lets the parent process merge worker artifacts back into
+    the same sample order as a single-GPU evaluation without copying the large
+    128K prompt strings into temporary shard files.
+    """
+    shard_index = int(shard_index)
+    shard_count = int(shard_count)
+    if shard_count <= 0 or not 0 <= shard_index < shard_count:
+        raise ValueError(
+            "Invalid shard selection: "
+            f"index={shard_index} count={shard_count}."
+        )
+    if shard_count == 1:
+        return selected_factory
+
+    def factory() -> Iterator[dict[str, Any]]:
+        for global_index, row in enumerate(selected_factory()):
+            if global_index % shard_count != shard_index:
+                continue
+            sharded_row = dict(row)
+            sharded_row["_sparsevllm_global_index"] = int(global_index)
+            yield sharded_row
+
+    return factory
+
+
 def _load_rows(config: EvalConfig) -> list[dict[str, Any]]:
     row_factory, _ = _dataset_row_factory(config)
     selected_factory = _selected_row_factory(row_factory, config)
-    return list(selected_factory())
+    sharded_factory = _sharded_row_factory(
+        selected_factory,
+        shard_index=config.shard_index,
+        shard_count=config.shard_count,
+    )
+    return list(sharded_factory())
+
+
+def _count_selected_rows(config: EvalConfig) -> int:
+    """Count globally selected rows without retaining their large text fields."""
+    row_factory, _ = _dataset_row_factory(config)
+    selected_factory = _selected_row_factory(row_factory, config)
+    return sum(1 for _ in selected_factory())
 
 
 def _references(value: Any, *, task: str) -> list[str]:
@@ -670,6 +764,25 @@ def _iter_rows_at_indices(
             "RULER dataset changed between tokenizer and generation passes: "
             f"missing selected row index {next_index}."
         )
+
+
+def _row_output_index(row: dict[str, Any], local_index: int) -> int:
+    """Return the stable selected-dataset ordinal for a worker row."""
+    value = row.get("_sparsevllm_global_index")
+    if value is None:
+        return int(local_index)
+    if isinstance(value, bool):
+        raise ValueError("_sparsevllm_global_index must be an integer.")
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "_sparsevllm_global_index must be an integer, "
+            f"got {value!r}."
+        ) from error
+    if value < 0:
+        raise ValueError("_sparsevllm_global_index must be non-negative.")
+    return value
 
 
 def _kvpress_prompt(
@@ -789,7 +902,10 @@ def _build_infer_config(
         "decode_graph_capture_sizes": [config.batch_size],
         "enable_prefix_caching": False,
     }
-    if config.sparse_method == "quest":
+    if config.sparse_method == "vanilla":
+        # Full Attention uses only the shared runtime/cache defaults.
+        pass
+    elif config.sparse_method == "quest":
         infer_config.update(
             {
                 "quest_chunk_size": config.quest_chunk_size,
@@ -843,8 +959,533 @@ def _build_infer_config(
     return infer_config
 
 
+def _strip_cli_options(argv: Sequence[str], options: set[str]) -> list[str]:
+    """Remove value-taking options before appending worker-specific values."""
+    cleaned: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = str(argv[index])
+        option = token.split("=", 1)[0]
+        if option in options:
+            index += 1
+            if "=" not in token:
+                if index >= len(argv):
+                    raise ValueError(f"Missing value for {option}.")
+                index += 1
+            continue
+        cleaned.append(token)
+        index += 1
+    return cleaned
+
+
+def _worker_master_port(worker_index: int) -> int:
+    """Return a distinct localhost rendezvous port for one TP1 worker."""
+    configured = os.environ.get("SPARSEVLLM_MASTER_PORT")
+    if configured is not None:
+        try:
+            base_port = int(configured)
+        except ValueError as error:
+            raise ValueError(
+                "SPARSEVLLM_MASTER_PORT must be an integer when --gpu-ids is used."
+            ) from error
+        port = base_port + int(worker_index)
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                "SPARSEVLLM_MASTER_PORT plus worker index must stay in [1, 65535], "
+                f"got {port}."
+            )
+        return port
+
+    # Ask the OS for a free port when the caller did not configure a base.
+    # The child immediately binds the returned port through torch.distributed;
+    # using different ports avoids the TP1 workers contending on the default.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _read_jsonl_if_present(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    return _read_json_rows(path)
+
+
+def _terminate_worker_processes(
+    child_processes: list[tuple[int, int, subprocess.Popen, Any, Path]],
+) -> None:
+    """Terminate and reap workers when orchestration itself aborts."""
+    for _, _, process, _, _ in child_processes:
+        if process.poll() is None:
+            process.terminate()
+    for _, _, process, log_handle, _ in child_processes:
+        if process.poll() is None:
+            process.wait()
+        log_handle.close()
+
+
+def _merge_worker_rows(
+    *,
+    worker_rows: list[dict[str, Any]],
+    expected_indices: set[int],
+    worker_index: int,
+    gpu_id: int,
+    output_name: str,
+) -> list[dict[str, Any]]:
+    """Validate and annotate rows emitted by one worker."""
+    merged: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for row in worker_rows:
+        if "index" not in row:
+            raise RuntimeError(
+                f"Worker {worker_index} {output_name} row has no index: {row!r}."
+            )
+        try:
+            index = int(row["index"])
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"Worker {worker_index} {output_name} row has invalid index "
+                f"{row.get('index')!r}."
+            ) from error
+        if index not in expected_indices:
+            raise RuntimeError(
+                f"Worker {worker_index} emitted {output_name} index={index}, "
+                f"outside its assigned shard."
+            )
+        if index in seen:
+            raise RuntimeError(
+                f"Worker {worker_index} emitted duplicate {output_name} index={index}."
+            )
+        seen.add(index)
+        merged.append(
+            {
+                **row,
+                "index": index,
+                "shard_index": int(worker_index),
+                "gpu_id": int(gpu_id),
+            }
+        )
+    return merged
+
+
+def _missing_worker_result_rows(
+    *,
+    selected_rows: list[dict[str, Any]],
+    missing_indices: set[int],
+    worker_index: int,
+    gpu_id: int,
+    max_new_tokens_override: int | None,
+    error: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index in sorted(missing_indices):
+        source_row = selected_rows[index]
+        task = str(source_row["task"])
+        try:
+            answer = _references(source_row["answer"], task=task)
+        except Exception:
+            answer = source_row.get("answer")
+        max_new_tokens = _resolve_max_new_tokens(
+            [source_row], override=max_new_tokens_override
+        )[0]
+        rows.append(
+            {
+                "index": int(index),
+                "task": task,
+                "status": "model_failed",
+                "error_type": "WorkerOutputMissing",
+                "error": error,
+                "answer": answer,
+                "input_token_count": None,
+                "max_new_tokens": max_new_tokens,
+                "shard_index": int(worker_index),
+                "gpu_id": int(gpu_id),
+            }
+        )
+    return rows
+
+
+def _run_multi_gpu(config: EvalConfig) -> None:
+    """Run disjoint TP1 workers and merge their auditable artifacts."""
+    gpu_ids = tuple(config.gpu_ids or ())
+    if len(gpu_ids) <= 1:
+        raise ValueError("_run_multi_gpu requires at least two GPU IDs.")
+    if config.shard_count != 1 or config.shard_index != 0:
+        raise ValueError("--gpu-ids cannot be combined with internal shard options.")
+
+    parent_started = time.perf_counter()
+    total_rows = _count_selected_rows(config)
+    if total_rows <= 0:
+        raise ValueError("RULER dataset is empty after applying selection.")
+    if len(gpu_ids) > total_rows:
+        raise ValueError(
+            "Cannot assign more workers than selected RULER rows: "
+            f"workers={len(gpu_ids)} rows={total_rows}."
+        )
+
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for filename in (
+        "run_info.json",
+        "aggregate_metrics.json",
+        "raw_outputs.jsonl",
+        "parsed_outputs.jsonl",
+        "per_sample_results.jsonl",
+        "multi_gpu_manifest.json",
+    ):
+        target = output_dir / filename
+        if target.exists():
+            raise FileExistsError(
+                f"Refusing to overwrite existing multi-GPU artifact: {target}"
+            )
+    shard_root = output_dir / "shards"
+    if shard_root.exists() and any(shard_root.iterdir()):
+        raise FileExistsError(
+            f"Multi-GPU shard directory is not empty; choose a fresh output directory: "
+            f"{shard_root}"
+        )
+    shard_root.mkdir(parents=True, exist_ok=True)
+    parent_cwd = os.getcwd()
+
+    child_argv = _strip_cli_options(
+        sys.argv[1:],
+        {
+            "--gpu-ids",
+            "--output-dir",
+            "--device",
+            "--shard-index",
+            "--shard-count",
+        },
+    )
+    child_processes: list[tuple[int, int, subprocess.Popen, Any, Path]] = []
+    worker_records: list[dict[str, Any]] = []
+    worker_ports: set[int] = set()
+    try:
+        for worker_index, gpu_id in enumerate(gpu_ids):
+            worker_dir = shard_root / f"worker-{worker_index:02d}-gpu-{gpu_id}"
+            worker_dir.mkdir(parents=True, exist_ok=False)
+            log_path = worker_dir / "worker.log"
+            worker_args = [
+                *child_argv,
+                "--output-dir",
+                str(worker_dir),
+                "--device",
+                "cuda:0",
+                "--shard-index",
+                str(worker_index),
+                "--shard-count",
+                str(len(gpu_ids)),
+            ]
+            command = [sys.executable, str(Path(__file__).resolve()), *worker_args]
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            master_port = _worker_master_port(worker_index)
+            while master_port in worker_ports:
+                master_port = _worker_master_port(worker_index)
+            worker_ports.add(master_port)
+            env["SPARSEVLLM_MASTER_PORT"] = str(master_port)
+            pythonpath = [str(REPO_ROOT), str(SRC_ROOT)]
+            if env.get("PYTHONPATH"):
+                pythonpath.append(env["PYTHONPATH"])
+            env["PYTHONPATH"] = os.pathsep.join(pythonpath)
+            record = {
+                "worker_index": int(worker_index),
+                "gpu_id": int(gpu_id),
+                "shard_rule": f"global_selected_index % {len(gpu_ids)} == {worker_index}",
+                "output_dir": str(worker_dir),
+                "log_path": str(log_path),
+                "command": shlex.join(command),
+                "master_port": int(env["SPARSEVLLM_MASTER_PORT"]),
+            }
+            log_handle = log_path.open("w", encoding="utf-8")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    # Preserve relative model/dataset/output paths exactly as the
+                    # parent invocation sees them.  REPO_ROOT is still injected in
+                    # PYTHONPATH below for imports.
+                    cwd=parent_cwd,
+                    env=env,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except Exception as error:
+                log_handle.close()
+                record.update(
+                    {
+                        "returncode": None,
+                        "launch_error_type": type(error).__name__,
+                        "launch_error": str(error),
+                    }
+                )
+                worker_records.append(record)
+                continue
+            child_processes.append((worker_index, gpu_id, process, log_handle, worker_dir))
+            worker_records.append(record)
+            _phase_log(
+                f"Launched TP1 worker {worker_index + 1}/{len(gpu_ids)} "
+                f"on physical GPU {gpu_id}: pid={process.pid}"
+            )
+    except BaseException:
+        _phase_log("Multi-GPU worker launch aborted; terminating launched workers.")
+        _terminate_worker_processes(child_processes)
+        raise
+
+    try:
+        for worker_index, gpu_id, process, log_handle, worker_dir in child_processes:
+            returncode = process.wait()
+            log_handle.close()
+            for record in worker_records:
+                if record["worker_index"] == worker_index:
+                    record["returncode"] = int(returncode)
+                    break
+            _phase_log(
+                f"Worker {worker_index} on GPU {gpu_id} finished with returncode={returncode}."
+            )
+    except KeyboardInterrupt:
+        _phase_log("Interrupted; terminating outstanding multi-GPU workers.")
+        _terminate_worker_processes(child_processes)
+        raise
+
+    worker_records.sort(key=lambda record: int(record["worker_index"]))
+    worker_result_rows: list[dict[str, Any]] = []
+    worker_raw_rows: list[dict[str, Any]] = []
+    worker_parsed_rows: list[dict[str, Any]] = []
+    child_aggregates: list[dict[str, Any]] = []
+    missing_by_worker: dict[int, set[int]] = {}
+    worker_output_contract_ok = True
+    for record in worker_records:
+        worker_index = int(record["worker_index"])
+        gpu_id = int(record["gpu_id"])
+        expected_indices = set(range(worker_index, total_rows, len(gpu_ids)))
+        worker_dir = Path(record["output_dir"])
+        result_path = worker_dir / "per_sample_results.jsonl"
+        try:
+            result_rows = _read_jsonl_if_present(result_path)
+        except Exception as error:
+            result_rows = []
+            record["result_read_error_type"] = type(error).__name__
+            record["result_read_error"] = str(error)
+        merged_results = _merge_worker_rows(
+            worker_rows=result_rows,
+            expected_indices=expected_indices,
+            worker_index=worker_index,
+            gpu_id=gpu_id,
+            output_name="per_sample_results.jsonl",
+        )
+        seen_indices = {int(row["index"]) for row in merged_results}
+        missing_indices = expected_indices - seen_indices
+        if missing_indices:
+            missing_by_worker[worker_index] = missing_indices
+        worker_result_rows.extend(merged_results)
+        for filename, target in (
+            ("raw_outputs.jsonl", worker_raw_rows),
+            ("parsed_outputs.jsonl", worker_parsed_rows),
+        ):
+            auxiliary_path = worker_dir / filename
+            if (
+                record.get("returncode") == 0
+                and result_rows
+                and not auxiliary_path.is_file()
+            ):
+                record.setdefault("missing_output_files", []).append(filename)
+                worker_output_contract_ok = False
+            rows = _read_jsonl_if_present(auxiliary_path)
+            target.extend(
+                _merge_worker_rows(
+                    worker_rows=rows,
+                    expected_indices=expected_indices,
+                    worker_index=worker_index,
+                    gpu_id=gpu_id,
+                    output_name=filename,
+                )
+            )
+        aggregate_path = worker_dir / "aggregate_metrics.json"
+        if aggregate_path.is_file():
+            child_aggregates.append(
+                json.loads(aggregate_path.read_text(encoding="utf-8"))
+            )
+        elif record.get("returncode") == 0:
+            record.setdefault("missing_output_files", []).append(
+                "aggregate_metrics.json"
+            )
+            worker_output_contract_ok = False
+
+    if missing_by_worker:
+        selected_rows = _load_rows(
+            replace(config, gpu_ids=None, shard_index=0, shard_count=1)
+        )
+        if len(selected_rows) != total_rows:
+            raise RuntimeError(
+                "RULER dataset changed while merging multi-GPU workers: "
+                f"count_before={total_rows} count_after={len(selected_rows)}."
+            )
+        for worker_index, missing_indices in missing_by_worker.items():
+            record = worker_records[worker_index]
+            worker_result_rows.extend(
+                _missing_worker_result_rows(
+                    selected_rows=selected_rows,
+                    missing_indices=missing_indices,
+                    worker_index=worker_index,
+                    gpu_id=int(record["gpu_id"]),
+                    max_new_tokens_override=config.max_new_tokens,
+                    error=(
+                        "Worker did not emit a per-sample result; inspect "
+                        f"{record['log_path']} and its returncode."
+                    ),
+                )
+            )
+
+    worker_result_rows.sort(key=lambda row: int(row["index"]))
+    worker_raw_rows.sort(key=lambda row: int(row["index"]))
+    worker_parsed_rows.sort(key=lambda row: int(row["index"]))
+    _write_jsonl(output_dir / "raw_outputs.jsonl", worker_raw_rows)
+    _write_jsonl(output_dir / "parsed_outputs.jsonl", worker_parsed_rows)
+    _write_jsonl(output_dir / "per_sample_results.jsonl", worker_result_rows)
+
+    observed_indices = {int(row["index"]) for row in worker_result_rows}
+    expected_all = set(range(total_rows))
+    if observed_indices != expected_all:
+        raise RuntimeError(
+            "Merged multi-GPU results do not cover the selected dataset exactly: "
+            f"missing={sorted(expected_all - observed_indices)[:10]} "
+            f"extra={sorted(observed_indices - expected_all)[:10]}."
+        )
+
+    successful = [row for row in worker_result_rows if row.get("status") == "success"]
+    by_task: dict[str, float | None] = {}
+    for task in sorted({str(row["task"]) for row in worker_result_rows}):
+        values = [
+            float(row["score"])
+            for row in successful
+            if str(row["task"]) == task
+        ]
+        by_task[task] = round(100.0 * float(np.mean(values)), 2) if values else None
+
+    worker_startups = [
+        float(value["startup_seconds"])
+        for value in child_aggregates
+        if value.get("startup_seconds") is not None
+    ]
+    worker_serving = [
+        float(value["serving_elapsed_seconds"])
+        for value in child_aggregates
+        if value.get("serving_elapsed_seconds") is not None
+    ]
+    parallel_serving = max(worker_serving) if worker_serving else None
+    parent_elapsed = time.perf_counter() - parent_started
+    all_workers_succeeded = worker_output_contract_ok and all(
+        record.get("returncode") == 0 for record in worker_records
+    ) and len(worker_records) == len(gpu_ids)
+    aggregate: dict[str, Any] = {
+        "protocol": "NVIDIA/kvpress evaluation/evaluate.py RULER dataset and scorer",
+        "sparse_method": config.sparse_method,
+        "status": (
+            "success"
+            if all_workers_succeeded and len(successful) == total_rows
+            else "failed"
+        ),
+        "num_samples": total_rows,
+        "num_success": len(successful),
+        "overall_score": (
+            round(100.0 * float(np.mean([row["score"] for row in successful])), 2)
+            if successful
+            else None
+        ),
+        "score_by_task": by_task,
+        "startup_seconds": round(max(worker_startups), 3) if worker_startups else None,
+        "serving_elapsed_seconds": (
+            round(parallel_serving, 3) if parallel_serving is not None else None
+        ),
+        "elapsed_seconds": (
+            round(parallel_serving, 3) if parallel_serving is not None else None
+        ),
+        "total_elapsed_seconds": round(parent_elapsed, 3),
+        "multi_gpu_wall_seconds": round(parent_elapsed, 3),
+        "gpu_ids": list(gpu_ids),
+        "shard_count": len(gpu_ids),
+    }
+    aggregate["input_tokens"] = sum(
+        int(row["input_token_count"])
+        for row in successful
+        if row.get("input_token_count") is not None
+    )
+    aggregate["requested_output_tokens"] = sum(
+        int(row["max_new_tokens"]) for row in successful
+    )
+    aggregate["generated_output_tokens"] = sum(
+        int(row["output_token_count"])
+        for row in successful
+        if row.get("output_token_count") is not None
+    )
+    if parallel_serving is not None and parallel_serving > 0:
+        aggregate["samples_per_second"] = round(
+            len(successful) / parallel_serving, 4
+        )
+        aggregate["generated_output_tokens_per_second"] = round(
+            aggregate["generated_output_tokens"] / parallel_serving, 4
+        )
+        aggregate["requested_output_tokens_per_second"] = round(
+            aggregate["requested_output_tokens"] / parallel_serving, 4
+        )
+    (output_dir / "aggregate_metrics.json").write_text(
+        json.dumps(aggregate, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    run_info = {
+        "protocol": aggregate["protocol"],
+        "multi_gpu": True,
+        "gpu_ids": list(gpu_ids),
+        "shard_count": len(gpu_ids),
+        "shard_rule": "global selected row ordinal modulo shard_count",
+        "dataset_source": (
+            config.dataset_path
+            or config.dataset_repo_id
+            or f"datasets://{config.dataset_name}/{config.data_dir}"
+        ),
+        "dataset_rows": total_rows,
+        "config": asdict(config),
+        "workers": worker_records,
+    }
+    (output_dir / "run_info.json").write_text(
+        json.dumps(run_info, indent=2), encoding="utf-8"
+    )
+    (output_dir / "multi_gpu_manifest.json").write_text(
+        json.dumps(
+            {
+                "status": aggregate["status"],
+                "gpu_ids": list(gpu_ids),
+                "selected_rows": total_rows,
+                "shard_rule": run_info["shard_rule"],
+                "workers": worker_records,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _phase_log(
+        "Multi-GPU evaluation finished: "
+        f"status={aggregate['status']} samples={aggregate['num_success']}/{total_rows} "
+        f"wall={aggregate['multi_gpu_wall_seconds']}s"
+    )
+    print(json.dumps(aggregate, indent=2))
+    if aggregate["status"] != "success":
+        raise RuntimeError(
+            "Multi-GPU RULER evaluation failed; inspect multi_gpu_manifest.json "
+            "and each shards/*/worker.log."
+        )
+
+
 def main() -> None:
     config = _parse_args()
+    if config.gpu_ids is not None:
+        if len(config.gpu_ids) == 1:
+            # --gpu-ids names physical devices.  The evaluator itself then
+            # sees the selected physical device as logical cuda:0.
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(config.gpu_ids[0])
+            config = replace(config, device="cuda:0")
+        else:
+            _run_multi_gpu(config)
+            return
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     _phase_log(
@@ -854,7 +1495,11 @@ def main() -> None:
         f"max_samples={config.max_samples}"
     )
     row_factory, dataset_source = _dataset_row_factory(config)
-    selected_factory = _selected_row_factory(row_factory, config)
+    selected_factory = _sharded_row_factory(
+        _selected_row_factory(row_factory, config),
+        shard_index=config.shard_index,
+        shard_count=config.shard_count,
+    )
     random.seed(config.seed)
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
@@ -882,6 +1527,7 @@ def main() -> None:
     # multiple gigabytes before inference starts.
     prompt_lengths: list[int] = []
     task_names: list[str] = []
+    global_row_indices: list[int] = []
     first_tokenize_started = time.perf_counter()
     _phase_log(
         "Tokenizing prompts (pass 1/2) to infer prompt lengths and max_model_len..."
@@ -897,6 +1543,7 @@ def main() -> None:
             if prompt_schema is None:
                 prompt_schema = "prompt" if "prompt" in row else "context_question"
             task_names.append(str(row["task"]))
+            global_row_indices.append(_row_output_index(row, len(prompt_lengths)))
             max_new_tokens.append(
                 _resolve_max_new_tokens([row], override=config.max_new_tokens)[0]
             )
@@ -945,7 +1592,9 @@ def main() -> None:
         if config.data_dir is not None and str(config.data_dir).isdigit()
         else None,
     }
-    if config.sparse_method == "quest":
+    if config.sparse_method == "vanilla":
+        derived_config["attention_mode"] = "full"
+    elif config.sparse_method == "quest":
         # The shared config names are retained for other sparse methods, but
         # Quest's native protocol is a single query-aware token budget.
         derived_config["quest_effective_token_budget"] = (
@@ -960,12 +1609,14 @@ def main() -> None:
             config.shadowkv_sparse_budget,
             config.shadowkv_outlier_chunks,
         )
-    else:
+    elif config.sparse_method == "query_robust":
         derived_config["query_robust_effective_token_budget"] = (
             config.sink_keep_tokens
             + config.decode_keep_tokens
             + config.recent_keep_tokens
         )
+    else:
+        raise ValueError(f"Unsupported sparse method: {config.sparse_method!r}")
     run_info = {
         "protocol": "NVIDIA/kvpress evaluation/evaluate.py RULER dataset and scorer",
         "protocol_source": "https://github.com/NVIDIA/kvpress/tree/main/evaluation",
@@ -986,7 +1637,9 @@ def main() -> None:
                     "task": group["task"],
                     "max_new_tokens": group["max_new_tokens"],
                     "num_rows": len(group["indices"]),
-                    "row_indices": group["indices"],
+                    "row_indices": [
+                        global_row_indices[index] for index in group["indices"]
+                    ],
                 }
                 for group_index, group in enumerate(evaluation_groups)
             ],
@@ -1011,6 +1664,7 @@ def main() -> None:
     result_rows: list[dict[str, Any]] = []
     processed_indices: set[int] = set()
     progress = None
+    llm = None
     try:
         if config.device.startswith("cuda"):
             if not torch.cuda.is_available():
@@ -1116,12 +1770,16 @@ def main() -> None:
                     processed_indices.add(index)
                     prediction = str(prediction)
                     task = str(row["task"])
-                    raw_rows.append({"index": index, "prediction": prediction})
+                    output_index = _row_output_index(row, index)
+                    raw_rows.append({"index": output_index, "prediction": prediction})
                     parsed_rows.append(
-                        {"index": index, "predicted_answer": prediction.strip()}
+                        {
+                            "index": output_index,
+                            "predicted_answer": prediction.strip(),
+                        }
                     )
                     base_result = {
-                        "index": index,
+                        "index": output_index,
                         "task": task,
                         "predicted_answer": prediction,
                         "input_token_count": prompt_lengths[index],
@@ -1208,9 +1866,10 @@ def main() -> None:
         for index, row in enumerate(selected_factory()):
             if index in processed_indices:
                 continue
+            output_index = _row_output_index(row, index)
             result_rows.append(
                 {
-                    "index": index,
+                    "index": output_index,
                     "task": str(row["task"]),
                     "status": "model_failed",
                     "error_type": type(error).__name__,
@@ -1227,6 +1886,11 @@ def main() -> None:
     finally:
         if progress is not None:
             progress.close()
+        if llm is not None:
+            # Explicitly stop the engine before interpreter shutdown.  This
+            # avoids the atexit path trying to create a shutdown thread after
+            # Python has already begun tearing down its threading runtime.
+            llm.exit()
     raw_rows.sort(key=lambda row: row["index"])
     parsed_rows.sort(key=lambda row: row["index"])
     result_rows.sort(key=lambda row: row["index"])

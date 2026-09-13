@@ -1,0 +1,123 @@
+{
+  "artifact": {
+    "M": 32,
+    "bytes": 2363797,
+    "chunk_size": 16,
+    "model_id": "Qwen/Qwen3-4B-Instruct-2507",
+    "model_revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "path": "/mnt/results/query_robust/qwen3-4b-pile128k-m32-final-20260913_145407/qwen3_4b_qr_vertices_m32_128k.pt",
+    "sha256": "189b839536e53dac532b032504311b803438d0a968a5aed1db90223f0e76fd68",
+    "solver": {
+      "iterations": 24,
+      "lr": 0.25,
+      "score_alpha": 1.0
+    }
+  },
+  "artifact_scope": "Query-Robust M32 calibration only; no RULER quality claim.",
+  "artifact_status": "frozen_calibration_final",
+  "calibration": {
+    "bucket_counts": {
+      "112k": 375,
+      "128k": 375,
+      "16k": 375,
+      "32k": 375,
+      "48k": 375,
+      "64k": 375,
+      "80k": 375,
+      "96k": 375
+    },
+    "capture_path": "/mnt/results/query_robust/qwen3-4b-pile128k-m32-final-20260913_145407/pile128k_qwen3_q_capture.pt",
+    "query_shape": [
+      3000,
+      36,
+      32,
+      128
+    ],
+    "rope_config": {
+      "rope_theta": 5000000.0
+    }
+  },
+  "created_at_utc": "2026-09-13T15:02:41Z",
+  "environment": {
+    "calibration": {
+      "position_windows": {
+        "112k": [
+          112640,
+          114688
+        ],
+        "128k": [
+          129024,
+          131072
+        ],
+        "16k": [
+          14336,
+          16384
+        ],
+        "32k": [
+          30720,
+          32768
+        ],
+        "48k": [
+          47104,
+          49152
+        ],
+        "64k": [
+          63488,
+          65536
+        ],
+        "80k": [
+          79872,
+          81920
+        ],
+        "96k": [
+          96256,
+          98304
+        ]
+      },
+      "samples_per_query_head": 3000,
+      "sequence_length": 131072,
+      "sequences": 20,
+      "vertices": 32
+    },
+    "calibration_dataset": "monology/pile-uncopyrighted",
+    "calibration_dataset_revision": "3be90335b66f24456a5d6659d9c8d208c0357119",
+    "compute_capability": [
+      10,
+      0
+    ],
+    "gpu_name": "NVIDIA B200",
+    "leakage_controls": {
+      "metric_or_test_feedback_used": false,
+      "ruler_data_mounted": false,
+      "ruler_data_read": false
+    },
+    "model_id": "Qwen/Qwen3-4B-Instruct-2507",
+    "model_revision": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "torch_cuda": "13.0",
+    "torch_version": "2.11.0+cu130"
+  },
+  "validation": {
+    "asset_dtype": "torch.bfloat16",
+    "asset_shape": [
+      36,
+      8,
+      32,
+      128
+    ],
+    "model_fingerprint": "cdbee75f17c01a7cc42f958dc650907174af0554",
+    "model_id": "Qwen3-4B-Instruct-2507",
+    "samples_per_bucket_per_layer_kv_head": {
+      "112k": 1500,
+      "128k": 1500,
+      "16k": 1500,
+      "32k": 1500,
+      "48k": 1500,
+      "64k": 1500,
+      "80k": 1500,
+      "96k": 1500
+    },
+    "samples_per_layer_kv_head": 12000,
+    "status": "passed",
+    "valid_vertices": 32
+  }
+}
