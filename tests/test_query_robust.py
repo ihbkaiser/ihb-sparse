@@ -271,6 +271,41 @@ def test_query_robust_asset_loader_normalizes_rope_metadata(tmp_path):
     assert tuple(asset.vertices.shape) == (1, 1, 2, 4)
 
 
+def test_query_robust_asset_loader_treats_missing_rope_type_as_default(tmp_path):
+    vertices = torch.zeros((1, 1, 2, 4), dtype=torch.bfloat16)
+    valid = torch.full((1, 1), 2, dtype=torch.int32)
+    path = tmp_path / "vertices_qwen3_default_rope.pt"
+    torch.save(
+        {
+            "vertices": vertices,
+            "num_valid_vertices": valid,
+            "meta": {
+                "model_id": "Qwen3-4B-Instruct-2507",
+                "tp_world_size": 1,
+                "rope_config": {"rope_theta": 5_000_000},
+            },
+        },
+        path,
+    )
+
+    asset = load_query_robust_asset(
+        path,
+        num_layers=1,
+        global_num_kv_heads=1,
+        head_dim=4,
+        num_vertices=2,
+        tensor_parallel_rank=0,
+        tensor_parallel_size=1,
+        expected_model_id="Qwen3-4B-Instruct-2507",
+        expected_rope_config={
+            "rope_theta": 5_000_000.0,
+            "rope_type": "default",
+        },
+    )
+
+    assert tuple(asset.vertices.shape) == (1, 1, 2, 4)
+
+
 def test_query_robust_vertex_selector_repeats_real_support_points():
     selector = _load_selector_module()
     queries = torch.tensor([[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0]])

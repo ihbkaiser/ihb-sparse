@@ -113,8 +113,10 @@ def _canonical_rope_config(value: Any) -> dict[str, Any]:
     if "type" in raw and "rope_type" not in raw:
         raw["rope_type"] = raw["type"]
     raw.pop("type", None)
-    if "rope_type" in raw:
-        raw["rope_type"] = str(raw["rope_type"]).lower()
+    # Transformers treats a missing rope type as the standard/default RoPE.
+    # Keep older assets that only recorded rope_theta compatible with the
+    # runtime's explicit ``rope_type="default"`` representation.
+    raw["rope_type"] = str(raw.get("rope_type", "default")).lower()
     for name in (
         "factor",
         "low_freq_factor",
