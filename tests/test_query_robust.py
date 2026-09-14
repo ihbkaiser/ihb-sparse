@@ -10,6 +10,7 @@ import torch
 
 from sparsevllm.engine.cache_manager.query_robust import (
     build_query_robust_page_summaries,
+    build_query_robust_selected_prev_page_slots,
     load_query_robust_asset,
     score_query_robust_pages_reference,
     solve_query_robust_page,
@@ -35,6 +36,31 @@ def _mass(query: torch.Tensor, keys: torch.Tensor, scale: float) -> torch.Tensor
 
 def _bound(query: torch.Tensor, landmark: torch.Tensor, bias: torch.Tensor, scale: float) -> torch.Tensor:
     return scale * (query @ landmark.float()) + bias.float()
+
+
+def test_query_robust_paged_layout_keeps_quest_sink_middle_and_recent_budget():
+    page_size = 16
+    num_pages = torch.tensor([300], dtype=torch.int32)
+    row_page_slots = torch.arange(300, dtype=torch.int32).view(1, -1)
+    selected_middle = torch.arange(10_000, 10_256, dtype=torch.int32).view(1, -1)
+
+    selected_prev = build_query_robust_selected_prev_page_slots(
+        row_page_slots,
+        num_pages,
+        selected_middle,
+        page_size=page_size,
+        sink_keep_tokens=32,
+        middle_keep_tokens=4096,
+        recent_keep_tokens=256,
+    )
+
+    assert selected_prev.shape == (1, 273)
+    assert torch.equal(selected_prev[0, :2], torch.tensor([0, 1], dtype=torch.int32))
+    assert torch.equal(selected_prev[0, 2:258], selected_middle[0])
+    assert torch.equal(
+        selected_prev[0, 258:],
+        torch.arange(284, 299, dtype=torch.int32),
+    )
 
 
 def test_query_robust_solver_certifies_interior_hull_and_bf16_storage():

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import benchmark.kvpress_ruler.evaluate as ruler_evaluate
+import benchmark.kvpress_ruler.evaluate_small as small_ruler_evaluate
 from benchmark.kvpress_ruler.evaluate import (
     EvalConfig,
     _build_infer_config,
@@ -55,19 +56,71 @@ def test_kvpress_defaults_use_gpu_cache_shadowkv_profile(monkeypatch):
     config = _parse_args()
 
     assert config.quest_chunk_size == 16
-    assert config.sink_keep_tokens == 0
-    assert config.decode_keep_tokens == 2048
-    assert config.recent_keep_tokens == 0
+    assert config.sink_keep_tokens == 32
+    assert config.decode_keep_tokens == 4096
+    assert config.recent_keep_tokens == 256
     assert (
         config.sink_keep_tokens
         + config.decode_keep_tokens
         + config.recent_keep_tokens
-        == 2048
+        == 4384
     )
     assert config.shadowkv_sparse_budget == 2048
     assert config.shadowkv_rank == 160
     assert config.shadowkv_chunk_size == 8
     assert config.shadowkv_storage == "gpu_cache"
+
+
+def test_kvpress_query_robust_defaults_match_quest_budget(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate.py",
+            "--model-path",
+            "/models/llama",
+            "--output-dir",
+            "/results/qr",
+            "--sparse-method",
+            "query_robust",
+            "--query-robust-vertices-path",
+            "/data/qr_vertices.pt",
+        ],
+    )
+
+    config = _parse_args()
+
+    assert (
+        config.sink_keep_tokens,
+        config.decode_keep_tokens,
+        config.recent_keep_tokens,
+    ) == (32, 4096, 256)
+
+
+def test_local_ruler_query_robust_defaults_match_quest_budget(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate_small.py",
+            "--model-path",
+            "/models/llama",
+            "--output-dir",
+            "/results/qr",
+            "--sparse-method",
+            "query_robust",
+            "--query-robust-vertices-path",
+            "/data/qr_vertices.pt",
+        ],
+    )
+
+    config = small_ruler_evaluate._parse_args()
+
+    assert (
+        config.sink_keep_tokens,
+        config.decode_keep_tokens,
+        config.recent_keep_tokens,
+    ) == (32, 4096, 256)
 
 
 def test_kvpress_parser_accepts_query_robust_full_ruler_configuration(monkeypatch):

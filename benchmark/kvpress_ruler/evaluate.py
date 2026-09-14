@@ -71,11 +71,11 @@ class EvalConfig:
     max_batched_tokens: int = 65536
     decode_graph: bool = False
     quest_chunk_size: int = 16
-    decode_keep_tokens: int = 2048
-    # Quest's native protocol exposes one query-aware token budget. Keep the
-    # shared sink/recent regions empty so the effective budget is exactly 2048.
-    sink_keep_tokens: int = 0
-    recent_keep_tokens: int = 0
+    # Matched Quest/Query-Robust RULER protocol: 32 sink tokens, up to 4096
+    # query-selected middle tokens, and 256 recent tokens.
+    decode_keep_tokens: int = 4096
+    sink_keep_tokens: int = 32
+    recent_keep_tokens: int = 256
     shadowkv_sparse_budget: int = 2048
     shadowkv_rank: int = 160
     shadowkv_chunk_size: int = 8
@@ -241,9 +241,9 @@ def _parse_args() -> EvalConfig:
         help="Capture/replay fixed-shape decode CUDA Graphs.",
     )
     parser.add_argument("--quest-chunk-size", type=int, default=16)
-    parser.add_argument("--decode-keep-tokens", type=int, default=2048)
-    parser.add_argument("--sink-keep-tokens", type=int, default=0)
-    parser.add_argument("--recent-keep-tokens", type=int, default=0)
+    parser.add_argument("--decode-keep-tokens", type=int, default=4096)
+    parser.add_argument("--sink-keep-tokens", type=int, default=32)
+    parser.add_argument("--recent-keep-tokens", type=int, default=256)
     parser.add_argument("--shadowkv-sparse-budget", type=int, default=2048)
     parser.add_argument("--shadowkv-rank", type=int, default=160)
     parser.add_argument("--shadowkv-chunk-size", type=int, default=8)

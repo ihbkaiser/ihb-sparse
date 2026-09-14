@@ -7,7 +7,7 @@ MODEL_PATH="/workspace/storage-shared/models/Llama-3.1-8B-Instruct"
 DATASET_PATH="/workspace/storage-shared/nlp/tungdd11/tungsparse/ruler-data/ruler-131072.jsonl"
 QR_VERTICES="/workspace/Sparse-vLLM/scripts/benchmarks/qr_vertices_m32_128k.pt"
 MODEL_FINGERPRINT="d10aef7999a2b5ba950ab3974312feeedbfe0b77"
-OUT_ROOT="/workspace/storage-shared/nlp/tungdd11/tungsparse/results/kvpress-ruler-new/full-ruler128k-budget4096-b4"
+OUT_ROOT="/workspace/storage-shared/nlp/tungdd11/tungsparse/results/kvpress-ruler-new/full-ruler128k-budget4384-b4"
 # Physical GPU IDs.  A comma-separated list launches one independent TP1
 # evaluator per GPU and merges the per-sample artifacts at OUT_ROOT.
 GPU_IDS="${GPU_IDS:-0}"
@@ -37,7 +37,7 @@ python benchmark/kvpress_ruler/evaluate.py \
   --query-robust-score-alpha 1.0 \
   --query-robust-skip-layers 0 \
   --no-query-robust-uniform-p \
-  --sink-keep-tokens 0 \
+  --sink-keep-tokens 32 \
   --decode-keep-tokens 4096 \
-  --recent-keep-tokens 0 \
+  --recent-keep-tokens 256 \
   --output-dir "$OUT_ROOT/query-robust-m32"

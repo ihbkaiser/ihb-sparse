@@ -111,14 +111,14 @@ hosted `simonjegou/ruler` dataset exposes only the 4096/8192/16384 configs, so
 the kvpress columns listed above. The official ShadowKV RULER command uses
 `datalen=131072`, `sparse_budget=2048`, `rank=160`, and `chunk_size=8`
 ([ShadowKV repository](https://github.com/ByteDance-Seed/ShadowKV)). The
-commands below use the same ShadowKV values and a matched 2048-token QuEST
-budget:
+commands below use the same ShadowKV values and a matched 4384-token
+QuEST/Query-Robust budget:
 
 ```bash
 MODEL_PATH=/path/to/Meta-Llama-3.1-8B-Instruct
 RULER_128K_PATH=/path/to/processed-ruler-131072.jsonl
 
-# QuEST: page/chunk size 16; one query-aware 2048-token budget.
+# QuEST: page/chunk size 16; matched 32/4096/256 sink/middle/recent budget.
 python benchmark/kvpress_ruler/evaluate.py \
   --model-path "$MODEL_PATH" \
   --sparse-method quest \
@@ -126,10 +126,10 @@ python benchmark/kvpress_ruler/evaluate.py \
   --data-dir 131072 \
   --dataset-path "$RULER_128K_PATH" \
   --quest-chunk-size 16 \
-  --sink-keep-tokens 0 \
-  --decode-keep-tokens 2048 \
-  --recent-keep-tokens 0 \
-  --output-dir results/kvpress-ruler/quest-128k-budget2048
+  --sink-keep-tokens 32 \
+  --decode-keep-tokens 4096 \
+  --recent-keep-tokens 256 \
+  --output-dir results/kvpress-ruler/quest-128k-budget4384
 
 # ShadowKV: paper/repository configuration for 128K RULER.
 python benchmark/kvpress_ruler/evaluate.py \
@@ -155,7 +155,8 @@ contain `context`, `question`, `answer_prefix`, `answer`, `task`, and
 `max_new_tokens` for every row.
 
 For a Table-1-style 128K comparison, use a tokenizer-aligned processed artifact
-and the same 2048-token effective sparse budget:
+and the same 4384-token effective sparse budget (`32` sink, `4096` QR-selected
+middle, `256` recent):
 
 ```bash
 MODEL_PATH=/path/to/Meta-Llama-3.1-8B-Instruct
@@ -176,14 +177,14 @@ python benchmark/kvpress_ruler/evaluate.py \
   --query-robust-score-alpha 0.5 \
   --query-robust-skip-layers 0 \
   --no-query-robust-uniform-p \
-  --sink-keep-tokens 0 \
-  --decode-keep-tokens 2048 \
-  --recent-keep-tokens 0 \
-  --output-dir results/kvpress-ruler/query-robust-128k-budget2048
+  --sink-keep-tokens 32 \
+  --decode-keep-tokens 4096 \
+  --recent-keep-tokens 256 \
+  --output-dir results/kvpress-ruler/query-robust-128k-budget4384
 ```
 
-The 2048-token retention budget is aligned with ShadowKV's 1.56% budget at
-131072 tokens. Query-Robust's vertex count, solver settings, and page size are
+The 4384-token retention budget is the matched Quest/Query-Robust protocol for
+this runner. Query-Robust's vertex count, solver settings, and page size are
 method-specific and are not substitutes for ShadowKV's rank-160/chunk-8
 factorization settings. Run vanilla on the exact same JSONL separately when a
 quality comparison is required.
@@ -193,15 +194,11 @@ separate output directory. The evaluator records the selected batch and graph
 settings in `run_info.json`; it does not silently fall back if graph capture
 or the ShadowKV CUDA extension fails.
 
-The QuEST/Query-Robust defaults in this runner are now `chunk_size=16`,
-`sink=0`, `decode=2048`, and `recent=0`. This mirrors Quest's native
-single-budget protocol. The shared sink/recent flags remain available for
-explicit ablations and for methods that implement fixed prefix/suffix
-retention; they are not part of Quest's original protocol. For a
-quality-oriented QuEST ablation, the upstream example uses approximately a
-1K token budget; that is a different, lower-budget experiment and should be
-reported separately ([Quest repository](https://github.com/mit-han-lab/Quest),
-[Quest paper](https://arxiv.org/abs/2406.10774)).
+The QuEST/Query-Robust defaults in this runner are `chunk_size=16`,
+`sink=32`, `decode=4096`, and `recent=256`, for an effective 4384-token
+budget. QR applies these as fixed sink/recent regions around its dynamic
+middle selection. Explicit CLI values remain available for lower-budget
+ablations and must be reported separately.
 
 ShadowKV's primary paper knobs are `2048/160/8`; in this implementation the
 default derived outlier count is 48 chunks. `shadowkv_local_chunks=4` and

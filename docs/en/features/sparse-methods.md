@@ -132,6 +132,10 @@ it and configure the three common keep-token fields instead.
 - `query_robust_vertices_path`: `.pt` or `.npz` asset containing BF16 vertices,
   `num_valid_vertices`, and calibration metadata
 - `query_robust_chunk_size`: physical page size; the default is 16 tokens
+- `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens`: QR keeps a
+  fixed prefix sink, selects the middle pages with QR, and keeps a fixed recent
+  suffix. The matched Quest default is `32/4096/256` tokens respectively;
+  each budget must be divisible by `query_robust_chunk_size`.
 - `query_robust_solver_iters` and `query_robust_solver_lr`: fixed FP32 page-summary
   solver schedule
 - `query_robust_score_alpha`: routing radius weight, restricted to `0`, `0.5`, or `1`

@@ -291,6 +291,18 @@ def _normalize_query_robust(config) -> None:
             f"tensor_parallel_size={tp_size}."
         )
     config.sparse_page_size = int(config.query_robust_chunk_size)
+    for name in ("sink_keep_tokens", "decode_keep_tokens", "recent_keep_tokens"):
+        value = int(getattr(config, name))
+        if value % config.sparse_page_size != 0:
+            raise ValueError(
+                "Query-Robust keep-token budgets must be divisible by "
+                f"query_robust_chunk_size={config.sparse_page_size}: "
+                f"{name}={value}."
+            )
+    if config.decode_keep_tokens <= 0:
+        raise ValueError(
+            "Query-Robust requires decode_keep_tokens > 0 for dynamic middle selection."
+        )
     config.sparse_token_budget = int(
         config.sink_keep_tokens
         + config.decode_keep_tokens

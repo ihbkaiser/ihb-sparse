@@ -18,6 +18,7 @@ from sparsevllm.engine.cache_manager.base import (
 )
 from sparsevllm.engine.cache_manager.quest import QuestCacheManager
 from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage
+from sparsevllm.kernels.triton.quest_decode_view import finalize_quest_paged_decode_view
 from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.operators.quest_selection import (
     QuestPageSelectionOpSpec,
@@ -46,6 +47,105 @@ class QueryRobustSummary:
     dual: torch.Tensor
     gap: torch.Tensor
     errors: torch.Tensor
+
+
+def build_query_robust_selected_prev_page_slots(
+    row_page_slots: torch.Tensor,
+    num_pages: torch.Tensor,
+    selected_middle_page_slots: torch.Tensor,
+    *,
+    page_size: int,
+    sink_keep_tokens: int,
+    middle_keep_tokens: int,
+    recent_keep_tokens: int,
+) -> torch.Tensor:
+    """Pack fixed sink/recent pages around QR-selected middle pages.
+
+    The paged finalizer appends the physical last page separately.  Therefore
+    this helper returns the prefix sink pages, the selected middle pages, and
+    all recent pages except that final page.
+    """
+
+    if row_page_slots.ndim != 2 or selected_middle_page_slots.ndim != 2:
+        raise ValueError("Query-Robust page layouts require rank-2 page tables.")
+    batch_size, row_width = map(int, row_page_slots.shape)
+    if selected_middle_page_slots.shape[0] != batch_size:
+        raise ValueError("Query-Robust page layouts must share a batch size.")
+    if num_pages.shape != (batch_size,):
+        raise ValueError("num_pages must have one value per batch row.")
+    tensors = (row_page_slots, num_pages, selected_middle_page_slots)
+    if any(tensor.dtype != torch.int32 for tensor in tensors):
+        raise TypeError("Query-Robust page layouts require contiguous int32 tensors.")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("Query-Robust page layouts require contiguous tensors.")
+    if any(tensor.device != row_page_slots.device for tensor in tensors):
+        raise ValueError("Query-Robust page layouts must share one device.")
+
+    page_size = int(page_size)
+    sink_keep_tokens = int(sink_keep_tokens)
+    middle_keep_tokens = int(middle_keep_tokens)
+    recent_keep_tokens = int(recent_keep_tokens)
+    if page_size <= 0:
+        raise ValueError("page_size must be positive.")
+    if any(
+        value < 0
+        for value in (sink_keep_tokens, middle_keep_tokens, recent_keep_tokens)
+    ):
+        raise ValueError("Query-Robust keep-token budgets must be non-negative.")
+    if middle_keep_tokens <= 0:
+        raise ValueError(
+            "middle_keep_tokens must be positive for Query-Robust selection."
+        )
+    if any(
+        value % page_size != 0
+        for value in (sink_keep_tokens, middle_keep_tokens, recent_keep_tokens)
+    ):
+        raise ValueError(
+            "Query-Robust sink, middle, and recent budgets must be divisible by "
+            f"page_size={page_size}."
+        )
+
+    sink_pages = sink_keep_tokens // page_size
+    middle_pages = middle_keep_tokens // page_size
+    recent_pages = recent_keep_tokens // page_size
+    if int(selected_middle_page_slots.shape[1]) != middle_pages:
+        raise ValueError(
+            "selected_middle_page_slots width must equal the middle page budget: "
+            f"expected {middle_pages}, got {int(selected_middle_page_slots.shape[1])}."
+        )
+
+    safe_row_width = max(row_width, 1)
+    safe_num_pages = num_pages.to(torch.long).clamp_min(1)
+    sink_indices = torch.arange(
+        sink_pages, dtype=torch.long, device=row_page_slots.device
+    )[None, :].expand(batch_size, -1)
+    safe_sink_indices = sink_indices.clamp_max(safe_row_width - 1)
+    sink_slots = row_page_slots.to(torch.long).gather(1, safe_sink_indices)
+    sink_slots = sink_slots.masked_fill(
+        sink_indices >= safe_num_pages[:, None], -1
+    )
+
+    recent_prev_pages = max(recent_pages - 1, 0)
+    recent_indices = (
+        safe_num_pages[:, None]
+        - recent_pages
+        + torch.arange(
+            recent_prev_pages, dtype=torch.long, device=row_page_slots.device
+        )[None, :]
+    )
+    safe_recent_indices = recent_indices.clamp(0, safe_row_width - 1)
+    recent_slots = row_page_slots.to(torch.long).gather(1, safe_recent_indices)
+    recent_slots = recent_slots.masked_fill(
+        (recent_indices < 0) | (recent_indices >= safe_num_pages[:, None]), -1
+    )
+    return torch.cat(
+        (
+            sink_slots.to(torch.int32),
+            selected_middle_page_slots,
+            recent_slots.to(torch.int32),
+        ),
+        dim=1,
+    ).contiguous()
 
 
 def _as_tensor(value: Any, *, name: str) -> torch.Tensor:
@@ -803,6 +903,154 @@ class QueryRobustCacheManager(QuestCacheManager):
             "max": float(gaps.max().item()),
         }
 
+    def _query_robust_decode_budgets(self) -> tuple[int, int, int, int]:
+        """Return sink, middle, recent, and total token budgets."""
+
+        sink_tokens = int(self.config.sink_keep_tokens)
+        middle_tokens = int(self.config.decode_keep_tokens)
+        recent_tokens = int(self.config.recent_keep_tokens)
+        page_size = int(self.page_size)
+        if middle_tokens <= 0:
+            raise ValueError(
+                "Query-Robust requires a positive dynamic middle budget; "
+                f"got decode_keep_tokens={middle_tokens}."
+            )
+        if any(
+            value % page_size != 0
+            for value in (sink_tokens, middle_tokens, recent_tokens)
+        ):
+            raise ValueError(
+                "Query-Robust sink, middle, and recent budgets must be divisible by "
+                f"page_size={page_size}; got sink={sink_tokens}, "
+                f"middle={middle_tokens}, recent={recent_tokens}."
+            )
+        total_tokens = sink_tokens + middle_tokens + recent_tokens
+        if total_tokens <= 0:
+            raise ValueError("Query-Robust total decode token budget must be positive.")
+        return sink_tokens, middle_tokens, recent_tokens, total_tokens
+
+    @torch.no_grad()
+    def _build_paged_decode_view_static(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        *,
+        token_budget: int,
+        num_kv_heads: int,
+    ):
+        """Build a QR view with fixed sink/recent pages and dynamic middle pages."""
+
+        del token_budget
+        with profiler.record("query_robust_build_decode_view_static"):
+            sink_tokens, middle_tokens, recent_tokens, total_tokens = (
+                self._query_robust_decode_budgets()
+            )
+            score_query = self._selection_query_tensor(q)
+            page_size = int(self.page_size)
+            sink_pages = sink_tokens // page_size
+            middle_pages = middle_tokens // page_size
+            recent_pages = recent_tokens // page_size
+            total_pages = sink_pages + middle_pages + recent_pages
+
+            max_context_len = self.layer_batch_state.max_context_len
+            if max_context_len is None:
+                raise RuntimeError(
+                    "Query-Robust decode CUDA graph requires max_context_len to be pinned."
+                )
+            max_context_len = int(max_context_len)
+            dense_width = min(
+                self.max_pages_per_row,
+                max(1, (max_context_len + page_size - 1) // page_size),
+            )
+            if (
+                layer_idx < self._decode_skip_layers()
+                or max_context_len <= total_tokens
+            ):
+                return self._dense_paged_decode_view(
+                    req_indices,
+                    context_lens,
+                    width=dense_width,
+                )
+
+            batch_size = int(score_query.shape[0])
+            max_pages = min(
+                self.max_pages_per_row,
+                (max_context_len + page_size - 1) // page_size,
+            )
+            candidate_width = max_pages - sink_pages
+            if candidate_width < middle_pages:
+                return self._dense_paged_decode_view(
+                    req_indices,
+                    context_lens,
+                    width=max_pages,
+                )
+
+            is_long_text = bool(get_context().is_long_text)
+            page_scores, row_page_slots, num_pages, previous_page_counts = (
+                self._score_previous_decode_pages(
+                    layer_idx,
+                    score_query,
+                    req_indices,
+                    context_lens,
+                    max_pages=max_pages,
+                    num_kv_heads=num_kv_heads,
+                )
+            )
+            candidate_offsets = torch.arange(
+                candidate_width,
+                dtype=torch.long,
+                device=page_scores.device,
+            )
+            candidate_indices = (
+                candidate_offsets[None, :] + sink_pages
+            ).expand(batch_size, -1)
+            middle_scores = page_scores.gather(1, candidate_indices).contiguous()
+            middle_page_slots = row_page_slots.gather(
+                1, candidate_indices
+            ).contiguous()
+            middle_page_counts = (
+                previous_page_counts.to(torch.long)
+                - sink_pages
+                # The paged finalizer appends the last page separately.
+                - max(recent_pages - 1, 0)
+            ).clamp_min(0).clamp_max(candidate_width).to(torch.int32)
+            selected_middle = self.quest_page_selector.select(
+                middle_scores,
+                middle_page_slots,
+                middle_page_counts,
+                middle_pages,
+            )
+            selected_prev = build_query_robust_selected_prev_page_slots(
+                row_page_slots,
+                num_pages.to(torch.int32).contiguous(),
+                selected_middle,
+                page_size=page_size,
+                sink_keep_tokens=sink_tokens,
+                middle_keep_tokens=middle_tokens,
+                recent_keep_tokens=recent_tokens,
+            )
+            outputs = self._get_decode_paged_view_buffers(
+                batch_size,
+                total_pages,
+            )
+            paged_view = finalize_quest_paged_decode_view(
+                selected_prev,
+                row_page_slots,
+                num_pages.to(torch.int32).contiguous(),
+                context_lens,
+                page_size=page_size,
+                token_budget=total_tokens,
+                output_page_table=outputs[0],
+                output_req_indices=outputs[1],
+                output_context_lens=outputs[2],
+                output_page_counts=outputs[3],
+                output_last_page_lens=outputs[4],
+                use_dense_fallback=not is_long_text,
+            )
+            return (*paged_view, bool(is_long_text))
+
     @torch.no_grad()
     def _score_previous_decode_pages(
         self,
@@ -878,6 +1126,7 @@ __all__ = [
     "QueryRobustCacheManager",
     "QueryRobustSummary",
     "build_query_robust_page_summaries",
+    "build_query_robust_selected_prev_page_slots",
     "load_query_robust_asset",
     "score_query_robust_pages_reference",
     "solve_query_robust_page",
